@@ -117,12 +117,15 @@ import (
 //     no record, the source's publication), and a restart changes none of
 //     them, so it refuses again until the operator runs
 //     `sluice schema add-table` for the named table, takes it out of scope,
-//     or re-copies with --restart-from-scratch. Its catalog and control-row
-//     read failures are NOT the marker and stay restartable.
-//   - INCLUDE-TABLE-ADD-IN-PROGRESS (Bug 321 F2, codeless): NOT listed. It
-//     is raised only when the door's sole conviction is an add-table whose
-//     heartbeat is fresh — still running — and that add clears its entry
-//     when it finishes, so a restart after backoff resumes (and an add that
+//     or re-copies with --restart-from-scratch. The same marker carries
+//     COLD-START-INCOMPLETE (a cold start stopped past its point of no
+//     return; the in-progress mark on the control row is unchanged by a
+//     restart, so it refuses until the cold start is re-run). Its catalog
+//     and control-row read failures are NOT the marker and stay restartable.
+//   - INCLUDE-TABLE-ADD-IN-PROGRESS (Bug 321 F2/F-A, codeless): NOT listed.
+//     It is raised only when every table the door refuses has an add-table
+//     whose heartbeat is fresh — still running — and that add's completion
+//     records the table, so a restart after backoff resumes (and an add that
 //     died goes stale and becomes the listed INCLUDE-TABLE-SCOPE-DRIFT).
 //   - DEFERRED-KEY-CHECK-FAILED-AT-COMMIT (Postgres target, codeless): NOT
 //     listed. It is the COMMIT of a target transaction that a deferrable

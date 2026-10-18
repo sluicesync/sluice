@@ -19,6 +19,13 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// Store is an applier carrying both table-set surfaces, as both engines'
+// appliers do.
+type Store interface {
+	ir.PendingAddedTablesStore
+	ir.EstablishedTablesStore
+}
+
 // Corpus is every shape a recorded table name can take: each must come back
 // byte-exact through the real column.
 var Corpus = []string{
@@ -29,38 +36,43 @@ var Corpus = []string{
 // exists in a control table that predates the column.
 func PendingRoundTrip(ctx context.Context, t *testing.T, store ir.PendingAddedTablesStore, errStreamNotFound error) {
 	t.Helper()
-	if got, err := store.ReadPendingAddedTables(ctx, "s1"); err != nil || len(got) != 0 {
-		t.Fatalf("pre-column table: Read = (%v, %v); want empty", got, err)
+	read := func() ([]ir.PendingAddedTable, time.Time) {
+		t.Helper()
+		got, now, err := store.ReadPendingAddedTables(ctx, "s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// S-C: "now" is the server's clock, read with the entries. The
+		// container shares the host's kernel clock, so it is near ours.
+		if d := time.Since(now); d > time.Minute || d < -time.Minute {
+			t.Fatalf("Read's server now %v is not near the host's %v", now, time.Now())
+		}
+		return got, now
+	}
+	if got, _ := read(); len(got) != 0 {
+		t.Fatalf("pre-column table: Read = %v; want empty", got)
 	}
 	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"orders"}); err != nil {
 		t.Fatalf("pre-column table: Clear = %v; want nothing to clear", err)
 	}
-	started := time.UnixMilli(time.Now().UnixMilli()).UTC()
 	for _, name := range Corpus {
-		if err := store.RecordPendingAddedTable(ctx, "s1", name, started); err != nil {
+		if err := store.RecordPendingAddedTable(ctx, "s1", name, "tok-"+name); err != nil {
 			t.Fatalf("%q: Record: %v", name, err)
 		}
 	}
-	if err := store.RecordPendingAddedTable(ctx, "s1", "orders", started); err != nil {
+	if err := store.RecordPendingAddedTable(ctx, "s1", "orders", "tok-new"); err != nil {
 		t.Fatalf("repeated Record: %v", err)
 	}
-	beat := started.Add(time.Minute)
-	if err := store.HeartbeatPendingAddedTable(ctx, "s1", "orders", beat); err != nil {
-		t.Fatal(err)
-	}
-	got, err := store.ReadPendingAddedTables(ctx, "s1")
-	if err != nil {
-		t.Fatal(err)
-	}
+	got, now := read()
 	names := make([]string, 0, len(got))
 	for _, p := range got {
 		names = append(names, p.Table)
-		wantBeat := started
+		wantToken := "tok-" + p.Table
 		if p.Table == "orders" {
-			wantBeat = beat
+			wantToken = "tok-new"
 		}
-		if !p.StartedAt.Equal(started) || !p.HeartbeatAt.Equal(wantBeat) {
-			t.Fatalf("%q: started %v heartbeat %v; want %v %v", p.Table, p.StartedAt, p.HeartbeatAt, started, wantBeat)
+		if p.Token != wantToken || !p.StartedAt.Equal(p.HeartbeatAt) || now.Sub(p.StartedAt) > time.Minute || !p.Fresh(now) {
+			t.Fatalf("%q: %+v; want token %q, started = heartbeat = the server's recent now (%v)", p.Table, p, wantToken, now)
 		}
 	}
 	sort.Strings(names)
@@ -69,32 +81,57 @@ func PendingRoundTrip(ctx context.Context, t *testing.T, store ir.PendingAddedTa
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("Read = %q\nwant  %q (a repeated Record must replace, not duplicate)", names, want)
 	}
-	if err := store.RecordPendingAddedTable(ctx, "no-such-stream", "x", time.Now()); !errors.Is(err, errStreamNotFound) {
-		t.Fatalf("Record on a missing row = %v; want the stream-not-found error", err)
+
+	// S-B: a Touch compares-and-sets on the token.
+	if err := store.TouchPendingAddedTable(ctx, "s1", "orders", "tok-orders", true); !errors.Is(err, ir.ErrPendingAddSuperseded) {
+		t.Fatalf("Touch under a superseded token = %v; want ErrPendingAddSuperseded", err)
 	}
-	if err := store.HeartbeatPendingAddedTable(ctx, "s1", "never-recorded", time.Now()); err != nil {
-		t.Fatalf("Heartbeat of an entry that is gone: %v; want nothing to do", err)
+	if err := store.TouchPendingAddedTable(ctx, "s1", "never-recorded", "tok", true); !errors.Is(err, ir.ErrPendingAddSuperseded) {
+		t.Fatalf("Touch of an entry that is gone = %v; want ErrPendingAddSuperseded", err)
+	}
+	if err := store.TouchPendingAddedTable(ctx, "s1", "orders", "tok-new", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.TouchPendingAddedTable(ctx, "s1", "Orders", "tok-Orders", false); err != nil {
+		t.Fatal(err)
+	}
+	got, now = read()
+	for _, p := range got {
+		switch p.Table {
+		case "orders":
+			if p.Token != "tok-new" || p.HeartbeatAt.Before(p.StartedAt) || !p.Fresh(now) {
+				t.Fatalf("alive Touch: %+v", p)
+			}
+		case "Orders":
+			if !p.HeartbeatAt.Equal(time.Unix(0, 0)) || p.Fresh(now) || p.StartedAt.Equal(p.HeartbeatAt) {
+				t.Fatalf("stopped Touch: %+v; want the epoch heartbeat, start kept", p)
+			}
+		}
+	}
+	if err := store.RecordPendingAddedTable(ctx, "no-such-stream", "x", "tok"); !errors.Is(err, errStreamNotFound) {
+		t.Fatalf("Record on a missing row = %v; want the stream-not-found error", err)
 	}
 	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"line\nbreak", "\xff\xferaw", "never-recorded"}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := store.ReadPendingAddedTables(ctx, "s1"); len(got) != len(want)-2 {
+	if got, _ := read(); len(got) != len(want)-2 {
 		t.Fatalf("after Clear of two: %v", got)
 	}
 	if err := store.ClearPendingAddedTables(ctx, "s1", Corpus); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := store.ReadPendingAddedTables(ctx, "s1"); err != nil || len(got) != 0 {
-		t.Fatalf("after Clear of all: (%v, %v)", got, err)
+	if got, _ := read(); len(got) != 0 {
+		t.Fatalf("after Clear of all: %v", got)
 	}
 	if err := store.ClearPendingAddedTables(ctx, "no-such-stream", []string{"x"}); err != nil {
 		t.Fatalf("Clear on a missing row = %v; want nil", err)
 	}
 }
 
-// EstablishedRoundTrip runs the established/dropped record contract on
-// stream s1, whose row exists in a control table that predates the columns.
-func EstablishedRoundTrip(ctx context.Context, t *testing.T, store ir.EstablishedTablesStore, errStreamNotFound error) {
+// EstablishedRoundTrip runs the established/dropped record contract, and the
+// completion that writes it together with the pending set, on stream s1,
+// whose row exists in a control table that predates the columns.
+func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStreamNotFound error) {
 	t.Helper()
 	read := func() ir.EstablishedRecord {
 		t.Helper()
@@ -104,18 +141,52 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store ir.Establishe
 		}
 		return rec
 	}
+	pending := func() []string {
+		t.Helper()
+		got, _, err := store.ReadPendingAddedTables(ctx, "s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, 0, len(got))
+		for _, p := range got {
+			names = append(names, p.Table)
+		}
+		sort.Strings(names)
+		return names
+	}
+	complete := func(table, token string) error {
+		t.Helper()
+		return store.CompletePendingAddedTable(ctx, "s1", table, token)
+	}
+	recordPending := func(table, token string) {
+		t.Helper()
+		if err := store.RecordPendingAddedTable(ctx, "s1", table, token); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if read().Recorded {
 		t.Fatal("pre-column table: want not recorded")
 	}
-	if err := store.ResetEstablishedRecord(ctx, "s1"); err != nil {
-		t.Fatalf("Reset on a pre-column table (no DDL, nothing to reset): %v", err)
+	if err := store.BeginColdStartRecord(ctx, "no-such-stream"); err != nil {
+		t.Fatalf("BeginColdStartRecord on a missing row: %v; want nothing to mark", err)
 	}
-	if err := store.AddEstablishedTable(ctx, "s1", "orders"); err != nil {
-		t.Fatalf("Add with no record: %v", err)
+
+	// A completion on an unrecorded stream clears its entry and creates no
+	// record (one table is not a record of what the stream established).
+	recordPending("orders", "tok-a")
+	if err := complete("orders", "tok-wrong"); !errors.Is(err, ir.ErrPendingAddSuperseded) {
+		t.Fatalf("Complete under another token = %v; want ErrPendingAddSuperseded", err)
 	}
-	if read().Recorded {
-		t.Fatal("Add on an unrecorded stream created a record")
+	if got := pending(); !reflect.DeepEqual(got, []string{"orders"}) {
+		t.Fatalf("a refused Complete changed the pending set: %q", got)
 	}
+	if err := complete("orders", "tok-a"); err != nil {
+		t.Fatal(err)
+	}
+	if read().Recorded || len(pending()) != 0 {
+		t.Fatalf("Complete on an unrecorded stream: %+v pending %q", read(), pending())
+	}
+
 	if err := store.RecordEstablishedTables(ctx, "s1", Corpus); err != nil {
 		t.Fatal(err)
 	}
@@ -124,38 +195,76 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store ir.Establishe
 	}
 	want := append([]string(nil), Corpus...)
 	sort.Strings(want)
-	if rec := read(); !rec.Recorded || !reflect.DeepEqual(rec.Established, want) || !reflect.DeepEqual(rec.Dropped, []string{"line\nbreak", "orders"}) {
+	if rec := read(); !rec.Recorded || rec.ColdStartInProgress || !reflect.DeepEqual(rec.Established, want) ||
+		!reflect.DeepEqual(rec.Dropped, []string{"line\nbreak", "orders"}) {
 		t.Fatalf("Read = %+v\nwant established %q", rec, want)
 	}
+
 	// A completed add-table re-establishes a dropped table.
-	if err := store.AddEstablishedTable(ctx, "s1", "orders"); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a"}); err != nil {
 		t.Fatal(err)
 	}
-	if rec := read(); !reflect.DeepEqual(rec.Dropped, []string{"line\nbreak"}) {
-		t.Fatalf("Add left orders dropped: %q", rec.Dropped)
+	recordPending("orders", "tok-b")
+	if err := complete("orders", "tok-b"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"a", "orders"}) || !reflect.DeepEqual(rec.Dropped, []string{"line\nbreak"}) {
+		t.Fatalf("after Complete: %+v; want orders established and not dropped", rec)
+	}
+
+	// S-B: an abandoned add (its entry cleared) and a superseded one (its
+	// entry taken over) record nothing.
+	recordPending("x", "tok-x")
+	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := complete("x", "tok-x"); !errors.Is(err, ir.ErrPendingAddSuperseded) {
+		t.Fatalf("Complete of an abandoned add = %v; want ErrPendingAddSuperseded", err)
+	}
+	recordPending("y", "tok-y1")
+	recordPending("y", "tok-y2")
+	if err := complete("y", "tok-y1"); !errors.Is(err, ir.ErrPendingAddSuperseded) {
+		t.Fatalf("Complete of a superseded add = %v; want ErrPendingAddSuperseded", err)
+	}
+	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"a", "orders"}) {
+		t.Fatalf("an abandoned or superseded add recorded established: %q", rec.Established)
+	}
+	if err := complete("y", "tok-y2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// S-A: a cold start in progress is a recorded state, never "unrecorded";
+	// it keeps the dropped set, and a completion leaves it alone.
+	if err := store.BeginColdStartRecord(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); !rec.Recorded || !rec.ColdStartInProgress || len(rec.Established) != 0 || !reflect.DeepEqual(rec.Dropped, []string{"line\nbreak"}) {
+		t.Fatalf("after BeginColdStartRecord: %+v", rec)
+	}
+	recordPending("z", "tok-z")
+	if err := complete("z", "tok-z"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); !rec.ColdStartInProgress || len(rec.Established) != 0 {
+		t.Fatalf("Complete wrote into a cold start in progress: %+v", rec)
 	}
 	if err := store.RecordEstablishedTables(ctx, "s1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if rec := read(); !rec.Recorded || len(rec.Established) != 0 {
-		t.Fatalf("the empty set: %+v; want recorded and empty", rec)
+	if rec := read(); !rec.Recorded || rec.ColdStartInProgress || len(rec.Established) != 0 {
+		t.Fatalf("the empty set: %+v; want recorded, empty, finished", rec)
 	}
+
 	// A multi-database record is left alone by add-table (F3).
 	if err := store.RecordEstablishedTables(ctx, "s1", []string{"app\x00orders"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AddEstablishedTable(ctx, "s1", "orders"); err != nil {
+	recordPending("orders", "tok-c")
+	if err := complete("orders", "tok-c"); err != nil {
 		t.Fatal(err)
 	}
 	if rec := read(); len(rec.Established) != 1 || rec.Established[0] != "app\x00orders" {
 		t.Fatalf("add-table wrote into a multi-database record: %q", rec.Established)
-	}
-	// N3: a cold start's reset leaves the stream unrecorded.
-	if err := store.ResetEstablishedRecord(ctx, "s1"); err != nil {
-		t.Fatal(err)
-	}
-	if rec := read(); rec.Recorded {
-		t.Fatalf("after Reset: %+v; want not recorded", rec)
 	}
 	if err := store.RecordEstablishedTables(ctx, "no-such-stream", []string{"x"}); !errors.Is(err, errStreamNotFound) {
 		t.Fatalf("Record on a missing row = %v; want the stream-not-found error", err)

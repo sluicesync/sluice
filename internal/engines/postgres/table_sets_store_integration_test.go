@@ -44,7 +44,7 @@ func TestEstablishedTablesStore_RoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	_, applier := tableSetsStoreFixture(ctx, t)
-	tablesetstest.EstablishedRoundTrip(ctx, t, applier.(ir.EstablishedTablesStore), errStreamNotFound)
+	tablesetstest.EstablishedRoundTrip(ctx, t, applier.(tablesetstest.Store), errStreamNotFound)
 }
 
 // tableSetsStoreFixture starts a server holding a control table a pre-column

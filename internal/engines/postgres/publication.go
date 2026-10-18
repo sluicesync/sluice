@@ -676,6 +676,17 @@ func publicationMemberSet(ctx context.Context, db *sql.DB, name string) (map[str
 // no single target's control table is authoritative about who is
 // reading the source.
 //
+// Only slots on THIS database count (Bug 321 F-B). A logical slot is
+// bound to one database and decodes that database's WAL through that
+// database's publications, so a stream on another database of the same
+// server can never read this publication: counting it made every
+// ADR-0175 guard refuse — and the INCLUDE-TABLE-SCOPE-DRIFT door's
+// no-record fallback stand down as "shared" — on a server that merely
+// hosts a second database with a sluice stream. Both directions are
+// pinned by TestOtherSluiceSlots_OnlyThisDatabase: a peer on this
+// database still refuses, one on another database does not. (A physical
+// slot's database is NULL, so it never matches; it reads no publication.)
+//
 // Each returned entry is rendered "name (active)" / "name (inactive)"
 // so the refusal tells the operator which conflicting streams are
 // running right now vs holding a resumable position.
@@ -685,6 +696,7 @@ func otherSluiceSlots(ctx context.Context, db *sql.DB, excludeSlot string) ([]st
 		FROM   pg_replication_slots
 		WHERE  slot_name LIKE 'sluice\_%'
 		  AND  slot_name <> $1
+		  AND  database = pg_catalog.current_database()
 		ORDER  BY slot_name`
 	rows, err := db.QueryContext(ctx, slotQuery, excludeSlot)
 	if err != nil {

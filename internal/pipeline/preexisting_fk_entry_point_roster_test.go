@@ -90,9 +90,9 @@ var preExistingFKEntryPointPosture = map[string]map[string]fkEntryPointPosture{
 			why: "`sync` cold-start, single database: same gate, same read, via coldStartGatePreflight",
 		},
 		"(*Streamer).coldStartCopyOneDatabase": {
-			via: "(*Streamer).coldStartCopyOneDatabase",
+			via: "(*Streamer).gateOneDatabaseColdStart",
 			why: "`sync` cold-start, multi-database fan-out: a FIRST copy per database with no shape compare " +
-				"to ride, so it takes the catalog read itself — the one genuine sibling the first cut missed",
+				"to ride, so it takes the catalog read itself (in its per-database gate) — the one genuine sibling the first cut missed",
 		},
 		"(*AddTable).Run": {
 			why: "EXEMPT: the scoped schema holds tables that are not on the target yet, so the catalog lookup " +

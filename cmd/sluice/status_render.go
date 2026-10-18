@@ -109,9 +109,8 @@ func writePendingAddedTablesText(ctx context.Context, out io.Writer, applier ir.
 		return nil
 	}
 	header := false
-	now := time.Now()
 	for _, st := range streams {
-		pending, err := store.ReadPendingAddedTables(ctx, st.StreamID)
+		pending, now, err := store.ReadPendingAddedTables(ctx, st.StreamID)
 		if err != nil {
 			return fmt.Errorf("read pending add-table record: %w", err)
 		}

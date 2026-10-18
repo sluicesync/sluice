@@ -8,7 +8,10 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestTableSetCodecRoundTrip pins the table-set codec (pending_added_tables, established_tables)
@@ -88,4 +91,38 @@ func TestTableSetCodecRoundTrip(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestPendingEntryCodec pins a pending add-table entry's own codec (S-B): the
+// table, both stamps to the millisecond and the token come back exact, and an
+// entry missing its token — the round-3 shape, which would let any run
+// compare-and-set onto it — or carrying a malformed stamp is an error, never
+// a skipped entry. It also pins the cold-start sentinel's disjointness from
+// every real entry.
+func TestPendingEntryCodec(t *testing.T) {
+	started := time.UnixMilli(1_800_000_000_123).UTC()
+	for _, table := range []string{"orders", "naïve_表", " padded ", "\xff\xferaw"} {
+		in := ir.PendingAddedTable{Table: table, Token: "20261018T050000.000Z-0011223344556677", StartedAt: started, HeartbeatAt: started.Add(90 * time.Second)}
+		got, err := DecodePendingEntry(EncodePendingEntry(in))
+		if err != nil || got != in {
+			t.Fatalf("%q: round trip %+v, %v; want %+v", table, got, err, in)
+		}
+	}
+	for _, bad := range []string{
+		"orders\x001\x002",            // no token
+		"orders\x001\x002\x00",        // empty token
+		"orders\x00x\x002\x00tok",     // malformed start
+		"orders\x001\x00y\x00tok",     // malformed heartbeat
+		"orders\x001\x002\x00tok\x00", // a fifth field
+	} {
+		if _, err := DecodePendingEntry(bad); err == nil {
+			t.Errorf("%q decoded; want an error", bad)
+		}
+	}
+	if _, err := DecodePendingEntry(ColdStartInProgressEntry); err == nil {
+		t.Error("the cold-start sentinel decodes as a pending entry")
+	}
+	if strings.IndexByte(ColdStartInProgressEntry, 0) != 0 {
+		t.Error("the sentinel must lead with NUL: no bare table name or namespace\\x00table key does")
+	}
 }

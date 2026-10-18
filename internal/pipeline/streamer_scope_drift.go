@@ -30,19 +30,26 @@ package pipeline
 //     established. Their changes were discarded from then on — on pgoutput
 //     the table stays in the publication and the dispatch filter drops them —
 //     so a scope that re-admits one, by ANY means, refuses (N1).
+//   - the COLD-START-IN-PROGRESS mark ([ir.EstablishedRecord.ColdStartInProgress]):
+//     a cold start passed its point of no return and did not finish. It
+//     refuses every warm resume (COLD-START-INCOMPLETE) before anything else
+//     is read. A recorded stream never returns to "not recorded".
 //   - the PENDING add-table record ([ir.PendingAddedTablesStore]): an add
-//     that started and did not complete; with a fresh heartbeat it is still
-//     running (restartable, [ir.ErrIncludeTableAddInProgress]), with a stale
-//     one it died.
+//     that started and did not complete; with a fresh heartbeat (by the
+//     control-table server's clock) it is still running, with a stale one it
+//     died. A running add overrides the convictions of its own table that its
+//     completion cures (F-A); when every refused table is such a table the
+//     verdict is restartable ([ir.ErrIncludeTableAddInProgress]).
 //   - pg_publication_tables (pgoutput, single namespace): an ESTABLISHED
 //     table missing from a FOR TABLE publication is no longer sent at all — a
 //     table dropped and recreated while the stream was stopped leaves the
 //     publication (N2). Missing membership is a true positive whether or not
 //     the publication is shared.
-//   - for a stream with no record (cold-started before it existed, or a
-//     cold start whose record write failed): its publication, for literal
-//     includes, only when no other sluice slot exists. Otherwise no evidence,
-//     and the door says so (INCLUDE-TABLE-SCOPE-UNRECORDED).
+//   - for a stream with no record (cold-started by an older sluice, or only
+//     ever cold-started on a control table this role cannot ALTER): its
+//     publication, for literal includes, only when no other sluice slot
+//     exists on the same database. Otherwise no evidence, and the door says
+//     so (INCLUDE-TABLE-SCOPE-UNRECORDED).
 //
 // # When "not established" is a WARN and when it is a refusal
 //
@@ -167,7 +174,21 @@ type scopeDriftTable struct {
 	heartbeatAge                 time.Duration
 }
 
-// onlyInProgress reports a table convicted by nothing but a live add-table.
+// yieldToLiveAdd lets a running add-table (F-A) override the convictions it
+// is about to cure: a table being brought in is, until it completes, never
+// established — literally named, would-apply, previously dropped, missing
+// from a no-record stream's publication — and every one of those is what the
+// add's completion fixes, so a restart after it is the remedy, not an
+// operator decision. N2 (established and gone from the publication) is not
+// something an add cures, and still convicts.
+func (d *scopeDriftTable) yieldToLiveAdd() {
+	if d.addInProgress {
+		d.dropped, d.notEstablished, d.appliedWhy, d.legacyUnpublished = false, false, "", false
+	}
+}
+
+// onlyInProgress reports a table convicted by nothing but a live add-table
+// (after [scopeDriftTable.yieldToLiveAdd]).
 func (d scopeDriftTable) onlyInProgress() bool {
 	return d.addInProgress && !d.addIncomplete && !d.dropped && !d.notEstablished &&
 		d.appliedWhy == "" && !d.unpublished && !d.legacyUnpublished
@@ -192,6 +213,14 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 	if err != nil {
 		return controlReadFailure(fmt.Errorf("pipeline: include-table scope door: %w", err))
 	}
+	rec, err := readEstablishedRecord(ctx, applier, streamID)
+	if err != nil {
+		return err
+	}
+	if rec.ColdStartInProgress {
+		slog.ErrorContext(ctx, "warm resume refused: INCLUDE-TABLE-SCOPE-DRIFT (COLD-START-INCOMPLETE)", slog.String("stream_id", streamID))
+		return coldStartIncompleteError(streamID)
+	}
 	inScope := func(table string) bool { return s.Filter.Allows(table) || liveAdded[table] }
 	scope, err := s.readStreamScope(ctx, inScope)
 	if err != nil {
@@ -210,10 +239,6 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 		return err
 	}
 	membership, err := s.readPublicationMembership(ctx, scope.tables)
-	if err != nil {
-		return err
-	}
-	rec, err := readEstablishedRecord(ctx, applier, streamID)
 	if err != nil {
 		return err
 	}
@@ -299,16 +324,18 @@ func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplie
 	if !ok {
 		return nil
 	}
-	pending, err := store.ReadPendingAddedTables(ctx, streamID)
+	// now is the control-table server's clock, the one every entry was
+	// stamped with (S-C): this host's clock is never compared with another's.
+	pending, now, err := store.ReadPendingAddedTables(ctx, streamID)
 	if err != nil {
 		return controlReadFailure(fmt.Errorf("pipeline: include-table scope door: %w", err))
 	}
-	now := time.Now()
 	var absent []string
 	for _, p := range pending {
 		if !inScope(p.Table) {
 			continue
 		}
+		warnFutureHeartbeat(ctx, p, now)
 		found := false
 		for _, t := range scope {
 			if t.name != p.Table {
@@ -430,7 +457,7 @@ func (s *Streamer) changesWouldApply(ctx context.Context, scope streamScope, can
 }
 
 // judgeLegacy is the no-record fallback: the publication, for literal
-// includes, only when no other sluice slot exists on the source.
+// includes, only when no other sluice slot exists on the same source database.
 func (s *Streamer) judgeLegacy(ctx context.Context, streamID string, scope []scopeTable, m *ir.PublicationMembership, entry func(scopeTable) *scopeDriftTable) {
 	// Seeding a record now from the scope that passed would record a
 	// never-copied table as copied — the case this door exists for — so the
@@ -445,7 +472,7 @@ func (s *Streamer) judgeLegacy(ctx context.Context, streamID string, scope []sco
 		return
 	}
 	slog.WarnContext(ctx, "INCLUDE-TABLE-SCOPE-UNRECORDED: this stream has no record of the tables it established "+
-		"(it was cold-started by an older sluice, or a cold start could not write the record), so a table added to its "+
+		"(it was cold-started by an older sluice, or only on a control table this role cannot ALTER), so a table added to its "+
 		"scope without `sluice schema add-table` cannot be told from one it copied; the next cold start "+
 		"(--restart-from-scratch) records it",
 		slog.String("stream_id", streamID))
@@ -458,6 +485,7 @@ func (s *Streamer) scopeDriftRefusal(ctx context.Context, streamID string, m *ir
 	tables := make([]scopeDriftTable, 0, len(drift))
 	inProgress := true
 	for _, d := range drift {
+		d.yieldToLiveAdd()
 		tables = append(tables, *d)
 		inProgress = inProgress && d.onlyInProgress()
 	}
@@ -628,69 +656,91 @@ func (s *Streamer) includeTableScopeDriftError(streamID, publication string, tab
 		ir.ErrIncludeTableScopeDrift, streamID, len(tables), strings.Join(parts, ", "), remedy)
 }
 
-// resetStreamRecordsForColdStart is a cold start's first step on every lane:
-// the apply marks go (ADR-0190) and the established record is reset.
-func (s *Streamer) resetStreamRecordsForColdStart(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
-	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
-		return err
-	}
-	return s.resetEstablishedForColdStart(ctx, applier, streamID)
+// coldStartIncompleteError is the door's refusal of a stream whose record
+// reads COLD-START-IN-PROGRESS: a cold start passed its point of no return
+// and did not finish, so the target holds neither the copy the persisted
+// position describes nor a finished new one.
+func coldStartIncompleteError(streamID string) error {
+	return fmt.Errorf("pipeline: warm resume refused: %w: COLD-START-INCOMPLETE: stream %q began a cold start that "+
+		"did not finish — it had started changing the target (its established-table record reads cold start in "+
+		"progress), so the persisted position no longer describes what the target holds, and resuming from it "+
+		"would leave every table the cold start touched wrong while the stream reported healthy. Re-run the cold "+
+		"start: the same `sluice sync start` command with --restart-from-scratch if that is what was interrupted "+
+		"(on a Postgres source, first drop the stream's replication slot with `sluice slot drop` if that run's "+
+		"refusal says it exists), or with --reset-target-data if that was",
+		ir.ErrIncludeTableScopeDrift, streamID)
 }
 
-// resetEstablishedForColdStart sets the stream's established record to "not
-// recorded" before a cold start copies anything (N3), remembering the dropped
-// set so tables the copy does not cover stay dropped. Any failure from here
-// to [Streamer.recordColdStartEstablished] then leaves the stream unrecorded,
-// never holding a record of an older copy: a record that names a table the
-// new anchor skipped over would pass it with every change between the old
-// position and the new anchor missing. A reset that fails stops the cold
-// start (restartable): proceeding would be exactly that stale record.
-func (s *Streamer) resetEstablishedForColdStart(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
-	s.coldStartPriorDropped = nil
+// beginColdStartRecord marks the stream's established record
+// COLD-START-IN-PROGRESS ([ir.EstablishedRecord.ColdStartInProgress]) at a
+// cold start's point of no return: immediately before its first destructive
+// step (the target drop of --reset-target-data or --restart-from-scratch),
+// or, on a branch that drops nothing, once its last refusal has passed and
+// the next step is the first target write of the copy. Everything before
+// that point — every preflight, the snapshot open that refuses "slot already
+// exists" — leaves the record exactly as it was, so a refused cold start
+// leaves the stream judged on the record it had. (The EnsurePublication that
+// runs before those refusals may have widened the publication; the record,
+// not the publication, is what convicts.) A record is never set back to "not
+// recorded": that state is for streams that never had one.
+//
+// A failure to mark a RECORDED stream stops the cold start before it changes
+// anything: proceeding would leave a record describing a target this cold
+// start is about to change. A stream with no record (no row yet, or an older
+// stream on a control table this role cannot ALTER) has nothing to protect,
+// and the failure WARNs.
+func beginColdStartRecord(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
 	store, ok := applier.(ir.EstablishedTablesStore)
 	if !ok {
 		return nil
 	}
-	rec, err := store.ReadEstablishedRecord(ctx, streamID)
-	if err != nil {
-		return controlReadFailure(fmt.Errorf("pipeline: cold start: read established-table record: %w", err))
+	err := store.BeginColdStartRecord(ctx, streamID)
+	if err == nil {
+		return nil
 	}
-	s.coldStartPriorDropped = rec.Dropped
-	if err := store.ResetEstablishedRecord(ctx, streamID); err != nil {
-		return controlReadFailure(fmt.Errorf("pipeline: cold start: reset established-table record: %w", err))
+	if rec, rerr := store.ReadEstablishedRecord(ctx, streamID); rerr == nil && !rec.Recorded {
+		slog.WarnContext(ctx, "cold start could not mark the established-table record in progress; the stream has no "+
+			"record yet, so there is nothing to protect", slog.String("stream_id", streamID), slog.String("error", err.Error()))
+		return nil
 	}
-	return nil
+	return controlReadFailure(fmt.Errorf("pipeline: cold start: mark the established-table record in progress before "+
+		"changing the target (the target was not changed): %w", err))
 }
 
-// recordColdStartEstablished records the set a cold-start lane copied as the
-// stream's established tables, keeps every previously dropped table the copy
-// did not cover dropped, and clears the add-table pending entries of the
-// tables it copied — only those (N1): a pending table the copy left out is
-// still a partial copy if a later scope re-admits it. Failures WARN: the
-// copy succeeded, and the record stays unrecorded, which the next warm
-// resume says itself.
+// recordColdStartEstablished ends a successful cold-start lane's
+// COLD-START-IN-PROGRESS state: the dropped set loses the tables the copy
+// covered (read now, so a drop recorded since is kept), the established set
+// becomes the copied set, and the add-table pending entries of the copied
+// tables — only those (N1): a pending table the copy left out is still a
+// partial copy if a later scope re-admits it — are cleared. Dropped is
+// written before established, so until the established write lands the
+// record still reads in progress (which refuses) rather than half-written.
+// Failures are logged, not returned — the copy and the hand-off succeeded
+// and the stream is running — at ERROR when the stream holds the in-progress
+// mark (the next warm resume refuses COLD-START-INCOMPLETE until a cold start
+// records it; the same holds for a process killed between the anchor write
+// and this one: loud, never a stale record), and as the
+// INCLUDE-TABLE-SCOPE-UNRECORDED WARN when it has no record at all.
 func (s *Streamer) recordColdStartEstablished(ctx context.Context, applier ir.ChangeApplier, streamID string) {
-	keys, priorDropped := s.coldStartEstablished, s.coldStartPriorDropped
-	s.coldStartEstablished, s.coldStartPriorDropped = nil, nil
+	keys := s.coldStartEstablished
+	s.coldStartEstablished = nil
 	if keys == nil {
 		return
 	}
 	if store, ok := applier.(ir.EstablishedTablesStore); ok {
-		copied := toSet(keys)
-		var dropped []string
-		for _, k := range priorDropped {
-			if !copied[k] {
-				dropped = append(dropped, k)
+		if err := recordEstablishedAfterCopy(ctx, store, streamID, keys); err != nil {
+			if rec, rerr := store.ReadEstablishedRecord(ctx, streamID); rerr == nil && !rec.Recorded {
+				// A first cold start on a control table this role cannot
+				// ALTER: there never was a record, and there still is none.
+				slog.WarnContext(ctx, "INCLUDE-TABLE-SCOPE-UNRECORDED: cold start could not record the tables it copied, and "+
+					"the stream has no record; a later warm resume cannot tell a table added to its scope from one this copy "+
+					"brought in (add the established_tables and dropped_tables columns to the control table)",
+					slog.String("stream_id", streamID), slog.String("error", err.Error()))
+			} else {
+				slog.ErrorContext(ctx, "cold start could not record the tables it copied; the next warm resume of this stream "+
+					"refuses COLD-START-INCOMPLETE until a cold start records them",
+					slog.String("stream_id", streamID), slog.String("error", err.Error()))
 			}
-		}
-		if err := store.RecordEstablishedTables(ctx, streamID, keys); err != nil {
-			slog.WarnContext(ctx, "INCLUDE-TABLE-SCOPE-UNRECORDED: cold start could not record the tables it copied; "+
-				"a later warm resume cannot tell a table added to the scope from one this copy brought in "+
-				"(on a control table this role cannot ALTER, add the established_tables and dropped_tables columns)",
-				slog.String("stream_id", streamID), slog.String("error", err.Error()))
-		} else if err := store.RecordDroppedTables(ctx, streamID, dropped); err != nil {
-			slog.WarnContext(ctx, "cold start could not record the stream's dropped tables; re-admitting one later may "+
-				"not be refused", slog.String("stream_id", streamID), slog.String("error", err.Error()))
 		}
 	}
 	pstore, ok := applier.(ir.PendingAddedTablesStore)
@@ -706,6 +756,28 @@ func (s *Streamer) recordColdStartEstablished(ctx context.Context, applier ir.Ch
 			"next warm resume will refuse INCLUDE-TABLE-SCOPE-DRIFT naming them",
 			slog.String("stream_id", streamID), slog.String("error", err.Error()))
 	}
+}
+
+// recordEstablishedAfterCopy writes the copied set: dropped minus copied,
+// then established.
+func recordEstablishedAfterCopy(ctx context.Context, store ir.EstablishedTablesStore, streamID string, keys []string) error {
+	rec, err := store.ReadEstablishedRecord(ctx, streamID)
+	if err != nil {
+		return err
+	}
+	copied := toSet(keys)
+	var dropped []string
+	for _, k := range rec.Dropped {
+		if !copied[k] {
+			dropped = append(dropped, k)
+		}
+	}
+	if !sameSet(dropped, rec.Dropped) {
+		if err := store.RecordDroppedTables(ctx, streamID, dropped); err != nil {
+			return err
+		}
+	}
+	return store.RecordEstablishedTables(ctx, streamID, keys)
 }
 
 func toSet(xs []string) map[string]bool {

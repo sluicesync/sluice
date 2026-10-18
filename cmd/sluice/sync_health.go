@@ -211,12 +211,12 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 		applySkippedTablesHealth(&result, records, s.StreamID)
 	}
 	if store, ok := applier.(ir.PendingAddedTablesStore); ok {
-		pending, err := store.ReadPendingAddedTables(ctx, s.StreamID)
+		pending, now, err := store.ReadPendingAddedTables(ctx, s.StreamID)
 		if err != nil {
 			runErr = err
 			return operationalError{err: fmt.Errorf("read pending add-table record: %w", err)}
 		}
-		applyPendingAddsHealth(&result, pending, time.Now())
+		applyPendingAddsHealth(&result, pending, now)
 	}
 
 	// Optional source-side probe (v0.15.0, fixed in v0.15.1 / Bug 32).

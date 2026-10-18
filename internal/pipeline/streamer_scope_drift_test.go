@@ -6,6 +6,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -18,20 +19,44 @@ import (
 // pending add-tables and the live-added tables, with every write logged.
 type scopeDriftApplier struct {
 	ir.ChangeApplier
-	pending   []ir.PendingAddedTable
-	pendErr   error
-	rec       ir.EstablishedRecord
-	recordErr error
-	writes    []string // "established=a,b" / "dropped=a" / "reset" / "clear=a"
-	liveAdded []string
+	pending     []ir.PendingAddedTable
+	pendErr     error
+	serverNow   time.Time // the control-table server's clock; zero = this host's
+	rec         ir.EstablishedRecord
+	recordErr   error
+	beginErr    error
+	touchErr    error
+	completeErr error
+	writes      []string // "established=a,b" / "dropped=a" / "begin" / "clear=a" / "touch=a alive" / "complete=a"
+	liveAdded   []string
 }
 
-func (a *scopeDriftApplier) RecordPendingAddedTable(context.Context, string, string, time.Time) error {
+func (a *scopeDriftApplier) now() time.Time {
+	if a.serverNow.IsZero() {
+		return time.Now()
+	}
+	return a.serverNow
+}
+
+func (a *scopeDriftApplier) RecordPendingAddedTable(context.Context, string, string, string) error {
 	return errors.New("not used")
 }
 
-func (a *scopeDriftApplier) HeartbeatPendingAddedTable(context.Context, string, string, time.Time) error {
-	return errors.New("not used")
+func (a *scopeDriftApplier) TouchPendingAddedTable(_ context.Context, _, table, _ string, alive bool) error {
+	state := "stopped"
+	if alive {
+		state = "alive"
+	}
+	a.writes = append(a.writes, "touch="+table+" "+state)
+	return a.touchErr
+}
+
+func (a *scopeDriftApplier) CompletePendingAddedTable(_ context.Context, _, table, _ string) error {
+	if a.completeErr != nil {
+		return a.completeErr
+	}
+	a.writes = append(a.writes, "complete="+table)
+	return nil
 }
 
 func (a *scopeDriftApplier) ClearPendingAddedTables(_ context.Context, _ string, tables []string) error {
@@ -39,17 +64,20 @@ func (a *scopeDriftApplier) ClearPendingAddedTables(_ context.Context, _ string,
 	return nil
 }
 
-func (a *scopeDriftApplier) ReadPendingAddedTables(context.Context, string) ([]ir.PendingAddedTable, error) {
-	return a.pending, a.pendErr
+func (a *scopeDriftApplier) ReadPendingAddedTables(context.Context, string) ([]ir.PendingAddedTable, time.Time, error) {
+	return a.pending, a.now(), a.pendErr
 }
 
 func (a *scopeDriftApplier) ReadEstablishedRecord(context.Context, string) (ir.EstablishedRecord, error) {
 	return a.rec, nil
 }
 
-func (a *scopeDriftApplier) ResetEstablishedRecord(context.Context, string) error {
-	a.writes = append(a.writes, "reset")
-	a.rec = ir.EstablishedRecord{}
+func (a *scopeDriftApplier) BeginColdStartRecord(context.Context, string) error {
+	if a.beginErr != nil {
+		return a.beginErr
+	}
+	a.writes = append(a.writes, "begin")
+	a.rec = ir.EstablishedRecord{Recorded: true, ColdStartInProgress: true, Dropped: a.rec.Dropped}
 	return nil
 }
 
@@ -58,7 +86,7 @@ func (a *scopeDriftApplier) RecordEstablishedTables(_ context.Context, _ string,
 		return a.recordErr
 	}
 	a.writes = append(a.writes, "established="+strings.Join(tables, ","))
-	a.rec.Recorded, a.rec.Established = true, tables
+	a.rec.Recorded, a.rec.ColdStartInProgress, a.rec.Established = true, false, tables
 	return nil
 }
 
@@ -66,10 +94,6 @@ func (a *scopeDriftApplier) RecordDroppedTables(_ context.Context, _ string, tab
 	a.writes = append(a.writes, "dropped="+strings.Join(tables, ","))
 	a.rec.Dropped = tables
 	return nil
-}
-
-func (a *scopeDriftApplier) AddEstablishedTable(context.Context, string, string) error {
-	return errors.New("not used")
 }
 
 func (a *scopeDriftApplier) ReadLiveAddedTables(context.Context, string) ([]string, error) {
@@ -344,11 +368,49 @@ func TestScopeDriftDoor_PendingArm(t *testing.T) {
 		requireDrift(t, driftStreamer(t, pub(), nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, withPending(stale, "kd", "nt"), "st"),
 			"nt (", reasonIncomplete)
 	})
-	t.Run("fresh plus another conviction: terminal", func(t *testing.T) {
-		err := driftStreamer(t, pub(), nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, withPending(fresh, "kd"), "st")
-		if !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
-			t.Fatalf("a live add plus an unestablished delivered table must be terminal, got %v", err)
+	// F-A: a live add overrides the convictions of ITS table that its
+	// completion cures — never established (literal or delivered) and
+	// previously dropped — so a restart racing a real add-table defers.
+	for name, mk := range map[string]func() (*Streamer, *scopeDriftApplier){
+		"delivered, never established": func() (*Streamer, *scopeDriftApplier) {
+			return driftStreamer(t, pub(), nonScoperEngine{}), withPending(fresh, "kd")
+		},
+		"named literally, never established": func() (*Streamer, *scopeDriftApplier) {
+			return driftStreamer(t, pub(), nonScoperEngine{}, "kd", "nt"), withPending(fresh, "kd")
+		},
+		"previously dropped": func() (*Streamer, *scopeDriftApplier) {
+			app := withPending(fresh, "kd")
+			app.rec.Dropped = []string{"nt"}
+			return driftStreamer(t, pub(), nonScoperEngine{}), app
+		},
+		"no record, literal, unpublished": func() (*Streamer, *scopeDriftApplier) {
+			src := pub()
+			src.published = []string{"kd"}
+			return driftStreamer(t, src, nonScoperEngine{}, "kd", "nt"), &scopeDriftApplier{pending: []ir.PendingAddedTable{fresh}}
+		},
+	} {
+		t.Run("F-A: the live add overrides its own table: "+name, func(t *testing.T) {
+			s, app := mk()
+			err := s.phaseRefuseIncludeTableScopeDrift(ctx, app, "st")
+			if !errors.Is(err, ir.ErrIncludeTableAddInProgress) || errors.Is(err, ir.ErrIncludeTableScopeDrift) {
+				t.Fatalf("want only INCLUDE-TABLE-ADD-IN-PROGRESS, got %v", err)
+			}
+		})
+	}
+	t.Run("F-A: another table's conviction still counts", func(t *testing.T) {
+		src := newScopeDriftEngine("kd", "nt", "x")
+		src.published = []string{"kd", "nt", "x"}
+		err := driftStreamer(t, src, nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, withPending(fresh, "kd"), "st")
+		requireDrift(t, err, "x (never copied by this stream", "nt (its `sluice schema add-table` is still running")
+		if strings.Contains(err.Error(), "nt (never copied") {
+			t.Fatalf("the live add's own table kept a conviction the add cures: %v", err)
 		}
+	})
+	t.Run("F-A: N2 is not overridden", func(t *testing.T) {
+		src := pub()
+		src.published = []string{"kd"}
+		requireDrift(t, driftStreamer(t, src, nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, withPending(fresh, "kd", "nt"), "st"),
+			reasonUnpublished)
 	})
 	t.Run("gone from the source: ignored", func(t *testing.T) {
 		src := newScopeDriftEngine("kd")
@@ -364,6 +426,74 @@ func TestScopeDriftDoor_PendingArm(t *testing.T) {
 			t.Fatalf("want a restartable non-marker failure, got %T %v", err, err)
 		}
 	})
+}
+
+// TestScopeDriftDoor_ServerClock is S-C: the pending classifier compares the
+// entry against the control-table server's now, never this host's. The server
+// here runs three hours ahead of the host: an entry it stamped ten seconds
+// ago is fresh (by the host's clock it would be from the future), and one
+// stamped beyond the tolerance ahead of the server's own now is stale.
+func TestScopeDriftDoor_ServerClock(t *testing.T) {
+	ctx := context.Background()
+	serverNow := time.Now().Add(3 * time.Hour)
+	run := func(heartbeat time.Time) error {
+		src := newScopeDriftEngine("kd", "nt")
+		src.published = []string{"kd", "nt"}
+		app := recorded([]string{"kd", "nt"})
+		app.serverNow = serverNow
+		app.pending = []ir.PendingAddedTable{{Table: "nt", Token: "t", StartedAt: heartbeat, HeartbeatAt: heartbeat}}
+		return driftStreamer(t, src, nonScoperEngine{}).phaseRefuseIncludeTableScopeDrift(ctx, app, "st")
+	}
+	if err := run(serverNow.Add(-10 * time.Second)); !errors.Is(err, ir.ErrIncludeTableAddInProgress) {
+		t.Fatalf("an entry the server stamped 10s ago: want INCLUDE-TABLE-ADD-IN-PROGRESS, got %v", err)
+	}
+	if err := run(time.Now().Add(-10 * time.Second)); !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
+		t.Fatalf("an entry 10s old by the HOST's clock is 3h old by the server's: want terminal, got %v", err)
+	}
+	if err := run(serverNow.Add(ir.PendingAddFutureTolerance + time.Minute)); !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
+		t.Fatalf("a heartbeat ahead of the server's clock: want stale (terminal), got %v", err)
+	}
+	if err := run(serverNow.Add(ir.PendingAddFutureTolerance / 2)); !errors.Is(err, ir.ErrIncludeTableAddInProgress) {
+		t.Fatalf("a heartbeat within the future tolerance: want fresh, got %v", err)
+	}
+}
+
+// TestPendingAddedTableClassifier pins Fresh / FromTheFuture at their
+// boundaries.
+func TestPendingAddedTableClassifier(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	for _, c := range []struct {
+		beat          time.Duration // heartbeat relative to now
+		fresh, future bool
+	}{
+		{0, true, false},
+		{-ir.PendingAddStaleAfter + time.Millisecond, true, false},
+		{-ir.PendingAddStaleAfter, false, false},
+		{ir.PendingAddFutureTolerance, true, false},
+		{ir.PendingAddFutureTolerance + time.Millisecond, false, true},
+	} {
+		p := ir.PendingAddedTable{HeartbeatAt: now.Add(c.beat)}
+		if p.Fresh(now) != c.fresh || p.FromTheFuture(now) != c.future {
+			t.Errorf("heartbeat %v: Fresh=%v FromTheFuture=%v; want %v %v", c.beat, p.Fresh(now), p.FromTheFuture(now), c.fresh, c.future)
+		}
+	}
+}
+
+// TestScopeDriftDoor_ColdStartInProgress is S-A: a record a cold start
+// marked at its point of no return refuses every warm resume terminally —
+// whatever the scope — until a cold start finishes.
+func TestScopeDriftDoor_ColdStartInProgress(t *testing.T) {
+	ctx := context.Background()
+	src := newScopeDriftEngine("kd")
+	src.published = []string{"kd"}
+	app := &scopeDriftApplier{rec: ir.EstablishedRecord{Recorded: true, ColdStartInProgress: true}}
+	err := driftStreamer(t, src, nonScoperEngine{}, "kd").phaseRefuseIncludeTableScopeDrift(ctx, app, "st")
+	requireDrift(t, err, "COLD-START-INCOMPLETE", "--restart-from-scratch")
+	if refusalARestartRepeats(err) == nil {
+		t.Fatal("COLD-START-INCOMPLETE must be terminal: a restart reads the same record")
+	}
+	app.rec = ir.EstablishedRecord{Recorded: true, Established: []string{"kd"}}
+	requireNoDrift(t, driftStreamer(t, src, nonScoperEngine{}, "kd").phaseRefuseIncludeTableScopeDrift(ctx, app, "st"))
 }
 
 // TestScopeDriftDoor_LegacyFallback: no record — the publication, for literal
@@ -398,34 +528,49 @@ func TestScopeDriftRefusal_MultiDatabaseRemedy(t *testing.T) {
 	}
 }
 
-// TestColdStartEstablishedRecord is N3: a cold start resets the record before
-// it copies, so a failed write leaves the stream UNRECORDED rather than
-// holding the older copy's record; on success, previously dropped tables the
-// copy did not cover stay dropped and only the copied tables' pending
-// entries are cleared.
+// TestColdStartEstablishedRecord is S-A: a recorded stream never returns to
+// "not recorded". The point of no return marks it in progress, keeping the
+// dropped set; a failed final write leaves it in progress (which refuses), not
+// unrecorded (which the legacy fallback can pass); success writes dropped
+// minus copied, then established, and clears only the copied tables' pending
+// entries. A mark that fails stops the cold start of a recorded stream and
+// only WARNs on one with no record.
 func TestColdStartEstablishedRecord(t *testing.T) {
 	ctx := context.Background()
 	s := &Streamer{}
 
 	app := recorded([]string{"kd", "nt", "old"}, "gone", "nt2")
-	app.recordErr = errors.New("connection reset")
-	if err := s.resetEstablishedForColdStart(ctx, app, "st"); err != nil {
+	if err := beginColdStartRecord(ctx, app, "st"); err != nil {
 		t.Fatal(err)
 	}
+	if !app.rec.Recorded || !app.rec.ColdStartInProgress || len(app.rec.Dropped) != 2 {
+		t.Fatalf("after the mark: %+v; want recorded, in progress, dropped kept", app.rec)
+	}
+	app.recordErr = errors.New("connection reset")
 	s.coldStartEstablished = []string{"kd"}
 	s.recordColdStartEstablished(ctx, app, "st")
-	if app.rec.Recorded {
-		t.Fatalf("a failed record write left a record %+v; want the stream unrecorded", app.rec)
+	if !app.rec.Recorded || !app.rec.ColdStartInProgress {
+		t.Fatalf("a failed record write left %+v; want the in-progress mark, never unrecorded", app.rec)
 	}
 
 	app = recorded([]string{"kd"}, "nt", "nt2")
-	if err := s.resetEstablishedForColdStart(ctx, app, "st"); err != nil {
+	if err := beginColdStartRecord(ctx, app, "st"); err != nil {
 		t.Fatal(err)
 	}
 	s.coldStartEstablished = []string{"kd", "nt"}
 	s.recordColdStartEstablished(ctx, app, "st")
-	if got := strings.Join(app.writes, " "); got != "reset established=kd,nt dropped=nt2 clear=kd,nt" {
+	if got := strings.Join(app.writes, " "); got != "begin dropped=nt2 established=kd,nt clear=kd,nt" {
 		t.Fatalf("writes %q", got)
+	}
+
+	app = recorded([]string{"kd"})
+	app.beginErr = errors.New("permission denied")
+	if err := beginColdStartRecord(ctx, app, "st"); err == nil || !strings.Contains(err.Error(), "the target was not changed") {
+		t.Fatalf("a failed mark of a recorded stream: %v; want the cold start stopped", err)
+	}
+	app = &scopeDriftApplier{beginErr: errors.New("permission denied")}
+	if err := beginColdStartRecord(ctx, app, "st"); err != nil {
+		t.Fatalf("a failed mark of a stream with no record: %v; want a WARN only", err)
 	}
 }
 
@@ -484,11 +629,70 @@ func TestAddTableUndoFailedAdd(t *testing.T) {
 		}
 	})
 
+	t.Run("S-B: an entry no longer this run's is not undone", func(t *testing.T) {
+		src := &addTableUndoSource{}
+		app := &scopeDriftApplier{touchErr: ir.ErrPendingAddSuperseded}
+		a := &AddTable{Source: src, TableName: "nt", publicationAddedByThisRun: true}
+		err := a.undoFailedAdd(context.Background(), app, cause)
+		if !errors.Is(err, cause) || !errors.Is(err, ir.ErrPendingAddSuperseded) || !strings.Contains(err.Error(), "abandoned") {
+			t.Fatalf("got %v", err)
+		}
+		if len(src.dropped) != 0 {
+			t.Fatalf("dropped %v from the publication; it belongs to whoever retired the entry", src.dropped)
+		}
+	})
+
 	t.Run("a failed take-back is named", func(t *testing.T) {
 		src := &addTableUndoSource{dropErr: errors.New("permission denied")}
 		a := &AddTable{Source: src, TableName: "nt", publicationAddedByThisRun: true}
 		if err := a.undoFailedAdd(context.Background(), &scopeDriftApplier{}, cause); !strings.Contains(err.Error(), "FAILED (permission denied)") {
 			t.Fatalf("got %v", err)
+		}
+	})
+}
+
+// TestAddTablePendingTokenCAS is S-B on the add-table side: a heartbeat that
+// finds its entry abandoned or taken over cancels the copy with
+// ErrPendingAddSuperseded as the cause, and a completion refused for the same
+// reason is reported as such, recording nothing.
+func TestAddTablePendingTokenCAS(t *testing.T) {
+	t.Run("a superseded heartbeat stops the copy", func(t *testing.T) {
+		app := &scopeDriftApplier{touchErr: fmt.Errorf("postgres: pending add-table %q: %w", "nt", ir.ErrPendingAddSuperseded)}
+		a := &AddTable{TableName: "nt", pendingToken: "tok", pendingHeartbeatEvery: time.Millisecond}
+		copyCtx, cancelCopy := context.WithCancelCause(context.Background())
+		defer cancelCopy(nil)
+		stop := a.startPendingHeartbeat(copyCtx, app, cancelCopy)
+		defer stop()
+		select {
+		case <-copyCtx.Done():
+		case <-time.After(10 * time.Second):
+			t.Fatal("the copy kept running after its pending entry was superseded")
+		}
+		if !errors.Is(context.Cause(copyCtx), ir.ErrPendingAddSuperseded) {
+			t.Fatalf("cause %v; want ErrPendingAddSuperseded", context.Cause(copyCtx))
+		}
+	})
+	t.Run("a failed heartbeat of another kind only WARNs", func(t *testing.T) {
+		app := &scopeDriftApplier{touchErr: errors.New("connection reset")}
+		a := &AddTable{TableName: "nt", pendingToken: "tok", pendingHeartbeatEvery: 10 * time.Millisecond}
+		copyCtx, cancelCopy := context.WithCancelCause(context.Background())
+		defer cancelCopy(nil)
+		stop := a.startPendingHeartbeat(copyCtx, app, cancelCopy)
+		time.Sleep(50 * time.Millisecond)
+		stop()
+		if copyCtx.Err() != nil {
+			t.Fatalf("a transient heartbeat failure cancelled the copy: %v", context.Cause(copyCtx))
+		}
+	})
+	t.Run("a superseded completion records nothing and says so", func(t *testing.T) {
+		app := &scopeDriftApplier{completeErr: ir.ErrPendingAddSuperseded}
+		a := &AddTable{TableName: "nt", pendingToken: "tok"}
+		err := a.recordCompletedAdd(context.Background(), app)
+		if !errors.Is(err, ir.ErrPendingAddSuperseded) || !strings.Contains(err.Error(), "without recording the table as established") {
+			t.Fatalf("got %v", err)
+		}
+		if len(app.writes) != 0 {
+			t.Fatalf("writes %v", app.writes)
 		}
 	})
 }

@@ -1599,9 +1599,8 @@ type Streamer struct {
 	// over an add-table that a live stream is legitimately waiting on
 	// (streamer_scope_drift.go). coldStartEstablished is the set a cold-start
 	// lane copied, recorded when its branch of phaseOpenChangeStream returns.
-	scopeDriftDoorDone    bool
-	coldStartEstablished  []string
-	coldStartPriorDropped []string
+	scopeDriftDoorDone   bool
+	coldStartEstablished []string
 
 	uniqueKeyDoor         *uniqueKeyDoorState
 	uniqueKeyRecheckErr   atomic.Pointer[error]

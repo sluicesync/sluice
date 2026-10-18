@@ -20,7 +20,14 @@
 //   - An unfiltered or glob-admitted new table does NOT refuse (ADR-0021; the
 //     L1 regression of round 1) and is named in a WARN.
 //   - A stream from before the record (legacy) resumes, and refuses through
-//     its unshared publication.
+//     its unshared publication — a slot on another database of the server
+//     does not make it shared (F-B).
+//   - A cold start refused before its point of no return (the slot-exists
+//     refusal, a schema preflight) leaves the record as it was, so the plain
+//     restart after it still refuses (S-A).
+//   - A restart racing a real, still-copying add-table defers restartably and
+//     converges once the add completes (F-A); `--abandon` drops the dead
+//     add's snapshot slot (F-C).
 //
 // SLUICE_SCOPE_DRIFT_BIN, when set, runs a prebuilt binary instead of
 // building this tree — how the pins were shown red against the previous
@@ -737,8 +744,9 @@ func waitLog(t *testing.T, run *straddleBinaryRun, substr string) {
 }
 
 // setPending writes a pending add-table entry for table straight into the
-// control row — the state a running (fresh heartbeat) or killed (stale) add
-// leaves, which no add-table process can be held in for a test.
+// control row — the state a killed add leaves (stale), or a running one
+// (fresh) for the `sync health` rendering. The container shares this host's
+// kernel clock, so a host-clock stamp is a server-clock stamp here.
 func (r *scopeDriftRig) setPending(table string, heartbeat time.Time) {
 	r.t.Helper()
 	db, err := sql.Open(r.sqlDriver, r.tgt)
@@ -751,7 +759,8 @@ func (r *scopeDriftRig) setPending(table string, heartbeat time.Time) {
 	if _, err := db.ExecContext(ctx, "ALTER TABLE sluice_cdc_state ADD COLUMN IF NOT EXISTS pending_added_tables TEXT"); err != nil {
 		r.t.Fatal(err)
 	}
-	value := appliershared.EncodeTableSet([]string{appliershared.EncodePendingEntry(table, heartbeat.Add(-time.Hour), heartbeat)})
+	entry := ir.PendingAddedTable{Table: table, Token: "injected", StartedAt: heartbeat.Add(-time.Hour), HeartbeatAt: heartbeat}
+	value := appliershared.EncodeTableSet([]string{appliershared.EncodePendingEntry(entry)})
 	if _, err := db.ExecContext(ctx, "UPDATE sluice_cdc_state SET pending_added_tables = $1 WHERE stream_id = $2", value, r.streamID); err != nil {
 		r.t.Fatal(err)
 	}
@@ -776,44 +785,183 @@ func TestIncludeTableScopeDrift_PendingLivenessInHealthAndAbandon(t *testing.T) 
 	if code, out := r.health(); code != 1 || !strings.Contains(out, "ADD-TABLE INCOMPLETE") || !strings.Contains(out, "--abandon") {
 		t.Fatalf("health with a stale add: exit %d, want 1 naming --abandon\n%s", code, out)
 	}
+	// F-C: the snapshot slot a killed add leaves behind, which pins WAL and
+	// makes the next add-table of nt refuse "slot already exists".
+	r.exec(src, "SELECT pg_catalog.pg_create_logical_replication_slot('sluice_addtable_nt', 'pgoutput')")
 	args := append([]string{"schema", "add-table", "nt", "--abandon", "--yes"}, r.connArgs()...)
 	stdout, stderr, code := runSluice(t, r.bin, append(args, "--stream-id="+r.streamID)...)
 	if code != 0 || !strings.Contains(stdout+stderr, "may hold a partial copy") {
 		t.Fatalf("add-table --abandon: exit %d\n%s%s", code, stdout, stderr)
+	}
+	if got, _ := r.waitScalar(src, "SELECT COUNT(*)::text FROM pg_replication_slots WHERE slot_name = 'sluice_addtable_nt'", "0", 0); got != "0" {
+		t.Fatalf("--abandon left the dead add's snapshot slot behind (count %s)\n%s%s", got, stdout, stderr)
 	}
 	if code, out := r.health(); code != 0 || strings.Contains(out, "pending_added_table") {
 		t.Fatalf("health after --abandon: exit %d\n%s", code, out)
 	}
 }
 
-// TestIncludeTableScopeDrift_RestartDuringAddTableIsRestartable is F2: a
-// restart while an add-table is still running (fresh heartbeat) defers with
-// the restartable INCLUDE-TABLE-ADD-IN-PROGRESS, and once the add has cleared
-// its entry the stream resumes.
+// TestIncludeTableScopeDrift_RestartDuringAddTableIsRestartable is F-A with a
+// REAL add-table: `sync start --include-table=kd,nt` issued while `schema
+// add-table nt` is still copying a large nt. nt is literally named and not yet
+// established, which on its own refuses terminally — but the live add is
+// exactly what cures that, so the restart defers with the restartable
+// INCLUDE-TABLE-ADD-IN-PROGRESS (a supervisor retries it), and once the add
+// completes the stream resumes and streams nt. Before F-A the restart was the
+// terminal INCLUDE-TABLE-SCOPE-DRIFT: the operator was told to redo an add
+// that was about to succeed.
 func TestIncludeTableScopeDrift_RestartDuringAddTableIsRestartable(t *testing.T) {
 	src, tgt, cleanup := startPostgresLogical(t)
 	defer cleanup()
 	r := newScopeDriftRig(t, "postgres", src, tgt)
-	r.establishTwo("nt", "kd,nt")
+	r.establishKD("kd")
+	r.exec(src, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20), pad TEXT); "+
+		"INSERT INTO nt SELECT g, 'r', repeat('x', 100) FROM generate_series(1, 1000000) g")
 
-	r.setPending("nt", time.Now())
+	add := r.startAddTable("nt")
+	r.waitPendingInProgress(add, "nt", 120*time.Second)
 	run := r.startSync("kd,nt")
 	if !waitExit(run, 90*time.Second) {
-		t.Fatalf("a restart during an add-table kept streaming%s", run.logTail())
+		t.Fatalf("a restart during a running add-table kept streaming%s", run.logTail())
 	}
 	log := scopeDriftLog(t, run)
 	if !strings.Contains(log, "INCLUDE-TABLE-ADD-IN-PROGRESS") || strings.Contains(log, "warm resume refused: INCLUDE-TABLE-SCOPE-DRIFT") {
 		t.Fatalf("want the restartable INCLUDE-TABLE-ADD-IN-PROGRESS only%s", run.logTail())
 	}
 
-	// The add finishes: it clears its entry, as add-table's last step does.
-	r.exec(tgt, "UPDATE sluice_cdc_state SET pending_added_tables = NULL")
+	if !waitExit(add, 300*time.Second) || !strings.Contains(add.exited().Error(), "exit status 0") {
+		t.Fatalf("schema add-table nt: %v%s", add.exited(), add.logTail())
+	}
 	run = r.startSync("kd,nt")
 	requireStreaming(t, run, 8*time.Second, "restart after the add-table finished")
-	r.exec(src, "INSERT INTO nt VALUES (3, 'z')")
-	if got, ok := r.waitRows(tgt, "nt", "e", "1|x,2|y,3|z", 60*time.Second); !ok {
-		t.Fatalf("target nt = %q%s", got, run.logTail())
+	r.exec(src, "INSERT INTO nt VALUES (1000001, 'z', '')")
+	if got, ok := r.waitScalar(tgt, "SELECT COUNT(*)::text || '/' || COALESCE(MAX(e) FILTER (WHERE id = 1000001), '-') FROM nt",
+		"1000001/z", 90*time.Second); !ok {
+		t.Fatalf("target nt = %q, want 1000001 rows ending in the streamed one%s", got, run.logTail())
 	}
+}
+
+// startAddTable launches `schema add-table` in the background.
+func (r *scopeDriftRig) startAddTable(table string) *straddleBinaryRun {
+	r.t.Helper()
+	r.runs++
+	args := append([]string{"--log-level=info", "schema", "add-table", table}, r.connArgs()...)
+	args = append(args, "--stream-id="+r.streamID, "--yes")
+	run := &straddleBinaryRun{t: r.t, bin: r.bin, args: args, logPath: filepath.Join(r.logDir, fmt.Sprintf("%s-add%d.log", r.streamID, r.runs))}
+	run.start()
+	r.t.Cleanup(run.end)
+	return run
+}
+
+// waitPendingInProgress polls `sync health` until it reports table's add as
+// in progress — read from the control row the add-table process writes.
+func (r *scopeDriftRig) waitPendingInProgress(add *straddleBinaryRun, table string, timeout time.Duration) {
+	r.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, out := r.health(); strings.Contains(out, "pending_added_table: "+table+" in progress") {
+			return
+		}
+		if add.exited() != nil {
+			r.t.Fatalf("the add-table exited (%v) before its pending entry was seen in progress%s", add.exited(), add.logTail())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	r.t.Fatalf("no in-progress pending entry for %q within %s%s", table, timeout, add.logTail())
+}
+
+// waitScalar polls a one-value query on dsn until it returns want.
+func (r *scopeDriftRig) waitScalar(dsn, q, want string, timeout time.Duration) (string, bool) {
+	db, err := sql.Open(r.sqlDriver, dsn)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	deadline := time.Now().Add(timeout)
+	got := ""
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := db.QueryRowContext(ctx, q).Scan(&got); err != nil {
+			got = "<" + err.Error() + ">"
+		}
+		cancel()
+		if got == want || time.Now().After(deadline) {
+			return got, got == want
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// TestIncludeTableScopeDrift_RefusedRestartFromScratchKeepsTheRecord is S-A,
+// the exact repro: the stream established kd and dropped nt (narrowed away,
+// so its changes since were discarded). The re-widen refuses; a
+// --restart-from-scratch then refuses on the stream's existing slot — after
+// its EnsurePublication had already run. A plain restart must still refuse:
+// the refused cold start changed nothing, so the record must still say nt was
+// dropped. Before the fix the cold start reset the record to "unrecorded" as
+// its first step, the plain restart fell back to the publication (which
+// delivers nt), and streamed onto nt's stale copy at exit 0.
+func TestIncludeTableScopeDrift_RefusedRestartFromScratchKeepsTheRecord(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishTwo("nt", "kd,nt")
+	r.narrowThenChange("nt", "kd")
+	r.requireScopeDriftRefusal(r.startSync("kd,nt"), "nt", scopeDriftReasonDropped)
+
+	run := r.startSync("kd,nt", "--restart-from-scratch")
+	if !waitExit(run, 90*time.Second) || !strings.Contains(scopeDriftLog(t, run), "already exists") {
+		t.Fatalf("--restart-from-scratch with the stream's slot in place: want the slot-exists refusal%s", run.logTail())
+	}
+	r.requireScopeDriftRefusal(r.startSync("kd,nt"), "nt", scopeDriftReasonDropped)
+	if got := r.rows(tgt, "nt", "e"); got != "1|x,2|y" {
+		t.Fatalf("target nt = %q, want the stale 1|x,2|y untouched (refused before anything was applied)", got)
+	}
+}
+
+// TestIncludeTableScopeDrift_PreflightRefusedColdStartKeepsTheRecord is the
+// S-A preflight variant: the --restart-from-scratch is refused by a schema
+// preflight (a --type-override naming a column nt does not have) that runs
+// after the publication is ensured and before the snapshot. Same verdict: the
+// record is untouched and the plain restart still refuses.
+func TestIncludeTableScopeDrift_PreflightRefusedColdStartKeepsTheRecord(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishTwo("nt", "kd,nt")
+	r.narrowThenChange("nt", "kd")
+
+	run := r.startSync("kd,nt", "--restart-from-scratch", "--type-override=nt.no_such_column=text")
+	if !waitExit(run, 90*time.Second) || !strings.Contains(scopeDriftLog(t, run), "no_such_column") {
+		t.Fatalf("--restart-from-scratch with a bad --type-override: want its preflight refusal%s", run.logTail())
+	}
+	r.requireScopeDriftRefusal(r.startSync("kd,nt"), "nt", scopeDriftReasonDropped)
+}
+
+// TestIncludeTableScopeDrift_LegacySlotOnAnotherDatabaseIsNotAPeer is F-B
+// through the binary: a stream with no record (legacy) whose source server
+// also hosts a sluice slot on ANOTHER database. That slot cannot read this
+// database's publication, so the publication is not shared and the no-record
+// fallback still refuses a literally included table it does not deliver.
+// Before the filter the other database's slot made the publication read as
+// shared, and the fallback stood down with a WARN.
+func TestIncludeTableScopeDrift_LegacySlotOnAnotherDatabaseIsNotAPeer(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishKD("kd")
+	r.exec(tgt, "ALTER TABLE sluice_cdc_state DROP COLUMN established_tables")
+	r.exec(src, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO nt VALUES (1, 'x')")
+
+	r.exec(src, "CREATE DATABASE other_db")
+	other := strings.Replace(src, "/source_db", "/other_db", 1)
+	if other == src {
+		t.Fatalf("could not derive a second database's DSN from %q", src)
+	}
+	r.exec(other, "SELECT pg_catalog.pg_create_logical_replication_slot('sluice_elsewhere', 'pgoutput')")
+	defer r.exec(other, "SELECT pg_catalog.pg_drop_replication_slot('sluice_elsewhere')")
+
+	r.requireScopeDriftRefusal(r.startSync("kd,nt"), "nt", scopeDriftReasonUnpublished)
 }
 
 // TestIncludeTableScopeDrift_MultiDatabaseRemedyIsTheRecopy is F3: on a

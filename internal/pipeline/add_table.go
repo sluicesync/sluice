@@ -284,6 +284,9 @@ type AddTable struct {
 	// pendingHeartbeatEvery overrides [ir.PendingAddHeartbeatInterval]
 	// (tests); zero is the default.
 	pendingHeartbeatEvery time.Duration
+	// pendingToken identifies this run's pending entry; every later write to
+	// it compares-and-sets on it ([ir.PendingAddedTablesStore]).
+	pendingToken string
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -518,10 +521,10 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := a.recordPendingAdd(ctx, applier); err != nil {
 		return err
 	}
-	stopHeartbeat := a.startPendingHeartbeat(ctx, applier)
-	err = a.bringInTable(ctx, applier, preflight, scoped, sw, rw)
-	stopHeartbeat()
-	if err != nil {
+	if err := a.bringInTableUnderHeartbeat(ctx, applier, preflight, scoped, sw, rw); err != nil {
+		if errors.Is(err, ir.ErrPendingAddSuperseded) {
+			return a.supersededError(err)
+		}
 		return a.undoFailedAdd(ctx, applier, err)
 	}
 	if err := a.recordCompletedAdd(ctx, applier); err != nil {
@@ -649,42 +652,11 @@ func (a *AddTable) recordPendingAdd(ctx context.Context, applier ir.ChangeApplie
 		slog.DebugContext(ctx, "add-table: target applier keeps no pending-add record; skipping it", slog.String("target", a.Target.Name()))
 		return nil
 	}
-	if err := store.RecordPendingAddedTable(ctx, a.StreamID, a.TableName, time.Now()); err != nil {
+	a.pendingToken = newPendingToken()
+	if err := store.RecordPendingAddedTable(ctx, a.StreamID, a.TableName, a.pendingToken); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 			"pipeline: add-table: record %q as pending on the stream's control row before changing anything "+
 				"(nothing was changed): %w", a.TableName, err,
-		))
-	}
-	return nil
-}
-
-// recordCompletedAdd records the table in the stream's established set
-// ([ir.EstablishedTablesStore] — a no-op for a stream with no record yet) and
-// then clears its pending record, once the table is fully brought in. A
-// failure here is reported, not swallowed: the table IS copied, but a missing
-// established entry or a pending record left behind makes the next warm
-// resume refuse with INCLUDE-TABLE-SCOPE-DRIFT, and the operator should know
-// why.
-func (a *AddTable) recordCompletedAdd(ctx context.Context, applier ir.ChangeApplier) error {
-	if est, ok := applier.(ir.EstablishedTablesStore); ok {
-		if err := est.AddEstablishedTable(ctx, a.StreamID, a.TableName); err != nil {
-			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
-				"pipeline: add-table: %q was copied and handed to the stream, but recording it as established failed, "+
-					"so a `sync start` that names it in --include-table will refuse INCLUDE-TABLE-SCOPE-DRIFT until a "+
-					"--restart-from-scratch records the stream's tables again: %w", a.TableName, err,
-			))
-		}
-	}
-	store, ok := applier.(ir.PendingAddedTablesStore)
-	if !ok {
-		return nil
-	}
-	if err := store.ClearPendingAddedTables(ctx, a.StreamID, []string{a.TableName}); err != nil {
-		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
-			"pipeline: add-table: %q was copied and handed to the stream, but clearing its pending record failed, "+
-				"so the next `sync start` will refuse INCLUDE-TABLE-SCOPE-DRIFT naming it until the record is "+
-				"cleared (re-running add-table needs the target table emptied first; --restart-from-scratch "+
-				"clears it): %w", a.TableName, err,
 		))
 	}
 	return nil
@@ -706,43 +678,6 @@ func (a *AddTable) notePublicationAdd(ctx context.Context) error {
 	}
 	a.publicationAddedByThisRun = m.Publication != "" && len(m.Missing) == 1
 	return nil
-}
-
-// undoFailedAdd is the add's failure path after the pending record (Bug 321
-// path 2). The record stays, so the next warm resume refuses rather than
-// streaming into a table whose copy did not land. On a publication source it
-// also takes back the publication add this run made, so a LIVE stream stops
-// streaming the table's changes into that partial copy now rather than at
-// its next restart. Runs on a context detached from cancellation: a Ctrl-C
-// is the commonest way to get here. The returned error names both facts.
-func (a *AddTable) undoFailedAdd(ctx context.Context, applier ir.ChangeApplier, cause error) error {
-	note := fmt.Sprintf("the add of %q did not complete", a.TableName)
-	undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	if store, ok := applier.(ir.PendingAddedTablesStore); ok {
-		note += "; it stays recorded as pending, so `sync start` refuses INCLUDE-TABLE-SCOPE-DRIFT for it until " +
-			"a re-run of add-table succeeds (empty the target table first if rows landed) or a " +
-			"--restart-from-scratch re-copies it"
-		// This add is not running any more: age its heartbeat out now, so a
-		// restart reads it as dead (terminal) at once rather than as an add
-		// in progress (restartable) for the next PendingAddStaleAfter. A kill
-		// cannot do this; the heartbeat simply stops and ages out.
-		if err := store.HeartbeatPendingAddedTable(undoCtx, a.StreamID, a.TableName, time.Unix(0, 0)); err != nil {
-			slog.WarnContext(ctx, "add-table: could not mark the failed add's pending record as no longer running; "+
-				"a restart in the next few minutes defers as INCLUDE-TABLE-ADD-IN-PROGRESS", slog.String("error", err.Error()))
-		}
-	}
-	if dropper, ok := a.Source.(publicationTableDropper); ok && a.publicationAddedByThisRun {
-		if err := dropper.DropPublicationTables(undoCtx, a.SourceDSN, []string{a.TableName}); err != nil {
-			slog.WarnContext(ctx, "add-table: could not take the table back out of the source publication after the "+
-				"add failed; a running stream keeps streaming its changes into the partial target copy until the "+
-				"table is removed from the publication by hand", slog.String("table", a.TableName), slog.String("error", err.Error()))
-			note += "; taking it back out of the source publication FAILED (" + err.Error() + ")"
-		} else {
-			note += "; it was taken back out of the source publication"
-		}
-	}
-	return fmt.Errorf("%w (%s)", cause, note)
 }
 
 // translateScopedSchema applies the operator's per-column type /

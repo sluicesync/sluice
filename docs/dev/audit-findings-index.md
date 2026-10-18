@@ -54,6 +54,13 @@ other eighteen.
 
 ---
 
+## 2026-10-18 — Bug 321 (INCLUDE-TABLE-SCOPE-DRIFT): residuals named by its fourth review
+
+Indexed when filed. Residuals named while fixing Bug 321 (no audit pass).
+
+- TABLE-RECREATED-WHILE-STOPPED filed
+- ADD-TABLE-SNAPSHOT-SLOT-PERSISTENT filed
+
 ## 2026-10-15 — GitHub #356 (an outside user's report): fixed, with what it leaves open
 
 Indexed when filed. The report's defect and what fixing it found (no audit pass).

@@ -6,6 +6,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"sluicesync.dev/sluice/internal/appliershared"
@@ -27,6 +28,10 @@ func tableSetColumn(name string) controlColumn {
 	return controlColumn{name: name, def: name + " TEXT NULL"}
 }
 
+// pgServerNowMillis reads the server's wall clock: clock_timestamp(), not
+// now(), which is frozen at the start of the transaction it runs in.
+const pgServerNowMillis = "SELECT (EXTRACT(EPOCH FROM pg_catalog.clock_timestamp()) * 1000)::bigint"
+
 // tableSetQueries renders the statements the shared table-set helpers run
 // against one column of this applier's control table.
 func (a *ChangeApplier) tableSetQueries(col string) appliershared.TableSetQueries {
@@ -36,18 +41,39 @@ func (a *ChangeApplier) tableSetQueries(col string) appliershared.TableSetQuerie
 		Read:            "SELECT " + col + " FROM " + ref + " WHERE stream_id = $1",
 		ReadForUpdate:   "SELECT " + col + " FROM " + ref + " WHERE stream_id = $1 FOR UPDATE",
 		Update:          "UPDATE " + ref + " SET " + col + " = $1 WHERE stream_id = $2",
+		ServerNowMillis: pgServerNowMillis,
 		IsMissingColumn: isUndefinedColumnErr,
 	}
+}
+
+// pendingAddQueries renders [appliershared.CompletePendingAdd]'s statements.
+func (a *ChangeApplier) pendingAddQueries() appliershared.PendingAddQueries {
+	ref := controlTableRef(a.controlSchema)
+	cols := appliershared.PendingAddedTablesColumn + ", " + appliershared.EstablishedTablesColumn + ", " + appliershared.DroppedTablesColumn
+	return appliershared.PendingAddQueries{
+		ReadForUpdate: "SELECT " + cols + " FROM " + ref + " WHERE stream_id = $1 FOR UPDATE",
+		Update: "UPDATE " + ref + " SET " + appliershared.PendingAddedTablesColumn + " = $1, " +
+			appliershared.EstablishedTablesColumn + " = $2, " + appliershared.DroppedTablesColumn + " = $3 WHERE stream_id = $4",
+	}
+}
+
+// ensureTableSetColumns ensures cols exist (see [tableSetColumn]).
+func (a *ChangeApplier) ensureTableSetColumns(ctx context.Context, streamID string, cols ...string) error {
+	if streamID == "" {
+		return errors.New("postgres: applier: table sets: streamID is empty")
+	}
+	defs := make([]controlColumn, len(cols))
+	for i, c := range cols {
+		defs[i] = tableSetColumn(c)
+	}
+	return cdcStateTable(a.controlSchema).ensureColumns(ctx, a.db, defs)
 }
 
 // updateTableSet runs edit against col, ensuring the column first when ensure
 // is set.
 func (a *ChangeApplier) updateTableSet(ctx context.Context, streamID, col string, ensure, requireRow bool, edit appliershared.TableSetEdit) error {
 	if ensure {
-		if streamID == "" {
-			return errors.New("postgres: applier: " + col + ": streamID is empty")
-		}
-		if err := cdcStateTable(a.controlSchema).ensureColumns(ctx, a.db, []controlColumn{tableSetColumn(col)}); err != nil {
+		if err := a.ensureTableSetColumns(ctx, streamID, col); err != nil {
 			return err
 		}
 	}
@@ -55,13 +81,30 @@ func (a *ChangeApplier) updateTableSet(ctx context.Context, streamID, col string
 }
 
 // RecordPendingAddedTable implements [ir.PendingAddedTablesStore].
-func (a *ChangeApplier) RecordPendingAddedTable(ctx context.Context, streamID, table string, now time.Time) error {
-	return a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, true, true, appliershared.PendingAdd(table, now))
+func (a *ChangeApplier) RecordPendingAddedTable(ctx context.Context, streamID, table, token string) error {
+	return a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, true, true, appliershared.PendingAdd(table, token))
 }
 
-// HeartbeatPendingAddedTable implements [ir.PendingAddedTablesStore].
-func (a *ChangeApplier) HeartbeatPendingAddedTable(ctx context.Context, streamID, table string, now time.Time) error {
-	return a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, false, false, appliershared.PendingHeartbeat(table, now))
+// TouchPendingAddedTable implements [ir.PendingAddedTablesStore].
+func (a *ChangeApplier) TouchPendingAddedTable(ctx context.Context, streamID, table, token string, alive bool) error {
+	superseded := false
+	if err := a.updateTableSet(ctx, streamID, appliershared.PendingAddedTablesColumn, false, false,
+		appliershared.PendingTouch(table, token, alive, &superseded)); err != nil {
+		return err
+	}
+	if superseded {
+		return fmt.Errorf("postgres: pending add-table %q: %w", table, ir.ErrPendingAddSuperseded)
+	}
+	return nil
+}
+
+// CompletePendingAddedTable implements [ir.PendingAddedTablesStore].
+func (a *ChangeApplier) CompletePendingAddedTable(ctx context.Context, streamID, table, token string) error {
+	if err := a.ensureTableSetColumns(ctx, streamID, appliershared.PendingAddedTablesColumn,
+		appliershared.EstablishedTablesColumn, appliershared.DroppedTablesColumn); err != nil {
+		return err
+	}
+	return classifyApplierError(appliershared.CompletePendingAdd(ctx, a.db, controlCfg, a.pendingAddQueries(), streamID, table, token))
 }
 
 // ClearPendingAddedTables implements [ir.PendingAddedTablesStore].
@@ -73,9 +116,9 @@ func (a *ChangeApplier) ClearPendingAddedTables(ctx context.Context, streamID st
 }
 
 // ReadPendingAddedTables implements [ir.PendingAddedTablesStore].
-func (a *ChangeApplier) ReadPendingAddedTables(ctx context.Context, streamID string) ([]ir.PendingAddedTable, error) {
-	entries, err := appliershared.ReadPendingEntries(ctx, a.db, controlCfg, a.tableSetQueries(appliershared.PendingAddedTablesColumn), streamID)
-	return entries, classifyApplierError(err)
+func (a *ChangeApplier) ReadPendingAddedTables(ctx context.Context, streamID string) ([]ir.PendingAddedTable, time.Time, error) {
+	entries, now, err := appliershared.ReadPendingEntries(ctx, a.db, controlCfg, a.tableSetQueries(appliershared.PendingAddedTablesColumn), streamID)
+	return entries, now, classifyApplierError(err)
 }
 
 // ReadEstablishedRecord implements [ir.EstablishedTablesStore].
@@ -85,13 +128,9 @@ func (a *ChangeApplier) ReadEstablishedRecord(ctx context.Context, streamID stri
 	return rec, classifyApplierError(err)
 }
 
-// ResetEstablishedRecord implements [ir.EstablishedTablesStore]. No DDL: a
-// column that does not exist holds nothing to reset.
-func (a *ChangeApplier) ResetEstablishedRecord(ctx context.Context, streamID string) error {
-	if err := a.updateTableSet(ctx, streamID, appliershared.EstablishedTablesColumn, false, false, appliershared.SetNull()); err != nil {
-		return err
-	}
-	return a.updateTableSet(ctx, streamID, appliershared.DroppedTablesColumn, false, false, appliershared.SetNull())
+// BeginColdStartRecord implements [ir.EstablishedTablesStore].
+func (a *ChangeApplier) BeginColdStartRecord(ctx context.Context, streamID string) error {
+	return a.updateTableSet(ctx, streamID, appliershared.EstablishedTablesColumn, true, false, appliershared.BeginColdStart())
 }
 
 // RecordEstablishedTables implements [ir.EstablishedTablesStore].
@@ -102,13 +141,4 @@ func (a *ChangeApplier) RecordEstablishedTables(ctx context.Context, streamID st
 // RecordDroppedTables implements [ir.EstablishedTablesStore].
 func (a *ChangeApplier) RecordDroppedTables(ctx context.Context, streamID string, tables []string) error {
 	return a.updateTableSet(ctx, streamID, appliershared.DroppedTablesColumn, true, true, appliershared.EstablishedReplace(tables))
-}
-
-// AddEstablishedTable implements [ir.EstablishedTablesStore]. No column, no
-// row or no record is nothing to add to.
-func (a *ChangeApplier) AddEstablishedTable(ctx context.Context, streamID, table string) error {
-	if err := a.updateTableSet(ctx, streamID, appliershared.EstablishedTablesColumn, false, false, appliershared.EstablishedAdd(table)); err != nil {
-		return err
-	}
-	return a.updateTableSet(ctx, streamID, appliershared.DroppedTablesColumn, false, false, appliershared.SetRemove(table))
 }

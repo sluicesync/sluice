@@ -73,10 +73,10 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	stop = func() {}
 
 	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
-	// first — and so does its established-table record
-	// (INCLUDE-TABLE-SCOPE-DRIFT, N3), so a failure from here leaves the
-	// stream unrecorded, not stale.
-	if err := s.resetStreamRecordsForColdStart(ctx, applier, streamID); err != nil {
+	// first. (The established-table record is NOT touched here: it is marked
+	// in progress at the cold start's point of no return, inside
+	// coldStartGatePreflight — see [beginColdStartRecord].)
+	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
 		return nil, stop, err
 	}
 
@@ -319,6 +319,17 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	// the snapshot stream is open (so its reader is available for the
 	// largest-table estimate, matching migrate) but before any row moves.
 	s.logColdStartPlanSummary(ctx, stream.Rows, schema, fkStatus)
+
+	// INCLUDE-TABLE-SCOPE-DRIFT: the point of no return for a branch that
+	// dropped nothing — every refusal has passed and the copy's first target
+	// write (its CREATE TABLE IF NOT EXISTS, then the first row) is next. A
+	// drop branch already marked before its drop; this repeat is a no-op.
+	if err := beginColdStartRecord(ctx, applier, streamID); err != nil {
+		migcore.CloseIf(rw)
+		migcore.CloseIf(sw)
+		s.abandonUnlessStopped(ctx, stream, err)
+		return nil, stop, err
+	}
 
 	// Bulk-copy: the ADR-0079 FAST parallel path when eligible, the
 	// serial path otherwise. Releases the writers and the snapshot
@@ -993,8 +1004,26 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 
 	var createSchema *ir.Schema
 
+	// INCLUDE-TABLE-SCOPE-DRIFT: the record is marked in progress at the
+	// point of no return ([beginColdStartRecord]): here, immediately before a
+	// branch's target drop; for the branches that drop nothing, in coldStart
+	// immediately before the copy. Not one step earlier: a refusal before
+	// either leaves the record as it was.
+	markInProgress := func() error {
+		if err := beginColdStartRecord(ctx, applier, streamID); err != nil {
+			migcore.CloseIf(rw)
+			migcore.CloseIf(sw)
+			_ = stream.Abandon()
+			return err
+		}
+		return nil
+	}
+
 	switch {
 	case s.ResetTargetData:
+		if err := markInProgress(); err != nil {
+			return nil, err
+		}
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)
@@ -1061,6 +1090,9 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// (CreateTablesWithoutConstraints recreates them empty), but leaves
 		// the cdc-state row alone: the restart/resnapshot dispatch already
 		// discards the position.
+		if err := markInProgress(); err != nil {
+			return nil, err
+		}
 		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
 			migcore.CloseIf(rw)
 			migcore.CloseIf(sw)

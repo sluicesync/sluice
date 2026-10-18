@@ -196,7 +196,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	}
 	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
 	// first.
-	if err := s.resetStreamRecordsForColdStart(ctx, applier, streamID); err != nil {
+	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
 		return nil, stop, err
 	}
 
@@ -1105,6 +1105,78 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 	return nil
 }
 
+// gateOneDatabaseColdStart is one database's cold-start gate: the Bug 9
+// populated-target preflight (--force-cold-start / --restart-from-scratch /
+// --reset-target-data override it), or the destructive variant —
+// ResetTargetData's drop and clear, or the restart's drop — handled per
+// database here for parity with single-database. It also marks the
+// established record in progress at this database's point of no return
+// ([beginColdStartRecord], INCLUDE-TABLE-SCOPE-DRIFT): immediately before a
+// branch's target drop, or, on the branch that drops nothing, once its
+// refusals have passed and the copy is next. An earlier database already
+// marked it; the repeat is a no-op. The caller closes its writers on error.
+func (s *Streamer) gateOneDatabaseColdStart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter, stream *ir.SnapshotStream, applier ir.ChangeApplier, streamID, database, targetDSN, targetSchema string, fresh freshCopyReason) error {
+	switch {
+	case s.ResetTargetData:
+		if err := beginColdStartRecord(ctx, applier, streamID); err != nil {
+			return err
+		}
+		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
+			return fmt.Errorf("pipeline: reset target data for %q: %w", database, err)
+		}
+	case fresh.forcesFresh() && (!copyReaderIsIdempotent(stream.Rows) || fresh.clearsTarget()):
+		// restart-from-scratch / auto-resnapshot onto a NON-idempotent reader
+		// (multi-database fan-out is MySQL-source native binlog, plain
+		// INSERT). forceFresh covers BOTH --restart-from-scratch AND the
+		// automatic auto-resnapshot fall-through. Drop the in-scope target
+		// tables first so the fresh cold-start doesn't dup-key (Error 1062) on
+		// the prior copy's rows. Mirrors the single-database gate in
+		// coldStartGatePreflight; the idempotent path (none in multi-DB today,
+		// but guarded for parity) keeps the absorb-the-overlap behaviour via
+		// the default branch.
+		if err := beginColdStartRecord(ctx, applier, streamID); err != nil {
+			return err
+		}
+		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
+			return fmt.Errorf("pipeline: restart-from-scratch reset for %q: %w", database, err)
+		}
+	default:
+		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || fresh.forcesFresh(), preflightModeSync); err != nil {
+			return fmt.Errorf("pipeline: cold-start preflight for %q: %w", database, err)
+		}
+		// Roadmap item 140, the multi-database sibling. This fan-out is the
+		// one copy entry point of the six that was neither covered nor named
+		// by the first cut; a target database branched from an existing one
+		// dies on Error 1452 / SQLSTATE 23503 here exactly as it does on the
+		// single-database path, N-1 databases into the run. See
+		// migrate_existing_tables_fks.go for the full entry-point roster and
+		// the three exemptions.
+		//
+		// Only this branch: the two above drop the in-scope target tables
+		// first, so nothing pre-existing survives to find — the same reason
+		// the single-database gate lives in its own default branch alone.
+		// The gate is built with THIS database's resolved targetDSN /
+		// targetSchema, not the server DSN, because a catalog is per
+		// database. Shape-compare is deliberately not run here (the fan-out
+		// creates every in-scope table); this is the FK verdict only.
+		fkGate := &existingTablesGate{
+			Source:              s.Source,
+			Target:              s.Target,
+			TargetDSN:           targetDSN,
+			TargetSchema:        targetSchema,
+			EnabledPGExtensions: s.EnabledPGExtensions,
+			Mode:                "sync cold-start",
+		}
+		if err := fkGate.readAndCheckPreExistingForeignKeys(ctx, schema); err != nil {
+			return err
+		}
+		if err := beginColdStartRecord(ctx, applier, streamID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // coldStartCopyOneDatabase reads one selected database's schema (scoped so
 // Table.Schema is stamped + the FK carve-out lifted) and bulk-copies its
 // tables — read from the SHARED spanning snapshot RowReader — into its
@@ -1344,63 +1416,9 @@ func (s *Streamer) coldStartCopyOneDatabase(
 		return fmt.Errorf("pipeline: target RLS preflight for %q: %w", database, err)
 	}
 	preflightTargetOwnershipAdvisory(ctx, rw)
-
-	// Cold-start preflight: refuse if any target table already holds data
-	// (Bug 9). --force-cold-start / --restart-from-scratch / --reset-target-
-	// data override. ResetTargetData is the destructive variant (drop +
-	// re-copy) handled per-database here for parity with single-database.
-	switch {
-	case s.ResetTargetData:
-		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
-			closeWriters()
-			return fmt.Errorf("pipeline: reset target data for %q: %w", database, err)
-		}
-	case fresh.forcesFresh() && (!copyReaderIsIdempotent(stream.Rows) || fresh.clearsTarget()):
-		// restart-from-scratch / auto-resnapshot onto a NON-idempotent reader
-		// (multi-database fan-out is MySQL-source native binlog, plain
-		// INSERT). forceFresh covers BOTH --restart-from-scratch AND the
-		// automatic auto-resnapshot fall-through. Drop the in-scope target
-		// tables first so the fresh cold-start doesn't dup-key (Error 1062) on
-		// the prior copy's rows. Mirrors the single-database gate in
-		// coldStartGatePreflight; the idempotent path (none in multi-DB today,
-		// but guarded for parity) keeps the absorb-the-overlap behaviour via
-		// the default branch.
-		if err := resetTargetTablesForRestart(ctx, schema, rw); err != nil {
-			closeWriters()
-			return fmt.Errorf("pipeline: restart-from-scratch reset for %q: %w", database, err)
-		}
-	default:
-		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || fresh.forcesFresh(), preflightModeSync); err != nil {
-			closeWriters()
-			return fmt.Errorf("pipeline: cold-start preflight for %q: %w", database, err)
-		}
-		// Roadmap item 140, the multi-database sibling. This fan-out is the
-		// one copy entry point of the six that was neither covered nor named
-		// by the first cut; a target database branched from an existing one
-		// dies on Error 1452 / SQLSTATE 23503 here exactly as it does on the
-		// single-database path, N-1 databases into the run. See
-		// migrate_existing_tables_fks.go for the full entry-point roster and
-		// the three exemptions.
-		//
-		// Only this branch: the two above drop the in-scope target tables
-		// first, so nothing pre-existing survives to find — the same reason
-		// the single-database gate lives in its own default branch alone.
-		// The gate is built with THIS database's resolved targetDSN /
-		// targetSchema, not the server DSN, because a catalog is per
-		// database. Shape-compare is deliberately not run here (the fan-out
-		// creates every in-scope table); this is the FK verdict only.
-		fkGate := &existingTablesGate{
-			Source:              s.Source,
-			Target:              s.Target,
-			TargetDSN:           targetDSN,
-			TargetSchema:        targetSchema,
-			EnabledPGExtensions: s.EnabledPGExtensions,
-			Mode:                "sync cold-start",
-		}
-		if err := fkGate.readAndCheckPreExistingForeignKeys(ctx, schema); err != nil {
-			closeWriters()
-			return err
-		}
+	if err := s.gateOneDatabaseColdStart(ctx, schema, rw, stream, applier, streamID, database, targetDSN, targetSchema, fresh); err != nil {
+		closeWriters()
+		return err
 	}
 
 	slog.InfoContext(ctx, "multi-database: copying database from the spanning snapshot",
