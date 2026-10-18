@@ -81,23 +81,67 @@ func TestScopeDriftDoor_CorruptRecords(t *testing.T) {
 }
 
 // TestColdStartRecordOverwritesAnUndecodableRecord is R6 L1 at the cold
-// start: an unreadable record is overwritten, and the dropped set becomes
-// the all-uncopied marker (never a false "not dropped").
+// start, with R6-L1's concrete set: an unreadable record is overwritten,
+// and the dropped set becomes the source catalog's tables the copy did not
+// cover (never a false "not dropped"); only a catalog that cannot be read
+// leaves the all-uncopied marker, and a later cold start that can read it
+// replaces the marker — it no longer outlives the failure that wrote it.
 func TestColdStartRecordOverwritesAnUndecodableRecord(t *testing.T) {
-	app := &scopeDriftApplier{recErr: &ir.UndecodableTableSetError{Column: "dropped_tables", Err: errors.New("bad")}}
-	if err := recordEstablishedAfterCopy(context.Background(), app, "st", []string{"kd"}, nil); err != nil {
+	ctx := context.Background()
+	catalog := func(keys ...string) func(context.Context) ([]string, error) {
+		return func(context.Context) ([]string, error) { return keys, nil }
+	}
+	unreadable := func(context.Context) ([]string, error) { return nil, errors.New("catalog down") }
+	undecodable := func() *scopeDriftApplier {
+		return &scopeDriftApplier{recErr: &ir.UndecodableTableSetError{Column: "dropped_tables", Err: errors.New("bad")}}
+	}
+
+	app := undecodable()
+	if err := recordEstablishedAfterCopy(ctx, app, "st", []string{"kd"}, nil, catalog("kd", "old", "aside")); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(app.writes, " "); got != "dropped=aside,old established=kd" {
+		t.Fatalf("undecodable, catalog readable: writes %q", got)
+	}
+
+	app = undecodable()
+	if err := recordEstablishedAfterCopy(ctx, app, "st", []string{"kd"}, nil, unreadable); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(app.writes, " "); got != "dropped="+ir.DroppedAllUncopiedEntry+" established=kd" {
-		t.Fatalf("writes %q", got)
+		t.Fatalf("undecodable, catalog unreadable: writes %q", got)
 	}
-	// A marker already there survives the next cold start.
-	app = &scopeDriftApplier{rec: ir.EstablishedRecord{Recorded: true, Established: []string{"kd"}, Dropped: []string{"x"}, DroppedAllUncopied: true}}
-	if err := recordEstablishedAfterCopy(context.Background(), app, "st", []string{"kd", "x"}, nil); err != nil {
+
+	// A marker already there: replaced by the named entries plus the
+	// uncopied catalog, when the catalog reads; kept when it does not.
+	marked := func() *scopeDriftApplier {
+		return &scopeDriftApplier{rec: ir.EstablishedRecord{
+			Recorded: true, Established: []string{"kd"}, Dropped: []string{"x", "gone"}, DroppedAllUncopied: true,
+		}}
+	}
+	app = marked()
+	if err := recordEstablishedAfterCopy(ctx, app, "st", []string{"kd", "x"}, nil, catalog("kd", "x", "y")); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(app.writes, " "); got != "dropped="+ir.DroppedAllUncopiedEntry+" established=kd,x" {
-		t.Fatalf("writes %q", got)
+	if got := strings.Join(app.writes, " "); got != "dropped=gone,y established=kd,x" {
+		t.Fatalf("marker, catalog readable: writes %q", got)
+	}
+	app = marked()
+	if err := recordEstablishedAfterCopy(ctx, app, "st", []string{"kd", "x"}, nil, unreadable); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(app.writes, " "); got != "dropped=gone,"+ir.DroppedAllUncopiedEntry+" established=kd,x" {
+		t.Fatalf("marker, catalog unreadable: writes %q", got)
+	}
+
+	// No marker: the catalog is not consulted (an ordinary cold start's
+	// dropped set is its old one minus what it copied).
+	app = &scopeDriftApplier{rec: ir.EstablishedRecord{Recorded: true, Established: []string{"kd"}, Dropped: []string{"x"}}}
+	if err := recordEstablishedAfterCopy(ctx, app, "st", []string{"kd"}, nil, unreadable); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(app.writes, " "); got != "established=kd" {
+		t.Fatalf("no marker: writes %q", got)
 	}
 }
 

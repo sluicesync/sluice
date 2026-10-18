@@ -265,4 +265,32 @@ func TestTableIdentities_SurviveRename(t *testing.T) {
 	if ids, err := (Engine{Flavor: FlavorVitess}).TableIdentities(ctx, dsn, []string{"t8b"}); err != nil || len(ids) != 0 {
 		t.Fatalf("the Vitess flavor reported ids %v, %v; it has none", ids, err)
 	}
+
+	// R6-S3's premise, bound to the capability the door keys on: InnoDB
+	// gives a table a new TABLE_ID on routine rebuilds, so the engine must
+	// say its id does not survive a rebuild — and the door therefore must
+	// not refuse a changed id on MySQL without proof of a swap.
+	if eng.TableIdentitySurvivesRebuild() {
+		t.Fatal("TableIdentitySurvivesRebuild() = true; InnoDB rebuilds change TABLE_ID")
+	}
+	applyMySQLApplier(t, dsn, "INSERT INTO t8b VALUES (1), (2)")
+	prev := recreated["t8b"]
+	for _, rebuild := range []string{
+		"OPTIMIZE TABLE t8b", "ALTER TABLE t8b ENGINE=InnoDB", "ALTER TABLE t8b ADD COLUMN v INT, ALGORITHM=COPY", "TRUNCATE TABLE t8b",
+	} {
+		applyMySQLApplier(t, dsn, rebuild)
+		got, err := eng.TableIdentities(ctx, dsn, []string{"t8b"})
+		if err != nil || got["t8b"] == "" {
+			t.Fatalf("after %s: %v, %v", rebuild, got, err)
+		}
+		if got["t8b"] == prev {
+			t.Fatalf("%s kept TABLE_ID %s; the measured premise (a rebuild changes it) no longer holds — revisit "+
+				"TableIdentitySurvivesRebuild and the door's MySQL branch", rebuild, prev)
+		}
+		prev = got["t8b"]
+	}
+	applyMySQLApplier(t, dsn, "ALTER TABLE t8b ADD COLUMN w INT, ALGORITHM=INSTANT")
+	if got, _ := eng.TableIdentities(ctx, dsn, []string{"t8b"}); got["t8b"] != prev {
+		t.Fatalf("an INSTANT ADD COLUMN changed TABLE_ID %s → %s", prev, got["t8b"])
+	}
 }

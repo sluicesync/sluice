@@ -322,11 +322,17 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	if rec := read(); rec.IDs["t8"] != "16391" || rec.IDs["users"] != "4242" || rec.IDs["kd"] != "" {
 		t.Fatalf("ids read back as %v", rec.IDs)
 	}
-	if _, err := store.NarrowEstablishedRecord(ctx, "s1", []string{"t8b", "kd", "users"}, []string{"t8"}, map[string]string{"t8": "t8b"}); err != nil {
+	if _, err := store.NarrowEstablishedRecord(ctx, "s1", ir.RecordNarrowing{
+		InScope: []string{"t8b", "kd", "users"}, Gone: []string{"t8"}, Renames: map[string]string{"t8": "t8b"},
+		IDs: map[string]string{"users": "5151", "nope": "1"},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"kd", "t8b", "users"}) || rec.IDs["t8b"] != "16391" || rec.IDs["t8"] != "" {
-		t.Fatalf("after the rename: %+v; want t8b carrying t8's id", rec)
+	// R6-S3: a rebuilt table's new id replaces its recorded one; an id for
+	// an entry not established is not recorded.
+	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"kd", "t8b", "users"}) || rec.IDs["t8b"] != "16391" || rec.IDs["t8"] != "" ||
+		rec.IDs["users"] != "5151" || rec.IDs["nope"] != "" {
+		t.Fatalf("after the rename and id update: %+v; want t8b carrying t8's id and users at 5151", rec)
 	}
 
 	// R4-4: the narrowing is judged on the values under its row lock. The
@@ -342,7 +348,7 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	if err := complete("c", "tok-n"); err != nil {
 		t.Fatal(err)
 	}
-	leaving, err := store.NarrowEstablishedRecord(ctx, "s1", []string{"a", "c"}, []string{"gone"}, nil)
+	leaving, err := store.NarrowEstablishedRecord(ctx, "s1", ir.RecordNarrowing{InScope: []string{"a", "c"}, Gone: []string{"gone"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,10 +359,10 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	if err := store.BeginColdStartRecord(ctx, "s1"); err != nil {
 		t.Fatal(err)
 	}
-	if leaving, err := store.NarrowEstablishedRecord(ctx, "s1", nil, nil, nil); err != nil || leaving != nil || !read().ColdStartInProgress {
+	if leaving, err := store.NarrowEstablishedRecord(ctx, "s1", ir.RecordNarrowing{}); err != nil || leaving != nil || !read().ColdStartInProgress {
 		t.Fatalf("a narrowing during a cold start in progress: %q, %v, %+v; want nothing written", leaving, err, read())
 	}
-	if leaving, err := store.NarrowEstablishedRecord(ctx, "no-such-stream", nil, nil, nil); err != nil || leaving != nil {
+	if leaving, err := store.NarrowEstablishedRecord(ctx, "no-such-stream", ir.RecordNarrowing{}); err != nil || leaving != nil {
 		t.Fatalf("a narrowing of a missing row: %q, %v; want nothing to do", leaving, err)
 	}
 

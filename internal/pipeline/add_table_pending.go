@@ -282,8 +282,8 @@ func warnFutureHeartbeat(ctx context.Context, p ir.PendingAddedTable, now time.T
 // abandonCompletedAdd is `--abandon` of a table whose add-table completed:
 // it has no pending entry, but it is in the stream's live-added set, which
 // keeps it in scope on every start whatever --include-table says. Taking it
-// out of that set is the only way an include-mode stream (which cannot also
-// pass --exclude-table) lets go of an added table (Bug 321 R6 A). The next
+// out of that set is the only way any stream lets go of an added table (Bug
+// 321 R6 A; an --exclude-table naming it is refused, R6-S1). The next
 // start narrows it: its changes stop being applied, and the record moves it
 // to the dropped set, so a later re-admit refuses until it is copied again.
 func (a *AddTable) abandonCompletedAdd(ctx context.Context, applier ir.ChangeApplier) error {

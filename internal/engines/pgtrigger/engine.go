@@ -266,6 +266,9 @@ func (e Engine) TableIdentities(ctx context.Context, dsn string, tables []string
 	return e.pg.TableIdentities(ctx, dsn, tables)
 }
 
+// TableIdentitySurvivesRebuild delegates to the composed [postgres.Engine].
+func (e Engine) TableIdentitySurvivesRebuild() bool { return e.pg.TableIdentitySurvivesRebuild() }
+
 var _ ir.TableIdentityReader = Engine{}
 
 // ControlTableDDLGuidance delegates to the composed [postgres.Engine].

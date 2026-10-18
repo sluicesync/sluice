@@ -79,3 +79,10 @@ func innodbTableIDs(ctx context.Context, db *sql.DB, view, database string) (map
 	}
 	return out, rows.Err()
 }
+
+// TableIdentitySurvivesRebuild implements [ir.TableIdentityReader]: InnoDB
+// assigns a new TABLE_ID on OPTIMIZE TABLE, a null `ALTER TABLE … ENGINE=InnoDB`,
+// an INPLACE rebuild, a copying ALTER and TRUNCATE (measured on 8.4 by
+// TestTableIdentities_SurviveRename), so a changed id under the same name
+// is routine maintenance as often as a different table.
+func (Engine) TableIdentitySurvivesRebuild() bool { return false }

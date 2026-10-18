@@ -121,10 +121,10 @@ func (r *scopeDriftRig) startSync(tables string, extra ...string) *straddleBinar
 
 // addTable runs `schema add-table` to completion and returns its exit code
 // and output.
-func (r *scopeDriftRig) addTable(table string) (int, string) {
+func (r *scopeDriftRig) addTable(table string, extra ...string) (int, string) {
 	r.t.Helper()
 	args := append([]string{"--log-level=info", "schema", "add-table", table}, r.connArgs()...)
-	args = append(args, "--stream-id="+r.streamID, "--yes")
+	args = append(append(args, "--stream-id="+r.streamID, "--yes"), extra...)
 	stdout, stderr, code := runSluice(r.t, r.bin, args...)
 	return code, stdout + stderr
 }
@@ -1177,11 +1177,41 @@ func TestIncludeTableScopeDrift_BinlogDrainedAddedTableStaysInScope(t *testing.T
 	stagedWaveKeepsTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt))
 }
 
-// TestIncludeTableScopeDrift_ExcludeNarrowsAnAddedTable is R6 A's other
-// exit: on an exclude-mode stream, an explicit --exclude-table naming an
-// added table wins over the live-added set — the start narrows it with the
-// WARN, and a later start that re-admits it refuses.
-func TestIncludeTableScopeDrift_ExcludeNarrowsAnAddedTable(t *testing.T) {
+// requireLiveAddedExcludedRefusal asserts run exits naming
+// LIVE-ADDED-TABLE-EXCLUDED, table, and each of reasons.
+func requireLiveAddedExcludedRefusal(t *testing.T, run *straddleBinaryRun, table string, reasons ...string) {
+	t.Helper()
+	if !waitExit(run, 90*time.Second) {
+		t.Fatalf("the stream kept streaming with %q both live-added and excluded — R6-S1's silent omission%s", table, run.logTail())
+	}
+	if err := run.exited(); err == nil || strings.Contains(err.Error(), "exit status 0") {
+		t.Fatalf("the stream exited (%v); want a non-zero refusal%s", err, run.logTail())
+	}
+	log := scopeDriftLog(t, run)
+	for _, want := range append([]string{"LIVE-ADDED-TABLE-EXCLUDED", "INCLUDE-TABLE-SCOPE-DRIFT", table}, reasons...) {
+		if !strings.Contains(log, want) {
+			t.Fatalf("the refusal does not contain %q%s", want, run.logTail())
+		}
+	}
+}
+
+// abandonAdd runs `schema add-table <table> --abandon --yes`.
+func (r *scopeDriftRig) abandonAdd(table string) {
+	r.t.Helper()
+	args := append([]string{"schema", "add-table", table, "--abandon", "--yes"}, r.connArgs()...)
+	if stdout, stderr, code := runSluice(r.t, r.bin, append(args, "--stream-id="+r.streamID)...); code != 0 {
+		r.t.Fatalf("--abandon %s: exit %d\n%s%s", table, code, stdout, stderr)
+	}
+}
+
+// TestIncludeTableScopeDrift_ExcludeOfAnAddedTableRefuses is R6-S1 at a
+// start: an --exclude-table naming a table `schema add-table` brought in is a
+// contradiction, refused before anything is applied (R6 let the exclusion
+// win silently — the add said "in scope" and none of its changes were
+// applied). `--abandon` of the add is the exit that takes the table out: the
+// start then narrows it with the WARN, and a later start that re-admits it
+// refuses as dropped.
+func TestIncludeTableScopeDrift_ExcludeOfAnAddedTableRefuses(t *testing.T) {
 	src, tgt, cleanup := startPostgresLogical(t)
 	defer cleanup()
 	r := newScopeDriftRig(t, "postgres", src, tgt)
@@ -1202,8 +1232,10 @@ func TestIncludeTableScopeDrift_ExcludeNarrowsAnAddedTable(t *testing.T) {
 		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
 	}
 
+	requireLiveAddedExcludedRefusal(t, r.startSync("", "--exclude-table=users"), "users", "Nothing has been applied by this run")
+	r.abandonAdd("users")
 	run = r.startSync("", "--exclude-table=users")
-	requireStreaming(t, run, 8*time.Second, "restart excluding the added table")
+	requireStreaming(t, run, 8*time.Second, "restart excluding the added table after --abandon")
 	waitLog(t, run, "NO LONGER APPLIED")
 	if !strings.Contains(scopeDriftLog(t, run), "users") {
 		t.Fatalf("the narrowing WARN does not name users%s", run.logTail())
@@ -1214,6 +1246,59 @@ func TestIncludeTableScopeDrift_ExcludeNarrowsAnAddedTable(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	r.requireScopeDriftRefusal(r.startSync("", "--exclude-table=other"), "users", scopeDriftReasonDropped)
+}
+
+// liveAddOfAnExcludedTable is R6-S1 in a running stream, the review's
+// repro: a stream with --exclude-table='tmp_*'; `schema add-table tmp_keep
+// --no-drain` (which cannot know the stream's flags, and completes). Before
+// R6-S1 the stream kept running green and target tmp_keep stayed at its copy
+// while the source changed. Now the running stream stops with the refusal
+// within its poll interval; the same restart refuses before applying
+// anything; `--abandon` takes the table out and the stream runs.
+func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
+	t.Helper()
+	r.exec(r.src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a');"+
+		"CREATE TABLE tmp_keep (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO tmp_keep VALUES (1, 'x'), (2, 'y')")
+	run := r.startSync("", "--exclude-table=tmp_*")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a", 90*time.Second); !ok {
+		t.Fatalf("cold start: target kd = %q%s", got, run.logTail())
+	}
+	r.exec(r.src, "INSERT INTO kd VALUES (2, 'b')")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
+		t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
+	}
+	if code, out := r.addTable("tmp_keep", "--no-drain"); code != 0 {
+		t.Fatalf("schema add-table tmp_keep --no-drain: exit %d\n%s", code, out)
+	}
+	r.exec(r.src, "UPDATE tmp_keep SET e = 'changed' WHERE id = 1")
+	requireLiveAddedExcludedRefusal(t, run, "tmp_keep", "stopped as soon as it saw the add", "redo its copy")
+
+	requireLiveAddedExcludedRefusal(t, r.startSync("", "--exclude-table=tmp_*"), "tmp_keep", "Nothing has been applied by this run")
+
+	r.abandonAdd("tmp_keep")
+	run = r.startSync("", "--exclude-table=tmp_*")
+	requireStreaming(t, run, 8*time.Second, "restart after --abandon took the excluded table out")
+	r.exec(r.src, "INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
+		t.Fatalf("kd after --abandon: target kd = %q%s", got, run.logTail())
+	}
+}
+
+// TestIncludeTableScopeDrift_PgoutputLiveAddOfAnExcludedTableStops is R6-S1
+// on pgoutput (the publication-add path).
+func TestIncludeTableScopeDrift_PgoutputLiveAddOfAnExcludedTableStops(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	liveAddOfAnExcludedTable(t, newScopeDriftRig(t, "postgres", src, tgt))
+}
+
+// TestIncludeTableScopeDrift_BinlogLiveAddOfAnExcludedTableStops is R6-S1 on
+// MySQL --no-drain (ADR-0034's filter flip) — a regression R6 introduced
+// there: before it, ADR-0034's live-added set won over the exclusion.
+func TestIncludeTableScopeDrift_BinlogLiveAddOfAnExcludedTableStops(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	liveAddOfAnExcludedTable(t, newScopeDriftRig(t, "mysql", src, tgt))
 }
 
 // TestIncludeTableScopeDrift_CorruptRecordRecovers is R6 L1 through the
@@ -1257,6 +1342,39 @@ func TestIncludeTableScopeDrift_CorruptRecordRecovers(t *testing.T) {
 	if code, out := r.health(); code != 0 || strings.Contains(out, "pending_added_table") {
 		t.Fatalf("health after the re-copy: exit %d\n%s", code, out)
 	}
+}
+
+// TestIncludeTableScopeDrift_CorruptDroppedSetDoesNotOutliveTheRecopy is
+// R6-L1: an undecodable dropped set, then the re-copy its refusal names.
+// The re-copy writes the dropped set it can name (the source catalog's
+// tables it did not copy) instead of the all-uncopied marker — before R6-L1
+// every cold start re-appended the marker, so from then on every new table
+// of an unfiltered stream refused terminally. A table created after the
+// re-copy gets the not-established WARN and the stream runs.
+func TestIncludeTableScopeDrift_CorruptDroppedSetDoesNotOutliveTheRecopy(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishKD("")
+	r.exec(tgt, `UPDATE sluice_cdc_state SET dropped_tables = 'garbage' WHERE stream_id = 'itsd'`)
+	if stdout, stderr, code := runSluice(t, r.bin, "slot", "drop", "sluice_"+r.streamID, "--source-driver=postgres", "--source="+src, "--yes"); code != 0 {
+		t.Fatalf("slot drop: exit %d\n%s%s", code, stdout, stderr)
+	}
+	run := r.startSync("", "--restart-from-scratch")
+	r.exec(src, "INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 90*time.Second); !ok {
+		t.Fatalf("the re-copy over a corrupt dropped set: target kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+	if got, _ := r.waitScalar(tgt, `SELECT (COALESCE(dropped_tables, '') LIKE '%all-uncopied%')::text FROM sluice_cdc_state WHERE stream_id = 'itsd'`, "false", 5*time.Second); got != "false" {
+		t.Fatalf("the re-copy left the all-uncopied marker in the dropped set (LIKE = %s)", got)
+	}
+
+	r.exec(src, "CREATE TABLE nt (id INT PRIMARY KEY, v VARCHAR(20)); INSERT INTO nt VALUES (1, 'n')")
+	run = r.startSync("")
+	requireStreaming(t, run, 8*time.Second, "restart with a table created after the re-copy")
+	requireWarnNames(t, run, "nt")
 }
 
 // renameWhileStopped establishes kd and t8 on an unfiltered stream, stops
@@ -1341,6 +1459,134 @@ func TestIncludeTableScopeDrift_TargetNotRenamedRefuses(t *testing.T) {
 	r := newScopeDriftRig(t, "postgres", src, tgt)
 	r.renameWhileStopped("ALTER TABLE t8 RENAME TO t8b", "")
 	r.requireScopeDriftRefusal(r.startSync(""), "t8b", "the target was not renamed")
+}
+
+// TestIncludeTableScopeDrift_StaleTargetTableUnderTheNewNameRefuses is
+// R6-S2: the source renamed t8 to t8b; the target was NOT renamed, and holds
+// an unrelated, stale t8b beside the stream's real copy under t8. Following
+// would apply row 3 onto the stale table and strand the real copy; the start
+// refuses instead, and applies nothing to either.
+func TestIncludeTableScopeDrift_StaleTargetTableUnderTheNewNameRefuses(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.renameWhileStopped("ALTER TABLE t8 RENAME TO t8b; INSERT INTO t8b VALUES (3, 'z')",
+		"CREATE TABLE t8b (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO t8b VALUES (99, 'stale')")
+	r.requireScopeDriftRefusal(r.startSync(""), "t8b", "the target holds both t8 and t8b", "the target was not renamed")
+	if got := r.rows(tgt, "t8b", "e"); got != "99|stale" {
+		t.Fatalf("target t8b = %q; the refusal must apply nothing onto the stale table", got)
+	}
+	if got := r.rows(tgt, "t8", "e"); got != "1|x,2|y" {
+		t.Fatalf("target t8 = %q; the real copy must be left as it was", got)
+	}
+}
+
+// establishPairThenStop establishes kd, t8 and t9 on an unfiltered stream,
+// proves CDC, stops it, and runs sourceDDL while it is stopped.
+func (r *scopeDriftRig) establishPairThenStop(sourceDDL string) {
+	r.t.Helper()
+	r.exec(r.src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a');"+
+		"CREATE TABLE t8 (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO t8 VALUES (1, 'eight');"+
+		"CREATE TABLE t9 (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO t9 VALUES (1, 'nine')")
+	run := r.startSync("")
+	if got, ok := r.waitRows(r.tgt, "t9", "e", "1|nine", 90*time.Second); !ok {
+		r.t.Fatalf("cold start: target t9 = %q%s", got, run.logTail())
+	}
+	r.exec(r.src, "INSERT INTO kd VALUES (2, 'b')")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
+		r.t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+	r.exec(r.src, sourceDDL)
+}
+
+// requireSwapRefused asserts the start refuses TABLE-IDENTITY-CHANGED naming
+// the swap, and that neither target table took a change.
+func (r *scopeDriftRig) requireSwapRefused() {
+	r.t.Helper()
+	r.requireScopeDriftRefusal(r.startSync(""), "t8", "TABLE-IDENTITY-CHANGED", "swapped it with another table")
+	if got := r.rows(r.tgt, "t8", "e"); got != "1|eight" {
+		r.t.Fatalf("target t8 = %q; the refusal must apply nothing", got)
+	}
+}
+
+// TestIncludeTableScopeDrift_PgoutputSwapWhileStoppedRefuses is R6-S3 on
+// Postgres: t8 and t9 swapped by three renames while the stream was stopped.
+// Every name is still present and a FOR TABLE publication follows its
+// members by oid, so before R6-S3 the restart applied t9's changes onto
+// target t8 and t8's onto t9, at exit 0.
+func TestIncludeTableScopeDrift_PgoutputSwapWhileStoppedRefuses(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishPairThenStop("ALTER TABLE t8 RENAME TO tmp; ALTER TABLE t9 RENAME TO t8; ALTER TABLE tmp RENAME TO t9; " +
+		"INSERT INTO t8 VALUES (2, 'nine-2')")
+	r.requireSwapRefused()
+}
+
+// TestIncludeTableScopeDrift_PgoutputRecreatedSameNameRefusesByID: t8
+// dropped and re-created under the same name while stopped has a new oid;
+// the start refuses TABLE-IDENTITY-CHANGED (beside N2's publication
+// conviction, which only a FOR TABLE publication gives).
+func TestIncludeTableScopeDrift_PgoutputRecreatedSameNameRefusesByID(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishPairThenStop("DROP TABLE t8; CREATE TABLE t8 (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO t8 VALUES (7, 'new')")
+	r.requireScopeDriftRefusal(r.startSync(""), "t8", "TABLE-IDENTITY-CHANGED", "dropped and re-created")
+}
+
+// TestIncludeTableScopeDrift_PgoutputRewriteKeepsTheTable: VACUUM FULL and
+// CLUSTER rewrite the table (a new relfilenode) and keep its oid; the
+// restart streams.
+func TestIncludeTableScopeDrift_PgoutputRewriteKeepsTheTable(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishPairThenStop("VACUUM FULL t8")
+	r.exec(src, "CLUSTER t9 USING t9_pkey")
+	run := r.startSync("")
+	requireStreaming(t, run, 8*time.Second, "restart after VACUUM FULL and CLUSTER")
+	r.exec(src, "INSERT INTO t8 VALUES (2, 'eight-2')")
+	if got, ok := r.waitRows(tgt, "t8", "e", "1|eight,2|eight-2", 60*time.Second); !ok {
+		t.Fatalf("target t8 = %q after a rewrite%s", got, run.logTail())
+	}
+}
+
+// TestIncludeTableScopeDrift_BinlogRebuildUpdatesTheRecordedID is R6-S3 on
+// MySQL: OPTIMIZE TABLE gives the table a new TABLE_ID, which alone proves
+// nothing there, so the restart streams and the record takes the new id.
+func TestIncludeTableScopeDrift_BinlogRebuildUpdatesTheRecordedID(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "mysql", src, tgt)
+	r.establishPairThenStop("OPTIMIZE TABLE t8")
+	newID, _ := r.waitScalar(src, "SELECT CAST(TABLE_ID AS CHAR) FROM information_schema.INNODB_TABLES WHERE NAME = CONCAT(DATABASE(), '/t8')", "", 0)
+	if newID == "" || strings.HasPrefix(newID, "<") {
+		t.Fatalf("read t8's TABLE_ID: %q", newID)
+	}
+	run := r.startSync("")
+	requireStreaming(t, run, 8*time.Second, "restart after OPTIMIZE TABLE")
+	waitLog(t, run, "takes a table's new engine id")
+	r.exec(src, "INSERT INTO t8 VALUES (2, 'eight-2')")
+	if got, ok := r.waitRows(tgt, "t8", "e", "1|eight,2|eight-2", 60*time.Second); !ok {
+		t.Fatalf("target t8 = %q after OPTIMIZE TABLE%s", got, run.logTail())
+	}
+	if got, _ := r.waitScalar(tgt, "SELECT CAST(LOCATE(CONCAT(CHAR(9), '"+newID+"'), established_tables) > 0 AS CHAR) FROM sluice_cdc_state WHERE stream_id = 'itsd'", "1", 10*time.Second); got != "1" {
+		t.Fatalf("the record does not carry t8's new TABLE_ID %s", newID)
+	}
+}
+
+// TestIncludeTableScopeDrift_BinlogSwapWhileStoppedRefuses is R6-S3 on
+// MySQL: a swap is proved by the ids crossing between the two names, so it
+// refuses even though a bare id change there does not.
+func TestIncludeTableScopeDrift_BinlogSwapWhileStoppedRefuses(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "mysql", src, tgt)
+	r.establishPairThenStop("RENAME TABLE t8 TO tmp, t9 TO t8, tmp TO t9; INSERT INTO t8 VALUES (2, 'nine-2')")
+	r.requireSwapRefused()
 }
 
 // TestIncludeTableScopeDrift_AcceptTableRename is the flag path: a record

@@ -167,7 +167,7 @@ func TestTableSetsStore_NarrowingOnAControlTableThisRoleCannotAlter(t *testing.T
 		t.Skipf("the DML-only role cannot open an applier here (%v); the refusal is pinned by the unit door test", err)
 	}
 	defer func() { _ = applier.(interface{ Close() error }).Close() }()
-	_, err = applier.(tablesetstest.Store).NarrowEstablishedRecord(ctx, "s1", []string{"kd"}, nil, nil)
+	_, err = applier.(tablesetstest.Store).NarrowEstablishedRecord(ctx, "s1", ir.RecordNarrowing{InScope: []string{"kd"}})
 	if err == nil {
 		t.Fatal("the narrowing wrote nothing and reported success on a control table lacking dropped_tables")
 	}
@@ -200,5 +200,25 @@ func TestTableIdentities_SurviveRename(t *testing.T) {
 	recreated, err := Engine{}.TableIdentities(ctx, dsn, []string{"t8b"})
 	if err != nil || recreated["t8b"] == "" || recreated["t8b"] == before["t8"] {
 		t.Fatalf("a re-created t8b: %v (%v); want a new oid, not %s", recreated, err, before["t8"])
+	}
+
+	// R6-S3's premise, bound to the capability the door keys on: a table
+	// rewrite changes relfilenode, never the oid, so the engine says its id
+	// survives a rebuild — and the door refuses an oid that changed under
+	// the same name as a different relation.
+	if !(Engine{}).TableIdentitySurvivesRebuild() {
+		t.Fatal("TableIdentitySurvivesRebuild() = false on Postgres")
+	}
+	applyPGApplier(t, dsn, `INSERT INTO t8b SELECT g FROM generate_series(1, 100) g`)
+	for _, rewrite := range []string{
+		`VACUUM FULL t8b`, `CLUSTER t8b USING t8b_pkey`, `TRUNCATE t8b`, `ALTER TABLE t8b ALTER COLUMN id TYPE BIGINT`,
+		`ALTER TABLE t8b SET UNLOGGED`, `ALTER TABLE t8b SET LOGGED`,
+	} {
+		applyPGApplier(t, dsn, rewrite)
+		got, err := Engine{}.TableIdentities(ctx, dsn, []string{"t8b"})
+		if err != nil || got["t8b"] != recreated["t8b"] {
+			t.Fatalf("after %s: %v (%v); want the oid %s kept — the premise TableIdentitySurvivesRebuild rests on",
+				rewrite, got, err, recreated["t8b"])
+		}
 	}
 }

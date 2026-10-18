@@ -689,7 +689,7 @@ type RecordQueries struct {
 // [NarrowRecord] over the values read under a row lock, written back in the
 // same transaction. No row, no record, or a cold start in progress: nothing
 // is written. The caller has ensured both columns exist.
-func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RecordQueries, streamID string, inScope, gone []string, renames map[string]string) (leaving []string, err error) {
+func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RecordQueries, streamID string, n ir.RecordNarrowing) (leaving []string, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: begin: %w", cfg.EngineName, err)
@@ -720,15 +720,24 @@ func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig,
 	if err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, undecodable(DroppedTablesColumn, droppedCol.String, err))
 	}
-	nextEst, nextDrop, leaving := NarrowRecord(est, drop, inScope, gone, renames)
-	// A renamed entry keeps its id under its new name.
+	nextEst, nextDrop, leaving := NarrowRecord(est, drop, n.InScope, n.Gone, n.Renames)
+	// A renamed entry keeps its id under its new name; an entry the door
+	// found rebuilt takes its new id.
 	kept := toEntrySet(nextEst)
-	for old, renamed := range renames {
+	for old, renamed := range n.Renames {
 		if id, ok := ids[old]; ok {
 			if _, isKept := kept[renamed]; isKept {
 				delete(ids, old)
 				ids[renamed] = id
 			}
+		}
+	}
+	for entry, id := range n.IDs {
+		if _, isKept := kept[entry]; isKept && id != "" {
+			if ids == nil {
+				ids = map[string]string{}
+			}
+			ids[entry] = id
 		}
 	}
 	estValue, dropValue := EncodeTableSetIDs(nextEst, ids), EncodeTableSet(nextDrop)

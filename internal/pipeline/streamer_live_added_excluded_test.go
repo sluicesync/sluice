@@ -1,0 +1,138 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
+)
+
+// liveAddedApplier is a fakeApplier carrying a live-added set.
+type liveAddedApplier struct {
+	*fakeApplier
+	*fakeLiveAddedReader
+}
+
+// TestLiveAddedExcluded is R6-S1's predicate: an explicit --exclude-table
+// naming a live-added table is the contradiction; an include-mode or
+// unfiltered stream has none, and neither has a live-added table no
+// exclusion names.
+func TestLiveAddedExcluded(t *testing.T) {
+	excl := migcore.TableFilter{Exclude: []string{"tmp_*"}}
+	for _, c := range []struct {
+		name   string
+		filter migcore.TableFilter
+		live   []string
+		want   []string
+	}{
+		{"exclude glob names it", excl, []string{"orders", "tmp_keep", "tmp_a"}, []string{"tmp_a", "tmp_keep"}},
+		{"exclude names none", excl, []string{"orders"}, nil},
+		{"include mode", migcore.TableFilter{Include: []string{"users"}}, []string{"tmp_keep"}, nil},
+		{"unfiltered", migcore.TableFilter{}, []string{"tmp_keep"}, nil},
+		{"control table never", migcore.TableFilter{Exclude: []string{"sluice_*"}}, []string{"sluice_cdc_state"}, nil},
+	} {
+		if got := liveAddedExcluded(c.filter, c.live); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRefuseLiveAddedTableExcluded_AtStart is R6-S1 at a start: the
+// contradiction refuses terminally (INCLUDE-TABLE-SCOPE-DRIFT, the
+// supervisor's do-not-restart roster) with the marker and both remedies;
+// --reset-target-data, which deletes the set, does not refuse.
+func TestRefuseLiveAddedTableExcluded_AtStart(t *testing.T) {
+	ctx := context.Background()
+	app := &liveAddedApplier{fakeApplier: &fakeApplier{}, fakeLiveAddedReader: &fakeLiveAddedReader{}}
+	app.Set([]string{"tmp_keep", "orders"})
+	pg := &resumeDispatchEngine{name: "postgres"}
+	s := &Streamer{Source: pg, Target: pg, Filter: migcore.TableFilter{Exclude: []string{"tmp_*"}}}
+
+	err := s.refuseLiveAddedTableExcluded(ctx, app, "st")
+	if err == nil {
+		t.Fatal("a live-added table an --exclude-table names started")
+	}
+	if !errors.Is(err, ir.ErrIncludeTableScopeDrift) || refusalARestartRepeats(err) == nil {
+		t.Fatalf("not terminal: %v", err)
+	}
+	for _, want := range []string{LiveAddedTableExcludedMarker, "tmp_keep", "narrow --exclude-table", "--abandon --source-driver postgres --source <SOURCE-DSN>"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal lacks %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "orders") {
+		t.Errorf("refusal names a table no exclusion matches: %v", err)
+	}
+
+	s.ResetTargetData = true
+	if err := s.refuseLiveAddedTableExcluded(ctx, app, "st"); err != nil {
+		t.Fatalf("--reset-target-data deletes the live-added set; refused anyway: %v", err)
+	}
+	s.ResetTargetData = false
+	app.Set([]string{"orders"})
+	if err := s.refuseLiveAddedTableExcluded(ctx, app, "st"); err != nil {
+		t.Fatalf("no contradiction, refused: %v", err)
+	}
+}
+
+// TestLiveAddedExcluded_RunningStreamStops is R6-S1 in a running stream: the
+// poll that first reads the contradiction raises it, the dispatch filter
+// forwards nothing it receives from then on and closes, and the refusal says
+// what the poll window means for keeping the table.
+func TestLiveAddedExcluded_RunningStreamStops(t *testing.T) {
+	setPollIntervalForTest(t, 5*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	base := migcore.TableFilter{Exclude: []string{"tmp_*"}}
+	live := &liveAddedFilter{}
+	reader := &fakeLiveAddedReader{}
+	go pollLiveAddedTables(ctx, reader, liveAddedCheck{streamID: "st", base: base, source: "postgres", target: "postgres"}, live)
+
+	in := make(chan ir.Change, 8)
+	out := filterChangesWithLiveAdd(ctx, in, base, live)
+	in <- ir.Insert{Schema: "s", Table: "users", Row: ir.Row{"id": int64(1)}}
+	if c := <-out; c.(ir.Insert).Table != "users" {
+		t.Fatalf("before the add: got %v", c)
+	}
+
+	reader.Set([]string{"tmp_keep"})
+	select {
+	case <-live.refusedChan():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the poll never raised the contradiction")
+	}
+	in <- ir.Insert{Schema: "s", Table: "users", Row: ir.Row{"id": int64(2)}}
+	select {
+	case c, ok := <-out:
+		if ok {
+			t.Fatalf("the filter forwarded %v after the refusal", c)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the filter did not close after the refusal")
+	}
+	err := live.refusalErr()
+	if !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
+		t.Fatalf("refusal = %v", err)
+	}
+	for _, want := range []string{LiveAddedTableExcludedMarker, "tmp_keep", "stopped as soon as it saw the add", "redo its copy"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal lacks %q: %v", want, err)
+		}
+	}
+	if live.Contains("tmp_keep") {
+		t.Error("the contradicting set was installed")
+	}
+	s := &Streamer{}
+	s.liveFilterRef.Store(live)
+	if !s.interceptErrorPending() {
+		t.Error("interceptErrorPending misses the refusal, so a reshard reopen could run past it")
+	}
+}

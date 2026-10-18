@@ -809,8 +809,9 @@ func (a *AddTable) recordAddedTable(ctx context.Context, applier ir.ChangeApplie
 		))
 	}
 	slog.InfoContext(ctx, "add-table: recorded the table in the stream's live-added set: it is in the stream's scope on every "+
-		"start from now on (only --exclude-table or `schema add-table --abandon` takes it out), and a running stream picks it "+
-		"up on its next poll tick", slog.String("table", a.TableName), slog.String("stream_id", a.StreamID))
+		"start from now on (only `schema add-table --abandon` takes it out), and a running stream picks it up on its next poll "+
+		"tick; a stream whose --exclude-table names it refuses (LIVE-ADDED-TABLE-EXCLUDED) until one of the two changes",
+		slog.String("table", a.TableName), slog.String("stream_id", a.StreamID))
 	return nil
 }
 

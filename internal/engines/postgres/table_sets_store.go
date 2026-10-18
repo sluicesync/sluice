@@ -195,7 +195,7 @@ func (a *ChangeApplier) AbandonPendingAddedTable(ctx context.Context, streamID, 
 }
 
 // NarrowEstablishedRecord implements [ir.EstablishedTablesStore].
-func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string, renames map[string]string) ([]string, error) {
+func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID string, n ir.RecordNarrowing) ([]string, error) {
 	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
 		return nil, err
 	}
@@ -206,7 +206,7 @@ func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID st
 		Update: "UPDATE " + ref + " SET " + appliershared.EstablishedTablesColumn + " = $1, " +
 			appliershared.DroppedTablesColumn + " = $2 WHERE stream_id = $3",
 	}
-	leaving, err := appliershared.NarrowEstablished(ctx, a.db, controlCfg, q, streamID, inScope, gone, renames)
+	leaving, err := appliershared.NarrowEstablished(ctx, a.db, controlCfg, q, streamID, n)
 	return leaving, classifyApplierError(err)
 }
 

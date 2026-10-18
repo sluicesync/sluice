@@ -57,3 +57,10 @@ func (e Engine) TableIdentities(ctx context.Context, dsn string, tables []string
 	}
 	return out, nil
 }
+
+// TableIdentitySurvivesRebuild implements [ir.TableIdentityReader]: a table
+// rewrite (VACUUM FULL, CLUSTER, TRUNCATE, a rewriting ALTER) changes
+// relfilenode, never pg_class.oid — measured by
+// TestTableIdentities_SurviveRename — so an oid that changed under the same
+// name is a different relation.
+func (Engine) TableIdentitySurvivesRebuild() bool { return true }

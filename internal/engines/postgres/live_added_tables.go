@@ -12,8 +12,9 @@ package postgres
 // stream's original --include-table (staged-wave Mechanism A, as documented)
 // dropped every change to it at the dispatch filter: silently, at exit 0.
 // The streamer reads this set at startup and on its poll tick and admits
-// its tables like the MySQL set's; only an explicit --exclude-table, or
-// `schema add-table --abandon`, takes one back out.
+// its tables like the MySQL set's; only `schema add-table --abandon` takes
+// one back out (an --exclude-table naming one is refused,
+// LIVE-ADDED-TABLE-EXCLUDED).
 //
 // Stored in the table-set codec ([appliershared.EncodeTableSet]) rather than
 // MySQL's comma list, so any table name round-trips.

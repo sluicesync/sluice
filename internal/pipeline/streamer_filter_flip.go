@@ -30,9 +30,11 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -90,6 +92,52 @@ type liveAddedFilter struct {
 	// non-nil pointer points at an immutable map (the writer always
 	// allocates a fresh map and atomically swaps).
 	set atomic.Pointer[map[string]struct{}]
+
+	// refusal is the LIVE-ADDED-TABLE-EXCLUDED refusal the poll raised when
+	// the set gained a table an explicit --exclude-table names (R6-S1);
+	// refused is closed when it is set, and the dispatch filter forwards
+	// nothing from then on. Created lazily so the zero value stays usable.
+	refusal    atomic.Pointer[error]
+	refuseOnce sync.Once
+	refusedMu  sync.Mutex
+	refused    chan struct{}
+}
+
+// refusedChan is closed once [liveAddedFilter.refuse] has run. A nil filter
+// returns nil, which a select never receives from.
+func (f *liveAddedFilter) refusedChan() <-chan struct{} {
+	if f == nil {
+		return nil
+	}
+	f.refusedMu.Lock()
+	defer f.refusedMu.Unlock()
+	if f.refused == nil {
+		f.refused = make(chan struct{})
+	}
+	return f.refused
+}
+
+// refuse records the refusal and closes refusedChan; only the first call
+// counts.
+func (f *liveAddedFilter) refuse(err error) {
+	f.refuseOnce.Do(func() {
+		f.refusal.Store(&err)
+		f.refusedChan() // ensure it exists before closing it
+		f.refusedMu.Lock()
+		close(f.refused)
+		f.refusedMu.Unlock()
+	})
+}
+
+// refusalErr is the recorded refusal, nil while there is none.
+func (f *liveAddedFilter) refusalErr() error {
+	if f == nil {
+		return nil
+	}
+	if p := f.refusal.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // Contains reports whether tableName is in the live-added set.
@@ -161,14 +209,27 @@ func (f *liveAddedFilter) Snapshot() []string {
 // other; the streamer wires the operator-supplied [migcore.TableFilter] as
 // `base` and the running [liveAddedFilter] (whose contents change
 // over the run) as `live`.
+//
+// Once the live-added set's poll has raised LIVE-ADDED-TABLE-EXCLUDED
+// ([liveAddedFilter.refuse]), the stage forwards nothing more and closes its
+// output, like the other refusing intercepts; [Streamer.phaseSettleDispatch]
+// surfaces the refusal. Nothing it received after the refusal reaches the
+// applier, so the persisted position never moves past a change the stream
+// saw while the conflict stood.
 func filterChangesWithLiveAdd(ctx context.Context, in <-chan ir.Change, base migcore.TableFilter, live *liveAddedFilter) <-chan ir.Change {
 	out := make(chan ir.Change)
+	refused := live.refusedChan()
 	go func() {
 		defer close(out)
 		for {
 			select {
+			case <-refused:
+				return
 			case c, ok := <-in:
 				if !ok {
+					return
+				}
+				if live.refusalErr() != nil {
 					return
 				}
 				if !changeAllowedWithLiveAdd(c, base, live) {
@@ -252,6 +313,12 @@ func tableAllowedWithLiveAdd(unqualified string, base migcore.TableFilter, live 
 // live-add is what ADR-0034 promised ("the operator's safety-isolation
 // filter still excludes what it always excluded") and what this function did
 // not do before R6: it admitted a live-added table its --exclude-table named.
+//
+// The exclusion winning is a backstop, not a state a stream runs in: a
+// live-added table an explicit exclude names is a contradiction every start
+// and the running stream refuse (LIVE-ADDED-TABLE-EXCLUDED, R6-S1,
+// [liveAddedExcluded]), because the add told the operator the table is in
+// scope and the exclusion silently applies none of its changes.
 func scopeAdmits(unqualified string, base migcore.TableFilter, liveAdded func(string) bool) bool {
 	if appliershared.IsControlTable(unqualified) || base.IsSluiceOwned(unqualified) {
 		return false
@@ -260,6 +327,93 @@ func scopeAdmits(unqualified string, base migcore.TableFilter, liveAdded func(st
 		return true
 	}
 	return !base.ExcludesExplicitly(unqualified) && liveAdded(unqualified)
+}
+
+// LiveAddedTableExcludedMarker names the refusal of a live-added table an
+// explicit --exclude-table names (R6-S1).
+const LiveAddedTableExcludedMarker = "LIVE-ADDED-TABLE-EXCLUDED"
+
+// liveAddedExcluded returns, sorted, the live-added tables an explicit
+// --exclude-table names — the contradiction LIVE-ADDED-TABLE-EXCLUDED
+// refuses. sluice's own tables are never live-added and are skipped.
+func liveAddedExcluded(base migcore.TableFilter, liveAdded []string) []string {
+	var out []string
+	for _, t := range liveAdded {
+		if appliershared.IsControlTable(t) || base.IsSluiceOwned(t) {
+			continue
+		}
+		if base.ExcludesExplicitly(t) {
+			out = append(out, t)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// liveAddedCheck is what the LIVE-ADDED-TABLE-EXCLUDED check knows about a
+// stream: its id, its operator filter, and the engine names its pasteable
+// `schema add-table` remedies carry.
+type liveAddedCheck struct {
+	streamID       string
+	base           migcore.TableFilter
+	source, target string // engine names
+}
+
+// liveAddedCheckFor is the stream's [liveAddedCheck].
+func (s *Streamer) liveAddedCheckFor(streamID string) liveAddedCheck {
+	return liveAddedCheck{streamID: streamID, base: s.Filter, source: s.Source.Name(), target: s.Target.Name()}
+}
+
+// refusal is the LIVE-ADDED-TABLE-EXCLUDED refusal of tables. It carries
+// [ir.ErrIncludeTableScopeDrift]: a restart reads the same control row and
+// the same flags, so it is terminal, and in the fleet supervisor's
+// do-not-restart roster. running says the stream stopped mid-run rather than
+// at its start.
+func (c liveAddedCheck) refusal(tables []string, running bool) error {
+	list := strings.Join(tables, ", ")
+	what := "Nothing has been applied by this run."
+	if running {
+		// The poll sees the add up to one poll interval after it was
+		// recorded; changes in between were dropped as excluded, so keeping
+		// the table needs its copy redone, not just the flag narrowed.
+		what = fmt.Sprintf("The running stream stopped as soon as it saw the add, forwarding nothing it received after "+
+			"that; changes to the table that reached it between the add and that moment (at most one poll interval, the "+
+			"window every live add has — ADR-0034) were dropped as excluded, so to keep the table, also redo its copy: "+
+			"empty the target table and run `sluice schema add-table <table> --source-driver %s --source <SOURCE-DSN> --target-driver %s --target <TARGET-DSN> --stream-id %s --yes` "+
+			"once --exclude-table no longer names it.", c.source, c.target, c.streamID)
+	}
+	return fmt.Errorf("pipeline: %w: %s: stream %q has %s in its live-added set — `sluice schema add-table` brought "+
+		"it into the stream — and an --exclude-table pattern names it. The two contradict each other: the add said the "+
+		"table is in the stream's scope, and the exclusion would apply none of its changes, so its target copy would go "+
+		"stale while the stream reported healthy. Decide which you meant: to keep the table, narrow --exclude-table so "+
+		"no pattern matches it; to take it out, run `sluice schema add-table <table> --abandon --source-driver %s --source <SOURCE-DSN> --target-driver %s --target <TARGET-DSN> --stream-id %s --yes`, "+
+		"which removes it from the live-added set. Then start again. %s",
+		ir.ErrIncludeTableScopeDrift, LiveAddedTableExcludedMarker, c.streamID, list, c.source, c.target, c.streamID, what)
+}
+
+// refuseLiveAddedTableExcluded is LIVE-ADDED-TABLE-EXCLUDED at a start, on
+// every dispatch branch (cold and warm) before anything is copied, dropped or
+// applied. A target without the live-added set has nothing to contradict, and
+// neither has --reset-target-data, which deletes the control row the set
+// lives on before its cold start.
+func (s *Streamer) refuseLiveAddedTableExcluded(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+	if len(s.Filter.Exclude) == 0 || s.ResetTargetData {
+		return nil
+	}
+	reader, ok := applier.(liveAddedTablesReader)
+	if !ok {
+		return nil
+	}
+	tables, err := reader.ReadLiveAddedTables(ctx, streamID)
+	if err != nil {
+		return controlReadFailure(fmt.Errorf("pipeline: live-added table check: read live-added tables: %w", err))
+	}
+	if excluded := liveAddedExcluded(s.Filter, tables); len(excluded) > 0 {
+		slog.ErrorContext(ctx, "start refused: "+LiveAddedTableExcludedMarker, slog.String("stream_id", streamID),
+			slog.String("tables", strings.Join(excluded, ", ")))
+		return s.liveAddedCheckFor(streamID).refusal(excluded, false)
+	}
+	return nil
 }
 
 // wireCDCScopePredicate hands a CDC reader the sync's EFFECTIVE table scope
@@ -302,10 +456,15 @@ func (s *Streamer) wireCDCScopePredicate(r ir.CDCReader) {
 // instantly — the operator's add-table run already wrote the column,
 // and a few seconds of poll lag is the documented best-effort shape
 // (ADR-0034 § "best-effort caveat").
-func pollLiveAddedTables(pollCtx context.Context, reader liveAddedTablesReader, streamID string, target *liveAddedFilter) {
+//
+// A set that gains a table the stream's explicit --exclude-table names raises
+// LIVE-ADDED-TABLE-EXCLUDED ([observeLiveAdded]) and the poll ends: the
+// dispatch filter stops the stream.
+func pollLiveAddedTables(pollCtx context.Context, reader liveAddedTablesReader, check liveAddedCheck, target *liveAddedFilter) {
 	t := time.NewTicker(loadPollIntervalForTest())
 	defer t.Stop()
 
+	streamID := check.streamID
 	prev := ""
 	for {
 		select {
@@ -329,11 +488,30 @@ func pollLiveAddedTables(pollCtx context.Context, reader liveAddedTablesReader, 
 			continue
 		}
 		prev = joined
-		target.Set(tables)
+		if !observeLiveAdded(pollCtx, check, target, tables) {
+			return
+		}
 		slog.InfoContext(
 			pollCtx, "live-added tables observed; merging into dispatch filter (ADR-0034)",
 			slog.String("stream_id", streamID),
 			slog.String("tables", joined),
 		)
 	}
+}
+
+// observeLiveAdded installs a read of the live-added set into target, or —
+// when an explicit --exclude-table names one of its tables — raises
+// LIVE-ADDED-TABLE-EXCLUDED on target instead and reports false (R6-S1). The
+// refusal is raised before the set is installed, and the dispatch filter
+// checks it before forwarding each change, so no change the stream receives
+// from then on is applied or acknowledged.
+func observeLiveAdded(ctx context.Context, check liveAddedCheck, target *liveAddedFilter, tables []string) bool {
+	if excluded := liveAddedExcluded(check.base, tables); len(excluded) > 0 {
+		slog.ErrorContext(ctx, "stream stopping: "+LiveAddedTableExcludedMarker, slog.String("stream_id", check.streamID),
+			slog.String("tables", strings.Join(excluded, ", ")))
+		target.refuse(check.refusal(excluded, true))
+		return false
+	}
+	target.Set(tables)
+	return true
 }

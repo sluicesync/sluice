@@ -382,7 +382,7 @@ func TestPollLiveAddedTables_DetectsChange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go pollLiveAddedTables(ctx, reader, "stream-a", target)
+	go pollLiveAddedTables(ctx, reader, liveAddedCheck{streamID: "stream-a"}, target)
 
 	// Initially the target is empty.
 	if target.Contains("orders") {

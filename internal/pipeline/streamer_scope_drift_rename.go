@@ -13,9 +13,10 @@ package pipeline
 // that id beside each established name and the door matches it: an
 // established entry whose name is gone from the source, whose id now carries
 // a new in-scope name, is that table renamed. The record follows it (the new
-// name, the same id) and nothing refuses — provided the target holds the new
-// name; otherwise the refusal says the target was not renamed. A drop and
-// re-create under a new name has a new id, and still refuses.
+// name, the same id) and nothing refuses — provided the target was renamed
+// too: it holds the new name and no longer the old one (R6-S2); otherwise the
+// refusal says the target was not renamed. A drop and re-create under a new
+// name has a new id, and still refuses.
 //
 // Where no id proves it (a VStream/PlanetScale source, a name InnoDB stores
 // in its filename encoding, a record written without ids), the refusal names
@@ -58,11 +59,14 @@ func parseAcceptTableRenames(values []string) (map[string]string, error) {
 
 // detectRenames finds the in-scope tables the record does not hold that are
 // established tables renamed (see the file comment). followed maps a new
-// entry to the old one it is; targetNotRenamed maps a new entry to the old
-// table's display name where the target lacks the new name; gone lists the
+// entry to the old one it is; targetNotRenamed maps a new entry to what the
+// target holds instead where it was not renamed too; gone lists the
 // established tables missing from the source for the refusal's hint.
-func (s *Streamer) detectRenames(ctx context.Context, streamID string, scope streamScope, rec ir.EstablishedRecord, established, dropped map[string]bool) (followed, targetNotRenamed map[string]string, gone []string, err error) {
-	followed, targetNotRenamed = map[string]string{}, map[string]string{}
+//
+// ids holds the current engine id of each in-scope table, by key
+// ([Streamer.readTableIdentities]).
+func (s *Streamer) detectRenames(ctx context.Context, streamID string, scope streamScope, rec ir.EstablishedRecord, established, dropped map[string]bool, ids map[string]string) (followed map[string]string, targetNotRenamed map[string]renameMiss, gone []string, err error) {
+	followed, targetNotRenamed = map[string]string{}, map[string]renameMiss{}
 	acks, err := parseAcceptTableRenames(s.AcceptTableRenames)
 	if err != nil {
 		return nil, nil, nil, err
@@ -99,7 +103,6 @@ func (s *Streamer) detectRenames(ctx context.Context, streamID string, scope str
 		return followed, targetNotRenamed, nil, nil
 	}
 
-	ids := s.readTableIdentities(ctx, scope, unestablished, len(rec.IDs) > 0)
 	byID := map[string]string{} // namespace\x00id → old entry
 	for k := range goneKeys {
 		if id := rec.IDs[k]; id != "" {
@@ -162,6 +165,83 @@ func (s *Streamer) readTableIdentities(ctx context.Context, scope streamScope, t
 	return out
 }
 
+// TableIdentityChangedMarker names an established table whose engine id no
+// longer matches the stream's record (R6-S3).
+const TableIdentityChangedMarker = "TABLE-IDENTITY-CHANGED"
+
+// judgeTableIdentities compares each established, in-scope table's recorded
+// engine id with the source's id for the same name (R6-S3). The rename
+// match ([Streamer.detectRenames]) only looks at names gone from the source,
+// so a swap made while the stream was stopped (`t8 → tmp, t9 → t8, tmp →
+// t9`) left every name present and passed unnoticed; a FOR TABLE
+// publication tracks its members by oid, so N2 did not fire either.
+//
+// A changed id is PROOF of a different table when the recorded id now
+// belongs to another in-scope name (the recorded table moved away), or the
+// current id is one the record holds for another entry (this name now holds
+// another established table). On an engine whose id survives a rebuild
+// ([ir.TableIdentityReader.TableIdentitySurvivesRebuild]: Postgres) any
+// change is proof too — a drop and re-create under the same name, or a swap
+// with a table the stream does not have. Each proof is refused
+// (changed: key → why).
+//
+// On an engine whose rebuilds assign new ids (InnoDB: OPTIMIZE TABLE, a
+// copying ALTER, TRUNCATE) a bare change is routine maintenance as often as
+// a different table, and refusing it would break the former; the record
+// takes the new id instead (update: key → id) and the narrowing logs it.
+// What that leaves open on MySQL — a drop and re-create under the same name
+// while the stream was stopped — is TABLE-RECREATED-WHILE-STOPPED's
+// residual (docs/dev/audit-backlog.md).
+func (s *Streamer) judgeTableIdentities(ctx context.Context, streamID string, scope streamScope, rec ir.EstablishedRecord, established map[string]bool, ids map[string]string) (changed, update map[string]string) {
+	reader, ok := s.Source.(ir.TableIdentityReader)
+	if !ok || len(rec.IDs) == 0 || len(ids) == 0 {
+		return nil, nil
+	}
+	recordedOwner := map[string]string{} // namespace\x00id → established entry
+	for _, k := range rec.Established {
+		if id := rec.IDs[k]; id != "" {
+			recordedOwner[keyNamespace(k)+"\x00"+id] = k
+		}
+	}
+	currentOwner := map[string]string{} // namespace\x00id → in-scope entry
+	for _, t := range scope.tables {
+		if id := ids[t.key()]; id != "" {
+			currentOwner[t.namespace+"\x00"+id] = t.key()
+		}
+	}
+	shown := func(k string) string { return strings.ReplaceAll(k, "\x00", ".") }
+	changed, update = map[string]string{}, map[string]string{}
+	for _, t := range scope.tables {
+		k := t.key()
+		recorded, current := rec.IDs[k], ids[k]
+		if !established[k] || recorded == "" || current == "" || current == recorded {
+			continue
+		}
+		var why []string
+		if other := recordedOwner[t.namespace+"\x00"+current]; other != "" && other != k {
+			why = append(why, fmt.Sprintf("it now holds the table this stream recorded as %s", shown(other)))
+		}
+		if other := currentOwner[t.namespace+"\x00"+recorded]; other != "" && other != k {
+			why = append(why, fmt.Sprintf("the table this stream recorded under this name is now %s", shown(other)))
+		}
+		switch {
+		case len(why) > 0:
+			changed[k] = "the source swapped it with another table while the stream was stopped: " + strings.Join(why, ", and ")
+		case reader.TableIdentitySurvivesRebuild():
+			changed[k] = fmt.Sprintf("the source table under this name is a different one (engine id %s, recorded %s): it was "+
+				"dropped and re-created, or swapped with a table this stream does not have, while the stream was stopped",
+				current, recorded)
+		default:
+			update[k] = current
+		}
+	}
+	if len(update) > 0 {
+		slog.DebugContext(ctx, "table ids changed without proof of a different table; the record takes the new ids",
+			slog.String("stream_id", streamID), slog.Int("tables", len(update)))
+	}
+	return changed, update
+}
+
 // establishedIDs reads the engine-stable id of each established entry a
 // cold-start lane copied, for the record. Best-effort: a source without ids,
 // or a failed read, records the entries without them (a later rename then
@@ -220,18 +300,27 @@ func (a *AddTable) tableIdentity(ctx context.Context) string {
 	return ids[a.TableName]
 }
 
-// checkRenamedOnTarget sorts each matched rename by whether the target
-// holds the new name.
-func (s *Streamer) checkRenamedOnTarget(ctx context.Context, scope streamScope, tables []scopeTable, match, followed, targetNotRenamed map[string]string) error {
+// checkRenamedOnTarget sorts each matched rename by whether the target was
+// renamed too: it holds the new name AND no longer holds the old one — what
+// the runbook's rename of both sides leaves. A target holding the new name
+// beside the old one is not that (R6-S2): its new-named table is some other
+// table (a stale leftover, an unrelated one), the stream's real copy is
+// still under the old name, and following the rename would apply onto the
+// wrong table and strand the real copy. The acknowledgement path is held to
+// the same rule; what it cannot check is what the new-named target table
+// holds, which is trusted as-is (the flag's help says so).
+func (s *Streamer) checkRenamedOnTarget(ctx context.Context, scope streamScope, tables []scopeTable, match, followed map[string]string, targetNotRenamed map[string]renameMiss) error {
 	byNamespace := map[string]map[string]bool{}
 	for _, t := range tables {
-		if match[t.key()] == "" {
+		old := match[t.key()]
+		if old == "" {
 			continue
 		}
 		if byNamespace[t.namespace] == nil {
 			byNamespace[t.namespace] = map[string]bool{}
 		}
 		byNamespace[t.namespace][strings.ToLower(t.name)] = true
+		byNamespace[t.namespace][strings.ToLower(bareTableOfKey(old))] = true
 	}
 	for ns, names := range byNamespace {
 		tgt, err := s.readUniqueKeyDoorTarget(ctx, scope.pairs[ns], names)
@@ -243,12 +332,40 @@ func (s *Streamer) checkRenamedOnTarget(ctx context.Context, scope streamScope, 
 			if old == "" || t.namespace != ns {
 				continue
 			}
-			if matchTargetTable(tgt, t.name) != nil {
+			hasNew := matchTargetTable(tgt, t.name) != nil
+			hasOld := matchTargetTable(tgt, bareTableOfKey(old)) != nil
+			if hasNew && !hasOld {
 				followed[t.key()] = old
-			} else {
-				targetNotRenamed[t.key()] = strings.ReplaceAll(old, "\x00", ".")
+				continue
+			}
+			targetNotRenamed[t.key()] = renameMiss{
+				old: strings.ReplaceAll(old, "\x00", "."), oldTable: bareTableOfKey(old),
+				hasNew: hasNew, hasOld: hasOld,
 			}
 		}
 	}
 	return nil
+}
+
+// renameMiss is a source rename the target does not mirror: what the target
+// holds under each name.
+type renameMiss struct {
+	old      string // the established table's display name
+	oldTable string // and its bare table name
+
+	hasNew, hasOld bool
+}
+
+// targetState says what the target holds instead of the renamed table.
+func (m renameMiss) targetState(newName string) string {
+	old := m.oldTable
+	switch {
+	case m.hasNew && m.hasOld:
+		return fmt.Sprintf("the target holds both %s and %s, so its %s is not this stream's copy (that is still %s) "+
+			"and following the rename would apply onto the wrong table", old, newName, newName, old)
+	case m.hasOld:
+		return fmt.Sprintf("the target still holds %s and has no table named %s", old, newName)
+	default:
+		return "the target has no table named " + newName
+	}
 }

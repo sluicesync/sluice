@@ -93,6 +93,7 @@ import (
 	"strings"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
@@ -177,8 +178,13 @@ type scopeDriftTable struct {
 	addAbandoned bool
 	// renamedFrom: the table is an established one renamed on the source
 	// (proved by id or acknowledged), but the target holds no table under the
-	// new name — the target was not renamed.
-	renamedFrom string
+	// new name, or still holds the old one — the target was not renamed.
+	// renameTargetState says which.
+	renamedFrom, renameTargetState string
+	// identityChanged, non-empty: established, but the source table under
+	// its name is not the one the stream recorded (TABLE-IDENTITY-CHANGED,
+	// R6-S3) — why, naming a swap where one is proved.
+	identityChanged string
 	// renameCandidates, set on a never-established conviction: established
 	// tables gone from the source, any of which this table may be renamed
 	// from without an id that proves it (the refusal names
@@ -210,7 +216,7 @@ func (d *scopeDriftTable) yieldToLiveAdd() {
 // (after [scopeDriftTable.yieldToLiveAdd]).
 func (d scopeDriftTable) onlyInProgress() bool {
 	return d.addInProgress && !d.addIncomplete && !d.addAbandoned && !d.dropped && !d.droppedUnknown && !d.notEstablished && d.renamedFrom == "" &&
-		d.appliedWhy == "" && !d.unpublished && !d.legacyUnpublished
+		d.appliedWhy == "" && !d.unpublished && !d.legacyUnpublished && d.identityChanged == ""
 }
 
 // streamScope is the current scope with the namespace pairs it was read
@@ -265,9 +271,9 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 		return err
 	}
 	var notApplied map[string]bool
-	var renames map[string]string // old entry → new entry
+	var fix ir.RecordNarrowing // renames and rebuilt ids the record follows
 	if rec.Recorded {
-		if notApplied, renames, err = s.judgeAgainstRecord(ctx, streamID, scope, rec, membership, entry); err != nil {
+		if notApplied, fix, err = s.judgeAgainstRecord(ctx, streamID, scope, rec, membership, entry); err != nil {
 			return err
 		}
 	} else {
@@ -289,7 +295,7 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 		return s.scopeDriftRefusal(ctx, streamID, membership, drift)
 	}
 	if rec.Recorded {
-		if err := s.narrowEstablished(ctx, applier, streamID, rec, scope, renames); err != nil {
+		if err := s.narrowEstablished(ctx, applier, streamID, rec, scope, fix); err != nil {
 			return err
 		}
 	}
@@ -472,30 +478,39 @@ func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplie
 // never-established tables whose changes are provably not applied (the WARN
 // case), by key.
 //
-// It also returns the renames it proved or the operator acknowledged
-// ([Streamer.detectRenames]), old entry → new entry, for the record to
-// follow once the door passes.
-func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scope streamScope, rec ir.EstablishedRecord, m *ir.PublicationMembership, entry func(scopeTable) *scopeDriftTable) (notApplied map[string]bool, renames map[string]string, err error) {
+// It also returns what the record must follow once the door passes (fix):
+// the renames it proved or the operator acknowledged
+// ([Streamer.detectRenames]), old entry → new entry, and the new ids of
+// tables rebuilt under an engine whose ids a rebuild changes
+// ([Streamer.judgeTableIdentities]).
+func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scope streamScope, rec ir.EstablishedRecord, m *ir.PublicationMembership, entry func(scopeTable) *scopeDriftTable) (notApplied map[string]bool, fix ir.RecordNarrowing, err error) {
 	established, dropped := toSet(rec.Established), toSet(rec.Dropped)
 	missing := map[string]bool{}
 	if m != nil {
 		missing = toSet(m.Missing)
 	}
-	followed, targetNotRenamed, gone, err := s.detectRenames(ctx, streamID, scope, rec, established, dropped)
+	ids := s.readTableIdentities(ctx, scope, scope.tables, len(rec.IDs) > 0)
+	followed, targetNotRenamed, gone, err := s.detectRenames(ctx, streamID, scope, rec, established, dropped, ids)
 	if err != nil {
-		return nil, nil, err
+		return nil, fix, err
 	}
-	renames = map[string]string{}
+	fix.Renames = map[string]string{}
 	for newKey, oldKey := range followed {
-		renames[oldKey] = newKey
+		fix.Renames[oldKey] = newKey
 	}
+	var changed map[string]string
+	changed, fix.IDs = s.judgeTableIdentities(ctx, streamID, scope, rec, established, ids)
 	var candidates []scopeTable // never established, admitted by a glob or no filter
 	for _, t := range scope.tables {
+		if why := changed[t.key()]; why != "" {
+			entry(t).identityChanged = why
+		}
 		switch {
 		case followed[t.key()] != "":
 			// A RENAME TABLE the stream's record follows: the same table.
-		case targetNotRenamed[t.key()] != "":
-			entry(t).renamedFrom = targetNotRenamed[t.key()]
+		case targetNotRenamed[t.key()].old != "":
+			miss := targetNotRenamed[t.key()]
+			entry(t).renamedFrom, entry(t).renameTargetState = miss.old, miss.targetState(t.name)
 		case rec.DroppedAllUncopied && !established[t.key()]:
 			// The dropped set was unreadable at the last cold start (R6 L1):
 			// any table that cold start did not copy may be a stale one.
@@ -517,11 +532,11 @@ func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scop
 	s.scopeDriftGone = gone
 	notApplied = map[string]bool{}
 	if len(candidates) == 0 {
-		return notApplied, renames, nil
+		return notApplied, fix, nil
 	}
 	applied, err := s.changesWouldApply(ctx, scope, candidates, m)
 	if err != nil {
-		return nil, nil, err
+		return nil, fix, err
 	}
 	var outside []string
 	for _, t := range candidates {
@@ -539,7 +554,7 @@ func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scop
 			"counted); they stay out until `sluice schema add-table` copies them (ADR-0021)",
 			slog.String("stream_id", streamID), slog.String("tables", strings.Join(outside, ", ")))
 	}
-	return notApplied, renames, nil
+	return notApplied, fix, nil
 }
 
 // legacyNotDelivered is the no-record stream's "provably not applied": a
@@ -680,7 +695,7 @@ func (s *Streamer) scopeDriftRefusal(ctx context.Context, streamID string, m *ir
 // this role cannot ALTER, which the refusal names. A failure that only
 // concerns pruning dropped entries the source no longer has (nothing is
 // leaving) WARNs: keeping a stale dropped entry can only refuse more.
-func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeApplier, streamID string, rec ir.EstablishedRecord, scope streamScope, renames map[string]string) error {
+func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeApplier, streamID string, rec ir.EstablishedRecord, scope streamScope, fix ir.RecordNarrowing) error {
 	inScope := make([]string, 0, len(scope.tables))
 	in := map[string]bool{}
 	for _, t := range scope.tables {
@@ -689,12 +704,12 @@ func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeAppli
 	}
 	var planned []string // established tables this resume no longer applies
 	for _, k := range rec.Established {
-		if !in[k] && renames[k] == "" {
+		if !in[k] && fix.Renames[k] == "" {
 			planned = append(planned, k)
 		}
 	}
 	candidates := append(append([]string(nil), rec.Dropped...), planned...)
-	if len(candidates) == 0 && len(renames) == 0 {
+	if len(candidates) == 0 && len(fix.Renames) == 0 && len(fix.IDs) == 0 {
 		return nil
 	}
 	fail := func(step string, err error) error {
@@ -715,14 +730,21 @@ func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeAppli
 			gone = append(gone, k)
 		}
 	}
-	leaving, err := applier.(ir.EstablishedTablesStore).NarrowEstablishedRecord(ctx, streamID, inScope, gone, renames)
+	fix.InScope, fix.Gone = inScope, gone
+	leaving, err := applier.(ir.EstablishedTablesStore).NarrowEstablishedRecord(ctx, streamID, fix)
 	if err != nil {
 		return fail("record the narrowing", err)
 	}
-	for old, renamed := range renames {
+	for old, renamed := range fix.Renames {
 		slog.InfoContext(ctx, "the stream's record follows a table renamed while it was stopped",
 			slog.String("stream_id", streamID), slog.String("from", strings.ReplaceAll(old, "\x00", ".")),
 			slog.String("to", strings.ReplaceAll(renamed, "\x00", ".")))
+	}
+	for k, id := range fix.IDs {
+		slog.InfoContext(ctx, "the stream's record takes a table's new engine id: the source rebuilt it while the stream was "+
+			"stopped (OPTIMIZE TABLE, a copying ALTER, TRUNCATE), which on this engine assigns a new id, and nothing "+
+			"shows it is a different table", slog.String("stream_id", streamID),
+			slog.String("table", strings.ReplaceAll(k, "\x00", ".")), slog.String("id", id))
 	}
 	if len(leaving) > 0 {
 		shown := make([]string, len(leaving))
@@ -798,8 +820,13 @@ func (s *Streamer) includeTableScopeDriftError(streamID, publication string, tab
 			why = append(why, "it left this stream's scope earlier and its changes since then were discarded, so its target copy is stale")
 		}
 		if t.renamedFrom != "" {
-			why = append(why, fmt.Sprintf("it is %s renamed on the source, but the target has no table named %s: the target "+
-				"was not renamed — rename the target table too (the drained model), then start again", t.renamedFrom, t.name))
+			why = append(why, fmt.Sprintf("it is %s renamed on the source, but %s: the target was not renamed — rename "+
+				"the target table too (the drained model; a different table already holding the new name must be dropped "+
+				"or renamed away first), then start again", t.renamedFrom, t.renameTargetState))
+		}
+		if t.identityChanged != "" {
+			why = append(why, TableIdentityChangedMarker+": "+t.identityChanged+", so its target copy is of a different "+
+				"table and applying its changes onto it would mix the two")
 		}
 		if len(t.renameCandidates) > 0 {
 			why = append(why, fmt.Sprintf("if it is one of this stream's tables renamed while the stream was stopped (%s, gone "+
@@ -929,7 +956,7 @@ func (s *Streamer) recordColdStartEstablished(ctx context.Context, applier ir.Ch
 		return
 	}
 	if store, ok := applier.(ir.EstablishedTablesStore); ok {
-		if err := recordEstablishedAfterCopy(ctx, store, streamID, keys, s.establishedIDs(ctx, keys)); err != nil {
+		if err := recordEstablishedAfterCopy(ctx, store, streamID, keys, s.establishedIDs(ctx, keys), s.sourceTableKeys); err != nil {
 			if rec, rerr := store.ReadEstablishedRecord(ctx, streamID); rerr == nil && !rec.Recorded {
 				// A first cold start on a control table this role cannot
 				// ALTER: there never was a record, and there still is none.
@@ -965,23 +992,28 @@ func (s *Streamer) recordColdStartEstablished(ctx context.Context, applier ir.Ch
 // A record that does not decode (R6 L1) is overwritten: the cold start's
 // copy is the truth about what is established. The dropped set cannot be
 // recomputed from an unreadable value, and treating it as empty could pass a
-// stale table as never-established, so it becomes the all-uncopied marker
-// ([ir.EstablishedRecord.DroppedAllUncopied]): every table this copy did not
-// cover counts as dropped. That direction never yields a false "not
-// dropped"; its cost is that a table the stream never had refuses where it
-// would only have been WARNed about, until it is brought in or excluded.
-func recordEstablishedAfterCopy(ctx context.Context, store ir.EstablishedTablesStore, streamID string, keys []string, ids map[string]string) error {
+// stale table as never-established. So the cold start writes the dropped set
+// it CAN name (R6-L1): the old dropped entries still readable, plus every
+// table the source catalog holds that this copy did not cover — any table
+// that ever left the scope and is still on the source is among them — minus
+// what it copied. uncopied lists those catalog tables. Only when it cannot
+// (the catalog read fails) does the all-uncopied marker
+// ([ir.EstablishedRecord.DroppedAllUncopied]) stand in for the set; a later
+// cold start that can enumerate replaces it, so it does not outlive the
+// failure that wrote it (R6-L1: re-appending it on every cold start made
+// every new table of an unfiltered or glob stream refuse, forever). Both
+// directions never yield a false "not dropped".
+func recordEstablishedAfterCopy(ctx context.Context, store ir.EstablishedTablesStore, streamID string, keys []string, ids map[string]string, uncopied func(context.Context) ([]string, error)) error {
 	rec, err := store.ReadEstablishedRecord(ctx, streamID)
 	var bad *ir.UndecodableTableSetError
 	switch {
 	case errors.As(err, &bad):
 		slog.ErrorContext(ctx, "cold start: the stream's established-table record does not decode; overwriting it with the "+
-			"tables this copy covered, and marking every other table as possibly stale (all-uncopied)",
+			"tables this copy covered, and counting every table the source holds that it did not copy as dropped",
 			slog.String("stream_id", streamID), slog.String("column", bad.Column), slog.Int("discarded_bytes", bad.RawBytes))
-		if err := store.RecordDroppedTables(ctx, streamID, []string{ir.DroppedAllUncopiedEntry}); err != nil {
-			return err
-		}
-		return store.RecordEstablishedTables(ctx, streamID, keys, ids)
+		// Nothing of the record is readable, so nothing names an old dropped
+		// entry: the catalog's uncopied tables are the whole set.
+		rec = ir.EstablishedRecord{DroppedAllUncopied: true}
 	case err != nil:
 		return err
 	}
@@ -993,15 +1025,81 @@ func recordEstablishedAfterCopy(ctx context.Context, store ir.EstablishedTablesS
 		}
 	}
 	if rec.DroppedAllUncopied {
-		dropped = append(dropped, ir.DroppedAllUncopiedEntry)
-		rec.Dropped = append(rec.Dropped, ir.DroppedAllUncopiedEntry)
+		dropped = concreteDroppedSet(ctx, streamID, dropped, copied, uncopied)
+		rec.Dropped = append(rec.Dropped, ir.DroppedAllUncopiedEntry) // what is stored, so the write below runs
 	}
-	if !sameSet(dropped, rec.Dropped) {
+	if !sameSet(dropped, rec.Dropped) || bad != nil {
 		if err := store.RecordDroppedTables(ctx, streamID, dropped); err != nil {
 			return err
 		}
 	}
 	return store.RecordEstablishedTables(ctx, streamID, keys, ids)
+}
+
+// concreteDroppedSet is the dropped set a cold start writes in place of the
+// all-uncopied marker (R6-L1): named (the old entries it can still read,
+// minus copied) plus the source catalog's tables the copy did not cover. A
+// catalog it cannot read keeps the marker, which a later cold start replaces.
+func concreteDroppedSet(ctx context.Context, streamID string, named []string, copied map[string]bool, uncopied func(context.Context) ([]string, error)) []string {
+	var catalog []string
+	err := errors.New("no source catalog reader")
+	if uncopied != nil {
+		catalog, err = uncopied(ctx)
+	}
+	if err != nil {
+		slog.WarnContext(ctx, "cold start: could not read the source catalog to name the tables this copy did not cover; "+
+			"keeping the all-uncopied marker, so every table it did not copy still counts as dropped until a cold start "+
+			"can read the catalog", slog.String("stream_id", streamID), slog.String("error", err.Error()))
+		return append(named, ir.DroppedAllUncopiedEntry)
+	}
+	set := toSet(named)
+	for _, k := range catalog {
+		if !copied[k] && !set[k] {
+			set[k] = true
+			named = append(named, k)
+		}
+	}
+	sort.Strings(named)
+	return named
+}
+
+// sourceTableKeys lists every table in the source catalog, per namespace, as
+// established-record keys — the universe [concreteDroppedSet] subtracts the
+// copy from. A Postgres reader lists the names through its scope push-down
+// without reading any table (the push-down is asked about every name, and
+// told no); other readers read the schema.
+func (s *Streamer) sourceTableKeys(ctx context.Context) ([]string, error) {
+	pairs, err := s.uniqueKeyDoorScopes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, sc := range pairs {
+		var names []string
+		sr, schema, err := s.openScopedSourceSchema(ctx, sc.sourceDSN, func(name string) bool {
+			names = append(names, name)
+			return false
+		})
+		if err != nil {
+			return nil, err
+		}
+		migcore.CloseIf(sr)
+		if _, scoped := sr.(ir.TableScoper); !scoped && schema != nil {
+			names = names[:0]
+			for _, t := range schema.Tables {
+				if t != nil {
+					names = append(names, t.Name)
+				}
+			}
+		}
+		for _, n := range names {
+			if appliershared.IsControlTable(n) || s.Filter.IsSluiceOwned(n) {
+				continue // never in any stream's scope
+			}
+			out = append(out, establishedKey(sc.namespace, n))
+		}
+	}
+	return out, nil
 }
 
 func toSet(xs []string) map[string]bool {

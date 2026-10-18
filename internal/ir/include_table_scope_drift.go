@@ -88,8 +88,17 @@ type EstablishedRecord struct {
 // from the map; an engine with no such id does not implement it. Used by the
 // INCLUDE-TABLE-SCOPE-DRIFT door to follow a rename made while the stream
 // was stopped (Bug 321 R6).
+//
+// TableIdentitySurvivesRebuild says whether the id also survives a table
+// rewrite. Postgres keeps pg_class.oid across VACUUM FULL, CLUSTER, TRUNCATE
+// and rewriting ALTERs (only relfilenode changes), so a table whose id
+// changed under the same name is a different relation. InnoDB assigns a new
+// TABLE_ID on OPTIMIZE TABLE, a null ALTER, an INPLACE rebuild, a copying
+// ALTER and TRUNCATE, so there a changed id alone proves nothing (both
+// measured on real servers: TestTableIdentities_SurviveRename).
 type TableIdentityReader interface {
 	TableIdentities(ctx context.Context, dsn string, tables []string) (map[string]string, error)
+	TableIdentitySurvivesRebuild() bool
 }
 
 // DroppedAllUncopiedEntry is the dropped-set value behind
@@ -146,11 +155,27 @@ type EstablishedTablesStore interface {
 	// replace): established keeps only the entries in inScope, the rest move
 	// to dropped, and dropped loses the entries in gone (tables the source
 	// no longer has). It returns the entries that moved. A stream with no
-	// record, or a cold start in progress, is left alone. renames (old entry →
-	// new entry) are applied first, under the same lock: the entry takes its
+	// record, or a cold start in progress, is left alone. n's Renames and IDs
+	// are applied under the same lock ([RecordNarrowing]).
+	NarrowEstablishedRecord(ctx context.Context, streamID string, n RecordNarrowing) (leaving []string, err error)
+}
+
+// RecordNarrowing is one resume's change to a stream's established-table
+// record ([EstablishedTablesStore.NarrowEstablishedRecord]).
+type RecordNarrowing struct {
+	// InScope: the established entries the stream still applies; the rest
+	// move to dropped. Gone: entries the source no longer has, which leave
+	// dropped.
+	InScope, Gone []string
+	// Renames (old entry → new entry), applied first: the entry takes its
 	// new name and keeps its id (a RENAME TABLE the door proved or the
 	// operator acknowledged).
-	NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string, renames map[string]string) (leaving []string, err error)
+	Renames map[string]string
+	// IDs (entry → id) replaces the recorded id of an entry still
+	// established: a table whose id an engine changes on a rebuild (InnoDB's
+	// TABLE_ID on OPTIMIZE TABLE or a copying ALTER) and which the door
+	// found to be the same table.
+	IDs map[string]string
 }
 
 // Pending add-table liveness. A running add-table refreshes its entry's

@@ -2505,7 +2505,8 @@ func (s *Streamer) interceptErrorPending() bool {
 			return true
 		}
 	}
-	return false
+	// The live-added dispatch filter's LIVE-ADDED-TABLE-EXCLUDED (R6-S1).
+	return s.liveFilterRef.Load().refusalErr() != nil
 }
 
 // surfaceSourceError returns the source CDC reader's stored Err()

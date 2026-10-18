@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -72,14 +73,22 @@ func (a *scopeDriftApplier) AbandonPendingAddedTable(_ context.Context, _, table
 	return nil
 }
 
-func (a *scopeDriftApplier) NarrowEstablishedRecord(_ context.Context, _ string, inScope, gone []string, renames map[string]string) ([]string, error) {
+func (a *scopeDriftApplier) NarrowEstablishedRecord(_ context.Context, _ string, n ir.RecordNarrowing) ([]string, error) {
 	if a.narrowErr != nil {
 		return nil, a.narrowErr
 	}
-	est, drop, leaving := appliershared.NarrowRecord(a.rec.Established, a.rec.Dropped, inScope, gone, renames)
+	est, drop, leaving := appliershared.NarrowRecord(a.rec.Established, a.rec.Dropped, n.InScope, n.Gone, n.Renames)
 	if len(leaving) > 0 || !sameSet(drop, a.rec.Dropped) || !sameSet(est, a.rec.Established) {
 		a.writes = append(a.writes, "narrow=established:"+strings.Join(est, ",")+" dropped:"+strings.Join(drop, ","))
 		a.rec.Established, a.rec.Dropped = est, drop
+	}
+	if len(n.IDs) > 0 {
+		ids := make([]string, 0, len(n.IDs))
+		for k, v := range n.IDs {
+			ids = append(ids, k+":"+v)
+		}
+		sort.Strings(ids)
+		a.writes = append(a.writes, "ids="+strings.Join(ids, ","))
 	}
 	return leaving, nil
 }

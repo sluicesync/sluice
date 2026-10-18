@@ -45,7 +45,10 @@ func (s *Streamer) seedLiveAddedFilter(ctx context.Context, applier ir.ChangeApp
 	if len(tables) == 0 {
 		return
 	}
-	target.Set(tables)
+	// An add recorded since the start's own check (R6-S1) refuses here too.
+	if !observeLiveAdded(ctx, s.liveAddedCheckFor(streamID), target, tables) {
+		return
+	}
 	slog.InfoContext(
 		ctx, "live-added tables observed at startup; merging into dispatch filter (ADR-0034)",
 		slog.String("stream_id", streamID),
@@ -74,7 +77,7 @@ func (s *Streamer) startLiveAddedTablesPoll(applyCtx context.Context, applier ir
 		applyCtx, "live-added-tables poll started",
 		slog.String("stream_id", streamID),
 	)
-	go pollLiveAddedTables(applyCtx, reader, streamID, target)
+	go pollLiveAddedTables(applyCtx, reader, s.liveAddedCheckFor(streamID), target)
 }
 
 // startStopSignalPoll wires the optional stop-signal poll goroutine
@@ -716,6 +719,12 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			s.recordColdStartEstablished(ctx, applier, streamID)
 		}
 	}()
+	// LIVE-ADDED-TABLE-EXCLUDED (R6-S1): before any branch copies, drops or
+	// applies anything — a cold start would leave the table uncopied and a
+	// warm resume would apply none of its changes, both silently.
+	if err := s.refuseLiveAddedTableExcluded(ctx, applier, streamID); err != nil {
+		return nil, func() {}, false, err
+	}
 	var resumeCopyFrom ir.Position
 	if found && !s.ResetTargetData && !s.RestartFromScratch {
 		if resumer, ok := s.Source.(ir.SnapshotStreamResumer); ok && resumer.PositionCarriesCopyCursor(persisted) {
@@ -1367,6 +1376,11 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 		if ukErrPtr := s.uniqueKeyRecheckErr.Load(); ukErrPtr != nil && *ukErrPtr != nil {
 			dispatchErr = *ukErrPtr
 		}
+	}
+	// LIVE-ADDED-TABLE-EXCLUDED (R6-S1): the dispatch filter closes the
+	// channel once the live-added poll raised it.
+	if dispatchErr == nil {
+		dispatchErr = s.liveFilterRef.Load().refusalErr()
 	}
 	// ADR-0157: the streamer surfaces a schema-forward refusal here (the
 	// stall point). Fire the advisory schema-drift alert edge-once — a retry
