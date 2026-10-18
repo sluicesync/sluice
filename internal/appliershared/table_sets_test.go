@@ -134,17 +134,17 @@ func TestPendingEntryCodec(t *testing.T) {
 // and only b moves; computed from the door's read — the round-4 replace —
 // c was overwritten away and its completed copy forgotten.
 func TestNarrowRecord(t *testing.T) {
-	est, drop, leaving := NarrowRecord([]string{"a", "b", "c"}, []string{"gone", "x"}, []string{"a", "c"}, []string{"gone"})
+	est, drop, leaving := NarrowRecord([]string{"a", "b", "c"}, []string{"gone", "x"}, []string{"a", "c"}, []string{"gone"}, nil)
 	if !reflect.DeepEqual(est, []string{"a", "c"}) || !reflect.DeepEqual(drop, []string{"b", "x"}) || !reflect.DeepEqual(leaving, []string{"b"}) {
 		t.Fatalf("established %q dropped %q leaving %q; want [a c] [b x] [b]", est, drop, leaving)
 	}
 	// A leaving table the source no longer has is forgotten, not dropped.
-	est, drop, leaving = NarrowRecord([]string{"a", "b"}, nil, []string{"a"}, []string{"b"})
+	est, drop, leaving = NarrowRecord([]string{"a", "b"}, nil, []string{"a"}, []string{"b"}, nil)
 	if !reflect.DeepEqual(est, []string{"a"}) || len(drop) != 0 || !reflect.DeepEqual(leaving, []string{"b"}) {
 		t.Fatalf("established %q dropped %q leaving %q", est, drop, leaving)
 	}
 	// Narrowing to nothing records the empty set, not "no record".
-	if est, _, _ := NarrowRecord([]string{"a"}, nil, nil, nil); est == nil || len(est) != 0 {
+	if est, _, _ := NarrowRecord([]string{"a"}, nil, nil, nil, nil); est == nil || len(est) != 0 {
 		t.Fatalf("established %#v; want the empty, non-nil set", est)
 	}
 }
@@ -171,5 +171,38 @@ func TestDecodePendingSet(t *testing.T) {
 	}
 	if p, ok := byRaw["not quoted"]; !ok || p.Table != "" {
 		t.Fatalf("an unquoted line: %+v; want reported with no table", p)
+	}
+}
+
+// TestTableSetIDCodec pins the id beside an established entry (R6 rename):
+// a name holding a TAB, a NUL key, the sentinel and an entry without an id
+// all round-trip, the id-less decoder still reads the value, and an id that
+// is not decimal refuses.
+func TestTableSetIDCodec(t *testing.T) {
+	names := []string{"t8", "tab\tname", "app\x00orders", ColdStartInProgressEntry, "no_id"}
+	ids := map[string]string{"t8": "16391", "tab\tname": "7", "app\x00orders": "123456789012"}
+	enc := EncodeTableSetIDs(names, ids)
+	got, gotIDs, err := DecodeTableSetIDs(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got)
+	want := append([]string(nil), names...)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(gotIDs, ids) {
+		t.Fatalf("round trip: %q %v; want %q %v", got, gotIDs, want, ids)
+	}
+	if plain, err := DecodeTableSet(enc); err != nil || len(plain) != len(names) {
+		t.Fatalf("the id-less decoder: %q, %v", plain, err)
+	}
+	for _, bad := range []string{`"t8"` + "\t", `"t8"` + "\tx1", `"t8"` + "\t1\t2"} {
+		if _, _, err := DecodeTableSetIDs(bad); err == nil {
+			t.Errorf("%q decoded; want an error", bad)
+		}
+	}
+	// NarrowRecord follows a rename before it narrows.
+	est, drop, leaving := NarrowRecord([]string{"kd", "t8"}, nil, []string{"kd", "t8b"}, []string{"t8"}, map[string]string{"t8": "t8b"})
+	if !reflect.DeepEqual(est, []string{"kd", "t8b"}) || len(drop) != 0 || len(leaving) != 0 {
+		t.Fatalf("a rename: established %q dropped %q leaving %q", est, drop, leaving)
 	}
 }

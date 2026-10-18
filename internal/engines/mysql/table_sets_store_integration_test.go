@@ -158,7 +158,7 @@ func TestTableSetsStore_RawRoundTrip(t *testing.T) {
 	}
 	defer func() { _ = applier.(interface{ Close() error }).Close() }()
 	store := applier.(tablesetstest.Store)
-	if err := store.RecordEstablishedTables(ctx, "s1", nil); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	db, err := sql.Open("mysql", dsn)
@@ -182,7 +182,7 @@ func TestTableSetsStore_RawRoundTrip(t *testing.T) {
 		},
 	})
 	// The full corpus, through the same NO_BACKSLASH_ESCAPES applier.
-	if err := store.RecordEstablishedTables(ctx, "s1", tablesetstest.EstablishedCorpus); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", tablesetstest.EstablishedCorpus, nil); err != nil {
 		t.Fatal(err)
 	}
 	rec, err := store.ReadEstablishedRecord(ctx, "s1")
@@ -212,7 +212,7 @@ func TestTableSetsStore_LargeSetAndNarrowColumn(t *testing.T) {
 	for i := range big {
 		big[i] = fmt.Sprintf("table_%04d_%s", i, strings.Repeat("x", 40))
 	}
-	if err := store.RecordEstablishedTables(ctx, "s1", big); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", big, nil); err != nil {
 		t.Fatal(err)
 	}
 	rec, err := store.ReadEstablishedRecord(ctx, "s1")
@@ -231,8 +231,38 @@ func TestTableSetsStore_LargeSetAndNarrowColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = narrow.(interface{ Close() error }).Close() }()
-	err = narrow.(tablesetstest.Store).RecordEstablishedTables(ctx, "s1", []string{"orders"})
+	err = narrow.(tablesetstest.Store).RecordEstablishedTables(ctx, "s1", []string{"orders"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "MODIFY COLUMN `established_tables` LONGTEXT") {
 		t.Fatalf("a TEXT established_tables: %v; want the refusal naming the MODIFY", err)
+	}
+}
+
+// TestTableIdentities_SurviveRename is Bug 321 R6's premise on a real
+// server: InnoDB's TABLE_ID survives RENAME TABLE, and a table dropped and
+// re-created under the new name gets a different one.
+func TestTableIdentities_SurviveRename(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, cleanup := startMySQLForApplier(t)
+	t.Cleanup(cleanup)
+	applyMySQLApplier(t, dsn, "CREATE TABLE t8 (id INT PRIMARY KEY)")
+	eng := Engine{Flavor: FlavorVanilla}
+	before, err := eng.TableIdentities(ctx, dsn, []string{"t8"})
+	if err != nil || before["t8"] == "" {
+		t.Fatalf("no TABLE_ID for t8: %v, %v", before, err)
+	}
+	applyMySQLApplier(t, dsn, "RENAME TABLE t8 TO t8b")
+	after, err := eng.TableIdentities(ctx, dsn, []string{"t8", "t8b"})
+	if err != nil || after["t8b"] != before["t8"] || after["t8"] != "" {
+		t.Fatalf("after RENAME TABLE: %v (%v); want t8b to carry t8's id %s", after, err, before["t8"])
+	}
+	applyMySQLApplier(t, dsn, "DROP TABLE t8b")
+	applyMySQLApplier(t, dsn, "CREATE TABLE t8b (id INT PRIMARY KEY)")
+	recreated, err := eng.TableIdentities(ctx, dsn, []string{"t8b"})
+	if err != nil || recreated["t8b"] == "" || recreated["t8b"] == before["t8"] {
+		t.Fatalf("a re-created t8b: %v (%v); want a new id, not %s", recreated, err, before["t8"])
+	}
+	if ids, err := (Engine{Flavor: FlavorVitess}).TableIdentities(ctx, dsn, []string{"t8b"}); err != nil || len(ids) != 0 {
+		t.Fatalf("the Vitess flavor reported ids %v, %v; it has none", ids, err)
 	}
 }

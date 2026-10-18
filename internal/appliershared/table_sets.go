@@ -57,6 +57,15 @@ const ColdStartInProgressEntry = "\x00cold-start-in-progress"
 // bytes (TestTableSetCodecRoundTrip). NUL-separated entries (multi-database
 // keys, pending entries, the in-progress sentinel) ride it like any other.
 func EncodeTableSet(tables []string) string {
+	return EncodeTableSetIDs(tables, nil)
+}
+
+// EncodeTableSetIDs is [EncodeTableSet] carrying an engine-stable table id
+// beside an entry (the established set, Bug 321 R6 rename): a line is the
+// quoted entry, then — when ids holds one — a TAB and the id's decimal
+// digits. QuoteToASCII escapes every TAB inside the entry, so the first raw
+// TAB on a line can only be the separator.
+func EncodeTableSetIDs(tables []string, ids map[string]string) string {
 	set := make(map[string]struct{}, len(tables))
 	for _, t := range tables {
 		set[t] = struct{}{}
@@ -69,27 +78,61 @@ func EncodeTableSet(tables []string) string {
 	lines := make([]string, len(names))
 	for i, t := range names {
 		lines[i] = strconv.QuoteToASCII(t)
+		if id := ids[t]; id != "" {
+			lines[i] += "\t" + id
+		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-// DecodeTableSet parses a value [EncodeTableSet] wrote. A line that is not a
-// quoted string is an error, never skipped: a record that cannot be read must
-// refuse the resume rather than read as some other set.
+// DecodeTableSet parses a value [EncodeTableSet] (or [EncodeTableSetIDs])
+// wrote, without the ids. A line that is not a quoted string is an error,
+// never skipped: a record that cannot be read must refuse the resume rather
+// than read as some other set.
 func DecodeTableSet(stored string) ([]string, error) {
+	out, _, err := DecodeTableSetIDs(stored)
+	return out, err
+}
+
+// DecodeTableSetIDs parses a value [EncodeTableSetIDs] wrote: the entries,
+// and the id of each entry that carries one. An id that is not decimal digits
+// is an error like any other malformed line.
+func DecodeTableSetIDs(stored string) (entries []string, ids map[string]string, err error) {
 	if stored == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	lines := strings.Split(stored, "\n")
 	out := make([]string, 0, len(lines))
 	for i, line := range lines {
-		name, err := strconv.Unquote(line)
+		quoted, id, hasID := strings.Cut(line, "\t")
+		name, err := strconv.Unquote(quoted)
 		if err != nil {
-			return nil, fmt.Errorf("table-set line %d (%q) is not a quoted table name: %w", i+1, line, err)
+			return nil, nil, fmt.Errorf("table-set line %d (%q) is not a quoted table name: %w", i+1, line, err)
+		}
+		if hasID {
+			if !isDecimalID(id) {
+				return nil, nil, fmt.Errorf("table-set line %d (%q) carries a table id that is not decimal digits", i+1, line)
+			}
+			if ids == nil {
+				ids = map[string]string{}
+			}
+			ids[name] = id
 		}
 		out = append(out, name)
 	}
-	return out, nil
+	return out, ids, nil
+}
+
+func isDecimalID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // EncodePendingEntry renders one pending add-table entry:
@@ -185,15 +228,20 @@ func readRow(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q TableSe
 // failure is an error, and a value that does not decode is an
 // [ir.UndecodableTableSetError] naming the recovery.
 func ReadTableSet(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q TableSetQueries, streamID string) (tables []string, recorded bool, err error) {
+	tables, _, recorded, err = readTableSetIDs(ctx, db, cfg, q, streamID)
+	return tables, recorded, err
+}
+
+func readTableSetIDs(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q TableSetQueries, streamID string) (tables []string, ids map[string]string, recorded bool, err error) {
 	stored, _, err := readRow(ctx, db, cfg, q, streamID)
 	if err != nil || !stored.Valid {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	tables, err = DecodeTableSet(stored.String)
+	tables, ids, err = DecodeTableSetIDs(stored.String)
 	if err != nil {
-		return nil, false, fmt.Errorf("%s: read %s of stream %q: %w", cfg.EngineName, q.Column, streamID, undecodable(q.Column, stored.String, err))
+		return nil, nil, false, fmt.Errorf("%s: read %s of stream %q: %w", cfg.EngineName, q.Column, streamID, undecodable(q.Column, stored.String, err))
 	}
-	return tables, true, nil
+	return tables, ids, true, nil
 }
 
 // ReadPendingEntries reads a pending_added_tables set, with the server's now
@@ -247,7 +295,7 @@ func pendingEntryTable(entry string) string {
 // DroppedAllUncopied; a NULL dropped set reads as empty. An undecodable
 // value is an [ir.UndecodableTableSetError] naming its column.
 func ReadEstablishedRecord(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, established, dropped TableSetQueries, streamID string) (ir.EstablishedRecord, error) {
-	est, recorded, err := ReadTableSet(ctx, db, cfg, established, streamID)
+	est, ids, recorded, err := readTableSetIDs(ctx, db, cfg, established, streamID)
 	if err != nil || !recorded {
 		return ir.EstablishedRecord{}, err
 	}
@@ -255,7 +303,7 @@ func ReadEstablishedRecord(ctx context.Context, db *sql.DB, cfg *ControlTableCon
 	if err != nil {
 		return ir.EstablishedRecord{Recorded: true}, err
 	}
-	rec := ir.EstablishedRecord{Recorded: true}
+	rec := ir.EstablishedRecord{Recorded: true, IDs: ids}
 	for _, e := range est {
 		if e == ColdStartInProgressEntry {
 			rec.ColdStartInProgress = true
@@ -287,6 +335,8 @@ type TableSetEdit struct {
 	// is NULL; now is the clock of the server holding the row. A nil next
 	// with write true stores NULL; write false leaves the row untouched.
 	Apply func(current map[string]struct{}, recorded bool, now time.Time) (next map[string]struct{}, write bool)
+	// IDs, when set, are written beside next's entries ([EncodeTableSetIDs]).
+	IDs map[string]string
 }
 
 // UpdateTableSet applies edit to streamID's set under a row lock and writes
@@ -334,7 +384,7 @@ func UpdateTableSet(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q 
 	if !write {
 		return tx.Rollback()
 	}
-	value := encodeNext(next)
+	value := encodeNextIDs(next, edit.IDs)
 	if (value == nil && !stored.Valid) || (value != nil && stored.Valid && value.(string) == stored.String) {
 		return tx.Rollback() // nothing changes
 	}
@@ -356,7 +406,10 @@ func toEntrySet(entries []string) map[string]struct{} {
 }
 
 // encodeNext is the column value for next: nil (NULL) or its encoding.
-func encodeNext(next map[string]struct{}) any {
+func encodeNext(next map[string]struct{}) any { return encodeNextIDs(next, nil) }
+
+// encodeNextIDs is encodeNext with ids written beside the entries.
+func encodeNextIDs(next map[string]struct{}, ids map[string]string) any {
 	if next == nil {
 		return nil
 	}
@@ -364,7 +417,7 @@ func encodeNext(next map[string]struct{}) any {
 	for t := range next {
 		names = append(names, t)
 	}
-	return EncodeTableSet(names)
+	return EncodeTableSetIDs(names, ids)
 }
 
 // PendingAdd is the [TableSetEdit] that writes table's pending entry under
@@ -472,7 +525,13 @@ func BeginColdStart() TableSetEdit {
 // NULL: "established nothing" is a recorded fact. A replace: it overwrites a
 // corrupted value.
 func EstablishedReplace(tables []string) TableSetEdit {
-	return TableSetEdit{Replace: true, Apply: func(map[string]struct{}, bool, time.Time) (map[string]struct{}, bool) {
+	return EstablishedReplaceIDs(tables, nil)
+}
+
+// EstablishedReplaceIDs is [EstablishedReplace] writing each table's
+// engine-stable id beside it.
+func EstablishedReplaceIDs(tables []string, ids map[string]string) TableSetEdit {
+	return TableSetEdit{Replace: true, IDs: ids, Apply: func(map[string]struct{}, bool, time.Time) (map[string]struct{}, bool) {
 		return toEntrySet(tables), true
 	}}
 }
@@ -497,7 +556,7 @@ type PendingAddQueries struct {
 // multi-database stream (add-table names a bare table; the record keys
 // `<namespace>\x00<table>` — a bare entry would be junk no scope matches).
 // The caller has ensured all three columns exist.
-func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q PendingAddQueries, streamID, table, token string) (err error) {
+func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q PendingAddQueries, streamID, table, token, id string) (err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("%s: complete pending add-table: begin: %w", cfg.EngineName, err)
@@ -531,14 +590,20 @@ func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig
 
 	establishedNext, droppedNext := nullableString(establishedCol), nullableString(droppedCol)
 	if establishedCol.Valid {
-		est, err := DecodeTableSet(establishedCol.String)
+		est, ids, err := DecodeTableSetIDs(establishedCol.String)
 		if err != nil {
 			return fmt.Errorf("%s: complete pending add-table: %w", cfg.EngineName, undecodable(EstablishedTablesColumn, establishedCol.String, err))
 		}
 		if !inProgressOrMultiDatabase(est) {
 			eset := toEntrySet(est)
 			eset[table] = struct{}{}
-			establishedNext = encodeNext(eset)
+			if id != "" {
+				if ids == nil {
+					ids = map[string]string{}
+				}
+				ids[table] = id
+			}
+			establishedNext = encodeNextIDs(eset, ids)
 			if droppedCol.Valid {
 				drop, err := DecodeTableSet(droppedCol.String)
 				if err != nil {
@@ -565,7 +630,27 @@ func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig
 // it read under its row lock — an entry a concurrent completion added since
 // the caller's own read is judged too (kept if in scope, dropped otherwise),
 // never overwritten away.
-func NarrowRecord(established, dropped, inScope, gone []string) (nextEstablished, nextDropped, leaving []string) {
+//
+// renames (old entry → new entry) are applied first: an established old
+// entry becomes the new one, when the new one is not already established.
+func NarrowRecord(established, dropped, inScope, gone []string, renames map[string]string) (nextEstablished, nextDropped, leaving []string) {
+	if len(renames) > 0 {
+		est := toEntrySet(established)
+		for old, renamed := range renames {
+			if _, ok := est[old]; !ok {
+				continue
+			}
+			if _, taken := est[renamed]; taken {
+				continue
+			}
+			delete(est, old)
+			est[renamed] = struct{}{}
+		}
+		established = established[:0:0]
+		for e := range est {
+			established = append(established, e)
+		}
+	}
 	in, isGone := toEntrySet(inScope), toEntrySet(gone)
 	nextEstablished = []string{}
 	drop := toEntrySet(dropped)
@@ -604,7 +689,7 @@ type RecordQueries struct {
 // [NarrowRecord] over the values read under a row lock, written back in the
 // same transaction. No row, no record, or a cold start in progress: nothing
 // is written. The caller has ensured both columns exist.
-func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RecordQueries, streamID string, inScope, gone []string) (leaving []string, err error) {
+func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RecordQueries, streamID string, inScope, gone []string, renames map[string]string) (leaving []string, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: begin: %w", cfg.EngineName, err)
@@ -624,7 +709,7 @@ func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig,
 	if !establishedCol.Valid {
 		return nil, tx.Rollback()
 	}
-	est, err := DecodeTableSet(establishedCol.String)
+	est, ids, err := DecodeTableSetIDs(establishedCol.String)
 	if err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, undecodable(EstablishedTablesColumn, establishedCol.String, err))
 	}
@@ -635,11 +720,22 @@ func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig,
 	if err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, undecodable(DroppedTablesColumn, droppedCol.String, err))
 	}
-	nextEst, nextDrop, leaving := NarrowRecord(est, drop, inScope, gone)
-	if EncodeTableSet(nextEst) == EncodeTableSet(est) && EncodeTableSet(nextDrop) == EncodeTableSet(drop) {
+	nextEst, nextDrop, leaving := NarrowRecord(est, drop, inScope, gone, renames)
+	// A renamed entry keeps its id under its new name.
+	kept := toEntrySet(nextEst)
+	for old, renamed := range renames {
+		if id, ok := ids[old]; ok {
+			if _, isKept := kept[renamed]; isKept {
+				delete(ids, old)
+				ids[renamed] = id
+			}
+		}
+	}
+	estValue, dropValue := EncodeTableSetIDs(nextEst, ids), EncodeTableSet(nextDrop)
+	if estValue == establishedCol.String && dropValue == EncodeTableSet(drop) {
 		return nil, tx.Rollback()
 	}
-	if _, err := tx.ExecContext(ctx, q.Update, EncodeTableSet(nextEst), EncodeTableSet(nextDrop), streamID); err != nil {
+	if _, err := tx.ExecContext(ctx, q.Update, estValue, dropValue, streamID); err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, err)
 	}
 	if err := tx.Commit(); err != nil {

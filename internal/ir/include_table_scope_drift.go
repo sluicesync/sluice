@@ -63,6 +63,12 @@ type EstablishedRecord struct {
 	// Established are the tables copied by the stream's cold start or by a
 	// completed `sluice schema add-table`, and applied continuously since.
 	Established []string
+	// IDs holds the engine-stable id recorded for an established entry
+	// (Postgres pg_class.oid, InnoDB TABLE_ID), when the source exposes one.
+	// It is what lets a warm resume follow a RENAME TABLE made while the
+	// stream was stopped instead of refusing the new name as never copied;
+	// a drop and re-create under a new name has a new id, and still refuses.
+	IDs map[string]string
 	// Dropped are tables that left the stream's scope since they were
 	// established: their changes were discarded from then on, so the target
 	// copy is stale and a scope that re-admits them refuses until they are
@@ -73,6 +79,17 @@ type EstablishedRecord struct {
 	// Every table not established then counts as dropped — the direction
 	// that can never pass a stale copy as current.
 	DroppedAllUncopied bool
+}
+
+// TableIdentityReader is the optional source-[Engine] surface that reports
+// each named table's engine-stable id: an identifier that survives RENAME
+// TABLE and that a dropped-and-recreated table does not keep (Postgres
+// pg_class.oid; MySQL InnoDB TABLE_ID). A table it cannot identify is absent
+// from the map; an engine with no such id does not implement it. Used by the
+// INCLUDE-TABLE-SCOPE-DRIFT door to follow a rename made while the stream
+// was stopped (Bug 321 R6).
+type TableIdentityReader interface {
+	TableIdentities(ctx context.Context, dsn string, tables []string) (map[string]string, error)
 }
 
 // DroppedAllUncopiedEntry is the dropped-set value behind
@@ -116,8 +133,9 @@ type EstablishedTablesStore interface {
 	BeginColdStartRecord(ctx context.Context, streamID string) error
 
 	// RecordEstablishedTables replaces the established set (the empty set
-	// included), ending a cold start in progress. The row must exist.
-	RecordEstablishedTables(ctx context.Context, streamID string, tables []string) error
+	// included), ending a cold start in progress, with the engine-stable id of
+	// each table that has one (ids may be nil). The row must exist.
+	RecordEstablishedTables(ctx context.Context, streamID string, tables []string, ids map[string]string) error
 
 	// RecordDroppedTables replaces the dropped set. The row must exist.
 	RecordDroppedTables(ctx context.Context, streamID string, tables []string) error
@@ -128,8 +146,11 @@ type EstablishedTablesStore interface {
 	// replace): established keeps only the entries in inScope, the rest move
 	// to dropped, and dropped loses the entries in gone (tables the source
 	// no longer has). It returns the entries that moved. A stream with no
-	// record, or a cold start in progress, is left alone.
-	NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string) (leaving []string, err error)
+	// record, or a cold start in progress, is left alone. renames (old entry →
+	// new entry) are applied first, under the same lock: the entry takes its
+	// new name and keeps its id (a RENAME TABLE the door proved or the
+	// operator acknowledged).
+	NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string, renames map[string]string) (leaving []string, err error)
 }
 
 // Pending add-table liveness. A running add-table refreshes its entry's
@@ -226,8 +247,9 @@ type PendingAddedTablesStore interface {
 	// only when — the entry still carries token; otherwise
 	// [ErrPendingAddSuperseded] and nothing is written. The established half
 	// is skipped on a stream with no record, during a cold start in progress,
-	// and on a multi-database stream (add-table names a bare table).
-	CompletePendingAddedTable(ctx context.Context, streamID, table, token string) error
+	// and on a multi-database stream (add-table names a bare table). id is the
+	// table's engine-stable id, "" when the source exposes none.
+	CompletePendingAddedTable(ctx context.Context, streamID, table, token, id string) error
 
 	// ClearPendingAddedTables removes tables' entries whatever their tokens.
 	// Idempotent and tolerant of a missing row, table or column.

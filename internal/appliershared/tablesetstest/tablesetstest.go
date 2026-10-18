@@ -168,7 +168,7 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 	}
 	complete := func(table, token string) error {
 		t.Helper()
-		return store.CompletePendingAddedTable(ctx, "s1", table, token)
+		return store.CompletePendingAddedTable(ctx, "s1", table, token, "")
 	}
 	recordPending := func(table, token string) {
 		t.Helper()
@@ -199,7 +199,7 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 		t.Fatalf("Complete on an unrecorded stream: %+v pending %q", read(), pending())
 	}
 
-	if err := store.RecordEstablishedTables(ctx, "s1", EstablishedCorpus); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", EstablishedCorpus, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RecordDroppedTables(ctx, "s1", []string{"orders", "line\nbreak"}); err != nil {
@@ -213,7 +213,7 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 	}
 
 	// A completed add-table re-establishes a dropped table.
-	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a"}); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	recordPending("orders", "tok-b")
@@ -260,7 +260,7 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 	if rec := read(); !rec.ColdStartInProgress || len(rec.Established) != 0 {
 		t.Fatalf("Complete wrote into a cold start in progress: %+v", rec)
 	}
-	if err := store.RecordEstablishedTables(ctx, "s1", nil); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if rec := read(); !rec.Recorded || rec.ColdStartInProgress || len(rec.Established) != 0 {
@@ -270,7 +270,7 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 	narrowAndAbandon(ctx, t, store)
 
 	// A multi-database record is left alone by add-table (F3).
-	if err := store.RecordEstablishedTables(ctx, "s1", []string{"app\x00orders"}); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"app\x00orders"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	recordPending("orders", "tok-c")
@@ -280,7 +280,7 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 	if rec := read(); len(rec.Established) != 1 || rec.Established[0] != "app\x00orders" {
 		t.Fatalf("add-table wrote into a multi-database record: %q", rec.Established)
 	}
-	if err := store.RecordEstablishedTables(ctx, "no-such-stream", []string{"x"}); !errors.Is(err, errStreamNotFound) {
+	if err := store.RecordEstablishedTables(ctx, "no-such-stream", []string{"x"}, nil); !errors.Is(err, errStreamNotFound) {
 		t.Fatalf("Record on a missing row = %v; want the stream-not-found error", err)
 	}
 }
@@ -306,13 +306,33 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	}
 	complete := func(table, token string) error {
 		t.Helper()
-		return store.CompletePendingAddedTable(ctx, "s1", table, token)
+		return store.CompletePendingAddedTable(ctx, "s1", table, token, "")
+	}
+
+	// R6 rename: an id beside each name round-trips, a completion records
+	// its table's id, and a rename under the narrowing's lock keeps the id
+	// under the new name.
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"t8", "kd"}, map[string]string{"t8": "16391"}); err != nil {
+		t.Fatal(err)
+	}
+	recordPending("users", "tok-u")
+	if err := store.CompletePendingAddedTable(ctx, "s1", "users", "tok-u", "4242"); err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); rec.IDs["t8"] != "16391" || rec.IDs["users"] != "4242" || rec.IDs["kd"] != "" {
+		t.Fatalf("ids read back as %v", rec.IDs)
+	}
+	if _, err := store.NarrowEstablishedRecord(ctx, "s1", []string{"t8b", "kd", "users"}, []string{"t8"}, map[string]string{"t8": "t8b"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"kd", "t8b", "users"}) || rec.IDs["t8b"] != "16391" || rec.IDs["t8"] != "" {
+		t.Fatalf("after the rename: %+v; want t8b carrying t8's id", rec)
 	}
 
 	// R4-4: the narrowing is judged on the values under its row lock. The
 	// caller decided the scope from an older read of {a, b}; a completion of
 	// c has landed since. c survives, b moves to dropped.
-	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a", "b"}); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a", "b"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RecordDroppedTables(ctx, "s1", []string{"c", "gone"}); err != nil {
@@ -322,7 +342,7 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	if err := complete("c", "tok-n"); err != nil {
 		t.Fatal(err)
 	}
-	leaving, err := store.NarrowEstablishedRecord(ctx, "s1", []string{"a", "c"}, []string{"gone"})
+	leaving, err := store.NarrowEstablishedRecord(ctx, "s1", []string{"a", "c"}, []string{"gone"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,10 +353,10 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	if err := store.BeginColdStartRecord(ctx, "s1"); err != nil {
 		t.Fatal(err)
 	}
-	if leaving, err := store.NarrowEstablishedRecord(ctx, "s1", nil, nil); err != nil || leaving != nil || !read().ColdStartInProgress {
+	if leaving, err := store.NarrowEstablishedRecord(ctx, "s1", nil, nil, nil); err != nil || leaving != nil || !read().ColdStartInProgress {
 		t.Fatalf("a narrowing during a cold start in progress: %q, %v, %+v; want nothing written", leaving, err, read())
 	}
-	if leaving, err := store.NarrowEstablishedRecord(ctx, "no-such-stream", nil, nil); err != nil || leaving != nil {
+	if leaving, err := store.NarrowEstablishedRecord(ctx, "no-such-stream", nil, nil, nil); err != nil || leaving != nil {
 		t.Fatalf("a narrowing of a missing row: %q, %v; want nothing to do", leaving, err)
 	}
 
@@ -393,7 +413,7 @@ func RawRoundTrip(ctx context.Context, t *testing.T, store Store, raw RawColumn)
 	}
 
 	// A store write, inspected byte for byte.
-	if err := store.RecordEstablishedTables(ctx, "s1", []string{"x\ny", "é", `q"\`}); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"x\ny", "é", `q"\`}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if v, _ := raw.Get("established_tables"); v != `"q\"\\"`+"\n"+`"x\ny"`+"\n"+`"\u00e9"` {
@@ -425,7 +445,7 @@ func RawRoundTrip(ctx context.Context, t *testing.T, store Store, raw RawColumn)
 	if err := store.RecordDroppedTables(ctx, "s1", []string{ir.DroppedAllUncopiedEntry}); err != nil {
 		t.Fatalf("overwriting an undecodable dropped set: %v", err)
 	}
-	if err := store.RecordEstablishedTables(ctx, "s1", []string{"kd"}); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"kd"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if rec, err := read(); err != nil || !rec.DroppedAllUncopied || len(rec.Dropped) != 0 || !reflect.DeepEqual(rec.Established, []string{"kd"}) {

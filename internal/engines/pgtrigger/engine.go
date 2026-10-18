@@ -259,6 +259,15 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 // postgres-trigger` prints exactly the Postgres set.
 func (e Engine) ControlTableDDL() []ir.ControlTableStatement { return e.pg.ControlTableDDL() }
 
+// TableIdentities delegates to the composed [postgres.Engine]: a
+// postgres-trigger source's tables are Postgres tables, identified by
+// pg_class.oid across a rename (Bug 321 R6).
+func (e Engine) TableIdentities(ctx context.Context, dsn string, tables []string) (map[string]string, error) {
+	return e.pg.TableIdentities(ctx, dsn, tables)
+}
+
+var _ ir.TableIdentityReader = Engine{}
+
 // ControlTableDDLGuidance delegates to the composed [postgres.Engine].
 func (e Engine) ControlTableDDLGuidance() []string { return e.pg.ControlTableDDLGuidance() }
 

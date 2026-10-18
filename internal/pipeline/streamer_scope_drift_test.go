@@ -54,7 +54,7 @@ func (a *scopeDriftApplier) TouchPendingAddedTable(_ context.Context, _, table, 
 	return a.touchErr
 }
 
-func (a *scopeDriftApplier) CompletePendingAddedTable(_ context.Context, _, table, _ string) error {
+func (a *scopeDriftApplier) CompletePendingAddedTable(_ context.Context, _, table, _, _ string) error {
 	if a.completeErr != nil {
 		return a.completeErr
 	}
@@ -72,12 +72,12 @@ func (a *scopeDriftApplier) AbandonPendingAddedTable(_ context.Context, _, table
 	return nil
 }
 
-func (a *scopeDriftApplier) NarrowEstablishedRecord(_ context.Context, _ string, inScope, gone []string) ([]string, error) {
+func (a *scopeDriftApplier) NarrowEstablishedRecord(_ context.Context, _ string, inScope, gone []string, renames map[string]string) ([]string, error) {
 	if a.narrowErr != nil {
 		return nil, a.narrowErr
 	}
-	est, drop, leaving := appliershared.NarrowRecord(a.rec.Established, a.rec.Dropped, inScope, gone)
-	if len(leaving) > 0 || !sameSet(drop, a.rec.Dropped) {
+	est, drop, leaving := appliershared.NarrowRecord(a.rec.Established, a.rec.Dropped, inScope, gone, renames)
+	if len(leaving) > 0 || !sameSet(drop, a.rec.Dropped) || !sameSet(est, a.rec.Established) {
 		a.writes = append(a.writes, "narrow=established:"+strings.Join(est, ",")+" dropped:"+strings.Join(drop, ","))
 		a.rec.Established, a.rec.Dropped = est, drop
 	}
@@ -104,7 +104,8 @@ func (a *scopeDriftApplier) BeginColdStartRecord(context.Context, string) error 
 	return nil
 }
 
-func (a *scopeDriftApplier) RecordEstablishedTables(_ context.Context, _ string, tables []string) error {
+func (a *scopeDriftApplier) RecordEstablishedTables(_ context.Context, _ string, tables []string, ids map[string]string) error {
+	a.rec.IDs = ids
 	if a.recordErr != nil {
 		return a.recordErr
 	}

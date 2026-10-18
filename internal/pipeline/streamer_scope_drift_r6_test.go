@@ -85,7 +85,7 @@ func TestScopeDriftDoor_CorruptRecords(t *testing.T) {
 // the all-uncopied marker (never a false "not dropped").
 func TestColdStartRecordOverwritesAnUndecodableRecord(t *testing.T) {
 	app := &scopeDriftApplier{recErr: &ir.UndecodableTableSetError{Column: "dropped_tables", Err: errors.New("bad")}}
-	if err := recordEstablishedAfterCopy(context.Background(), app, "st", []string{"kd"}); err != nil {
+	if err := recordEstablishedAfterCopy(context.Background(), app, "st", []string{"kd"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(app.writes, " "); got != "dropped="+ir.DroppedAllUncopiedEntry+" established=kd" {
@@ -93,7 +93,7 @@ func TestColdStartRecordOverwritesAnUndecodableRecord(t *testing.T) {
 	}
 	// A marker already there survives the next cold start.
 	app = &scopeDriftApplier{rec: ir.EstablishedRecord{Recorded: true, Established: []string{"kd"}, Dropped: []string{"x"}, DroppedAllUncopied: true}}
-	if err := recordEstablishedAfterCopy(context.Background(), app, "st", []string{"kd", "x"}); err != nil {
+	if err := recordEstablishedAfterCopy(context.Background(), app, "st", []string{"kd", "x"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := strings.Join(app.writes, " "); got != "dropped="+ir.DroppedAllUncopiedEntry+" established=kd,x" {

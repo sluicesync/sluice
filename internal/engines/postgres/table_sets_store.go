@@ -174,11 +174,11 @@ func (a *ChangeApplier) TouchPendingAddedTable(ctx context.Context, streamID, ta
 }
 
 // CompletePendingAddedTable implements [ir.PendingAddedTablesStore].
-func (a *ChangeApplier) CompletePendingAddedTable(ctx context.Context, streamID, table, token string) error {
+func (a *ChangeApplier) CompletePendingAddedTable(ctx context.Context, streamID, table, token, id string) error {
 	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
 		return err
 	}
-	return classifyApplierError(appliershared.CompletePendingAdd(ctx, a.db, controlCfg, a.pendingAddQueries(), streamID, table, token))
+	return classifyApplierError(appliershared.CompletePendingAdd(ctx, a.db, controlCfg, a.pendingAddQueries(), streamID, table, token, id))
 }
 
 // ClearPendingAddedTables implements [ir.PendingAddedTablesStore].
@@ -195,7 +195,7 @@ func (a *ChangeApplier) AbandonPendingAddedTable(ctx context.Context, streamID, 
 }
 
 // NarrowEstablishedRecord implements [ir.EstablishedTablesStore].
-func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string) ([]string, error) {
+func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string, renames map[string]string) ([]string, error) {
 	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
 		return nil, err
 	}
@@ -206,7 +206,7 @@ func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID st
 		Update: "UPDATE " + ref + " SET " + appliershared.EstablishedTablesColumn + " = $1, " +
 			appliershared.DroppedTablesColumn + " = $2 WHERE stream_id = $3",
 	}
-	leaving, err := appliershared.NarrowEstablished(ctx, a.db, controlCfg, q, streamID, inScope, gone)
+	leaving, err := appliershared.NarrowEstablished(ctx, a.db, controlCfg, q, streamID, inScope, gone, renames)
 	return leaving, classifyApplierError(err)
 }
 
@@ -229,8 +229,8 @@ func (a *ChangeApplier) BeginColdStartRecord(ctx context.Context, streamID strin
 }
 
 // RecordEstablishedTables implements [ir.EstablishedTablesStore].
-func (a *ChangeApplier) RecordEstablishedTables(ctx context.Context, streamID string, tables []string) error {
-	return a.updateTableSet(ctx, streamID, appliershared.EstablishedTablesColumn, true, true, appliershared.EstablishedReplace(tables))
+func (a *ChangeApplier) RecordEstablishedTables(ctx context.Context, streamID string, tables []string, ids map[string]string) error {
+	return a.updateTableSet(ctx, streamID, appliershared.EstablishedTablesColumn, true, true, appliershared.EstablishedReplaceIDs(tables, ids))
 }
 
 // RecordDroppedTables implements [ir.EstablishedTablesStore].

@@ -320,7 +320,13 @@ func TestIncludeTableScopeDrift_PgoutputWidenedTableRefusedThenAddTableConverges
 	run.end()
 	time.Sleep(2 * time.Second)
 
-	// Narrowing is the operator's choice, not a refusal…
+	// Narrowing is the operator's choice, not a refusal. nt came in by
+	// add-table, so it stays in scope whatever --include-table says (R6 A);
+	// the operator lets go of it with --abandon of the completed add…
+	args := append([]string{"schema", "add-table", "nt", "--abandon", "--yes"}, r.connArgs()...)
+	if stdout, stderr, code := runSluice(t, r.bin, append(args, "--stream-id="+r.streamID)...); code != 0 {
+		t.Fatalf("--abandon of the completed add: exit %d\n%s%s", code, stdout, stderr)
+	}
 	r.exec(src, "INSERT INTO kd VALUES (6, 'f')")
 	run = r.startSync("kd")
 	requireStreaming(t, run, 8*time.Second, "narrowed warm restart")
@@ -1251,4 +1257,102 @@ func TestIncludeTableScopeDrift_CorruptRecordRecovers(t *testing.T) {
 	if code, out := r.health(); code != 0 || strings.Contains(out, "pending_added_table") {
 		t.Fatalf("health after the re-copy: exit %d\n%s", code, out)
 	}
+}
+
+// renameWhileStopped establishes kd and t8 on an unfiltered stream, stops
+// it, then runs sourceDDL and targetDDL — the drained model's two halves.
+func (r *scopeDriftRig) renameWhileStopped(sourceDDL, targetDDL string) {
+	r.t.Helper()
+	r.exec(r.src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a');"+
+		"CREATE TABLE t8 (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO t8 VALUES (1, 'x'), (2, 'y')")
+	run := r.startSync("")
+	if got, ok := r.waitRows(r.tgt, "t8", "e", "1|x,2|y", 90*time.Second); !ok {
+		r.t.Fatalf("cold start: target t8 = %q%s", got, run.logTail())
+	}
+	// A CDC change, so the stream has persisted a position to resume from.
+	r.exec(r.src, "INSERT INTO kd VALUES (2, 'b')")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
+		r.t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+	r.exec(r.src, sourceDDL)
+	if targetDDL != "" {
+		r.exec(r.tgt, targetDDL)
+	}
+}
+
+// requireRenameFollowed starts the stream, proves it streams the renamed
+// table, and proves a second restart streams too (the record followed).
+func (r *scopeDriftRig) requireRenameFollowed(extra ...string) {
+	r.t.Helper()
+	run := r.startSync("", extra...)
+	requireStreaming(r.t, run, 8*time.Second, "warm restart after a rename on both sides")
+	r.exec(r.src, "INSERT INTO t8b VALUES (3, 'z')")
+	if got, ok := r.waitRows(r.tgt, "t8b", "e", "1|x,2|y,3|z", 60*time.Second); !ok {
+		r.t.Fatalf("target t8b = %q after the rename%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+	requireStreaming(r.t, r.startSync(""), 8*time.Second, "the next restart, on the record that followed the rename")
+}
+
+// TestIncludeTableScopeDrift_PgoutputRenameFollowed is Bug 321 R6's CI
+// regression: the drained-model rename (RENAME on the source and the target
+// while stopped) resumes, matched by pg_class.oid.
+func TestIncludeTableScopeDrift_PgoutputRenameFollowed(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.renameWhileStopped("ALTER TABLE t8 RENAME TO t8b", "ALTER TABLE t8 RENAME TO t8b")
+	r.requireRenameFollowed()
+}
+
+// TestIncludeTableScopeDrift_BinlogRenameFollowed is the MySQL half, matched
+// by InnoDB TABLE_ID.
+func TestIncludeTableScopeDrift_BinlogRenameFollowed(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "mysql", src, tgt)
+	r.renameWhileStopped("RENAME TABLE t8 TO t8b", "RENAME TABLE t8 TO t8b")
+	r.requireRenameFollowed()
+}
+
+// TestIncludeTableScopeDrift_RecreatedUnderANewNameRefuses is the negative:
+// t8 dropped and a new t8b created (a new oid) is not a rename, whatever the
+// target was made to look like; the restart that names t8b refuses it as
+// never copied and names the acknowledgement. (Unfiltered, t8b would be
+// outside the FOR TABLE publication — not applied, only WARNed — so the
+// start names it literally.)
+func TestIncludeTableScopeDrift_RecreatedUnderANewNameRefuses(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.renameWhileStopped("DROP TABLE t8; CREATE TABLE t8b (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO t8b VALUES (9, 'new')",
+		"ALTER TABLE t8 RENAME TO t8b")
+	r.requireScopeDriftRefusal(r.startSync("kd,t8b"), "t8b", scopeDriftReasonNotEstablished, "--accept-table-rename")
+}
+
+// TestIncludeTableScopeDrift_TargetNotRenamedRefuses: the source renamed,
+// the target not — the refusal says so.
+func TestIncludeTableScopeDrift_TargetNotRenamedRefuses(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.renameWhileStopped("ALTER TABLE t8 RENAME TO t8b", "")
+	r.requireScopeDriftRefusal(r.startSync(""), "t8b", "the target was not renamed")
+}
+
+// TestIncludeTableScopeDrift_AcceptTableRename is the flag path: a record
+// without ids (rewritten here by SQL, as a stream from a source with no
+// stable id would carry) refuses the rename naming the flag, and
+// --accept-table-rename t8=t8b follows it.
+func TestIncludeTableScopeDrift_AcceptTableRename(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.renameWhileStopped("ALTER TABLE t8 RENAME TO t8b", "ALTER TABLE t8 RENAME TO t8b")
+	r.exec(tgt, `UPDATE sluice_cdc_state SET established_tables = '"kd"' || chr(10) || '"t8"' WHERE stream_id = 'itsd'`)
+	r.requireScopeDriftRefusal(r.startSync(""), "t8b", "--accept-table-rename <old>=t8b")
+	r.requireRenameFollowed("--accept-table-rename=t8=t8b")
 }

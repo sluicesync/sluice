@@ -83,7 +83,7 @@ func TestTableSetsStore_RawRoundTrip(t *testing.T) {
 	defer cancel()
 	dsn, applier := tableSetsStoreFixture(ctx, t)
 	store := applier.(tablesetstest.Store)
-	if err := store.RecordEstablishedTables(ctx, "s1", nil); err != nil { // adds the three columns
+	if err := store.RecordEstablishedTables(ctx, "s1", nil, nil); err != nil { // adds the three columns
 		t.Fatal(err)
 	}
 	db, err := sql.Open("pgx", dsn)
@@ -129,7 +129,7 @@ func TestTableSetsStore_RefusesANarrowColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = applier.(interface{ Close() error }).Close() }()
-	err = applier.(tablesetstest.Store).RecordEstablishedTables(ctx, "s1", []string{"orders"})
+	err = applier.(tablesetstest.Store).RecordEstablishedTables(ctx, "s1", []string{"orders"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "ALTER COLUMN established_tables TYPE TEXT") {
 		t.Fatalf("a VARCHAR(40) established_tables: %v; want the refusal naming the ALTER", err)
 	}
@@ -167,7 +167,7 @@ func TestTableSetsStore_NarrowingOnAControlTableThisRoleCannotAlter(t *testing.T
 		t.Skipf("the DML-only role cannot open an applier here (%v); the refusal is pinned by the unit door test", err)
 	}
 	defer func() { _ = applier.(interface{ Close() error }).Close() }()
-	_, err = applier.(tablesetstest.Store).NarrowEstablishedRecord(ctx, "s1", []string{"kd"}, nil)
+	_, err = applier.(tablesetstest.Store).NarrowEstablishedRecord(ctx, "s1", []string{"kd"}, nil, nil)
 	if err == nil {
 		t.Fatal("the narrowing wrote nothing and reported success on a control table lacking dropped_tables")
 	}
@@ -175,5 +175,30 @@ func TestTableSetsStore_NarrowingOnAControlTableThisRoleCannotAlter(t *testing.T
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("the refusal does not name %s in its statement: %v", want, err)
 		}
+	}
+}
+
+// TestTableIdentities_SurviveRename is Bug 321 R6's premise on a real
+// server: pg_class.oid survives ALTER TABLE … RENAME, and a table dropped and
+// re-created under the new name gets a different one.
+func TestTableIdentities_SurviveRename(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, cleanup := startPostgresForApplier(t)
+	t.Cleanup(cleanup)
+	applyPGApplier(t, dsn, `CREATE TABLE t8 (id INT PRIMARY KEY)`)
+	before, err := Engine{}.TableIdentities(ctx, dsn, []string{"t8"})
+	if err != nil || before["t8"] == "" {
+		t.Fatalf("no oid for t8: %v, %v", before, err)
+	}
+	applyPGApplier(t, dsn, `ALTER TABLE t8 RENAME TO t8b`)
+	after, err := Engine{}.TableIdentities(ctx, dsn, []string{"t8", "t8b"})
+	if err != nil || after["t8b"] != before["t8"] || after["t8"] != "" {
+		t.Fatalf("after RENAME: %v (%v); want t8b to carry t8's oid %s", after, err, before["t8"])
+	}
+	applyPGApplier(t, dsn, `DROP TABLE t8b; CREATE TABLE t8b (id INT PRIMARY KEY)`)
+	recreated, err := Engine{}.TableIdentities(ctx, dsn, []string{"t8b"})
+	if err != nil || recreated["t8b"] == "" || recreated["t8b"] == before["t8"] {
+		t.Fatalf("a re-created t8b: %v (%v); want a new oid, not %s", recreated, err, before["t8"])
 	}
 }

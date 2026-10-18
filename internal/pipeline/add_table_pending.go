@@ -124,7 +124,7 @@ func (a *AddTable) recordCompletedAdd(ctx context.Context, applier ir.ChangeAppl
 	if !ok {
 		return nil
 	}
-	err := store.CompletePendingAddedTable(ctx, a.StreamID, a.TableName, a.pendingToken)
+	err := store.CompletePendingAddedTable(ctx, a.StreamID, a.TableName, a.pendingToken, a.tableIdentity(ctx))
 	switch {
 	case err == nil:
 		return nil

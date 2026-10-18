@@ -58,6 +58,7 @@ var syncStartFleetExclusions = map[string]string{
 	// standing key would pre-accept a skipped gap on every restart. The flag
 	// is also bound to one confirmed_flush_lsn value, so a stale key would
 	// refuse anyway once the slot moved.
+	"accept-table-rename":             "one-shot acknowledgement of a rename the record then follows; a human decision taken with the leg out of the fleet, like the other one-shot acknowledgements, and matching nothing once followed",
 	"accept-slot-acked-past-position": "one-shot acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION refusal bound to one confirmed_flush_lsn; as standing config it would pre-accept a skipped gap on each restart",
 
 	// ---- position-from-manifest / broker resume family (cli-only) ----

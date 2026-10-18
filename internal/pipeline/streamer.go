@@ -494,6 +494,15 @@ type Streamer struct {
 	// Zero-value safe: empty accepts nothing.
 	AcceptTargetOnlyUniqueKeys []string
 
+	// AcceptTableRenames acknowledges tables renamed while the stream was
+	// stopped that no engine-stable id proves (`--accept-table-rename
+	// <old>=<new>`, repeatable): the INCLUDE-TABLE-SCOPE-DRIFT door then
+	// treats <new> as the established <old> and the record follows it
+	// (streamer_scope_drift_rename.go). One-shot in effect: once followed, a
+	// repeat matches nothing and only WARNs. Zero-value safe: empty
+	// acknowledges nothing.
+	AcceptTableRenames []string
+
 	// AcceptSlotAckedPastPosition is the operator's one-shot
 	// acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION warm-resume
 	// refusal (`--accept-slot-acked-past-position`), given as the exact
@@ -1601,6 +1610,9 @@ type Streamer struct {
 	// lane copied, recorded when its branch of phaseOpenChangeStream returns.
 	scopeDriftDoorDone   bool
 	coldStartEstablished []string
+	// scopeDriftGone: the established tables the current door found gone
+	// from the source, for the refusal's rename hint.
+	scopeDriftGone []string
 
 	uniqueKeyDoor         *uniqueKeyDoorState
 	uniqueKeyRecheckErr   atomic.Pointer[error]
