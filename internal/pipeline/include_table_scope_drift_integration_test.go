@@ -297,11 +297,10 @@ func TestIncludeTableScopeDrift_PgoutputRestartFromScratchRemedy(t *testing.T) {
 // includes the table and is refused, then the fixed target and a re-run.
 func failedAddTableThenRestart(t *testing.T, r *scopeDriftRig, checkDDL, dropCheckDDL string, reasons ...string) {
 	t.Helper()
-	failAddTableAndRestart(t, r, checkDDL, reasons...)
+	failAddTableAndRestart(t, r, checkDDL, dropCheckDDL, reasons...)
 
-	// The remedy: make the target table able to hold the rows, empty it, and
-	// add it again.
-	r.exec(r.tgt, dropCheckDDL+"; DELETE FROM nt")
+	// The remedy: empty the partial copy and add the table again.
+	r.exec(r.tgt, "DELETE FROM nt")
 	if code, out := r.addTable("nt"); code != 0 {
 		t.Fatalf("re-run of add-table: exit %d\n%s", code, out)
 	}
@@ -314,9 +313,12 @@ func failedAddTableThenRestart(t *testing.T, r *scopeDriftRig, checkDDL, dropChe
 }
 
 // failAddTableAndRestart establishes the stream on kd, fails an add-table of
-// nt on a target CHECK that refuses source row 3, and asserts the restart
-// that includes nt is refused without writing to it.
-func failAddTableAndRestart(t *testing.T, r *scopeDriftRig, checkDDL string, reasons ...string) {
+// nt on a target CHECK that refuses source row 3, removes the CHECK — the
+// cause is fixed, the add is not re-run — and asserts the restart that
+// includes nt is refused without writing to it. With the CHECK gone nothing
+// else would stop that restart: before the door it streamed row 4 into the
+// partial copy at exit 0.
+func failAddTableAndRestart(t *testing.T, r *scopeDriftRig, checkDDL, dropCheckDDL string, reasons ...string) {
 	t.Helper()
 	r.establishKD()
 	r.exec(r.src, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO nt VALUES (1, 'x'), (2, 'y'), (3, 'z')")
@@ -334,6 +336,7 @@ func failAddTableAndRestart(t *testing.T, r *scopeDriftRig, checkDDL string, rea
 
 	// The source keeps writing; the restart must not stream into the partial
 	// copy.
+	r.exec(r.tgt, dropCheckDDL)
 	r.exec(r.src, "INSERT INTO nt VALUES (4, 'w')")
 	partial := r.rows(r.tgt, "nt", "e")
 	run := r.startSync("kd,nt")
@@ -370,14 +373,15 @@ func TestIncludeTableScopeDrift_MySQLFailedAddTableRefused(t *testing.T) {
 
 // TestIncludeTableScopeDrift_MySQLFailedAddTableRestartFromScratch measures
 // the re-copy remedy on a MySQL source (no slot to drop): --restart-from-scratch
-// drops and re-copies every in-scope table — the CHECK-bearing nt among them,
+// drops and re-copies every in-scope table — the partial nt among them,
 // recreated from the source's shape — and clears the pending record, so the
 // next plain restart streams on.
 func TestIncludeTableScopeDrift_MySQLFailedAddTableRestartFromScratch(t *testing.T) {
 	src, tgt, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 	r := newScopeDriftRig(t, "mysql", src, tgt)
-	failAddTableAndRestart(t, r, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20), CONSTRAINT nt_lt3 CHECK (id < 3))")
+	failAddTableAndRestart(t, r, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20), CONSTRAINT nt_lt3 CHECK (id < 3))",
+		"ALTER TABLE nt DROP CHECK nt_lt3")
 
 	run := r.startSync("kd,nt", "--restart-from-scratch")
 	if got, ok := r.waitRows(tgt, "nt", "e", "1|x,2|y,3|z,4|w", 90*time.Second); !ok {
