@@ -1537,6 +1537,25 @@ func TestIncludeTableScopeDrift_PgoutputRecreatedSameNameRefusesByID(t *testing.
 	r.requireScopeDriftRefusal(r.startSync(""), "t8", "TABLE-IDENTITY-CHANGED", "dropped and re-created")
 }
 
+// TestIncludeTableScopeDrift_PgoutputRecreatedUnderForAllTablesRefuses is
+// TABLE-RECREATED-WHILE-STOPPED's own shape: under a FOR ALL TABLES
+// publication the re-created t8 is delivered like the old one and N2 cannot
+// see it, so before R6-S3 the restart streamed the new table's rows onto the
+// old target copy at exit 0. The recorded oid now refuses it.
+func TestIncludeTableScopeDrift_PgoutputRecreatedUnderForAllTablesRefuses(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	// The cold start scopes sluice_pub to its tables; turn it into FOR ALL
+	// TABLES while stopped (a hand-made publication's shape), then re-create.
+	r.establishPairThenStop("DROP PUBLICATION sluice_pub; CREATE PUBLICATION sluice_pub FOR ALL TABLES; " +
+		"DROP TABLE t8; CREATE TABLE t8 (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO t8 VALUES (7, 'new')")
+	r.requireScopeDriftRefusal(r.startSync(""), "t8", "TABLE-IDENTITY-CHANGED", "dropped and re-created")
+	if got := r.rows(tgt, "t8", "e"); got != "1|eight" {
+		t.Fatalf("target t8 = %q; the refusal must apply nothing", got)
+	}
+}
+
 // TestIncludeTableScopeDrift_PgoutputRewriteKeepsTheTable: VACUUM FULL and
 // CLUSTER rewrite the table (a new relfilenode) and keep its oid; the
 // restart streams.
