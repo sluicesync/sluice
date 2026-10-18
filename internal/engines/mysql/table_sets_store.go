@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"sluicesync.dev/sluice/internal/appliershared"
@@ -18,25 +19,40 @@ var (
 	_ ir.EstablishedTablesStore  = (*ChangeApplier)(nil)
 )
 
-// mysqlServerNowMillis reads the server's clock in Unix milliseconds, with no
+// tableSetColumnNames are sluice_cdc_state's three table-set columns, ensured
+// together (R6 S1(b)): a control table one DDL request brought up to date
+// carries all three, so no record write can find one present and the next
+// refused.
+var tableSetColumnNames = []string{
+	appliershared.PendingAddedTablesColumn, appliershared.EstablishedTablesColumn, appliershared.DroppedTablesColumn,
+}
+
+// tableSetColumnDef is each table-set column's declaration. LONGTEXT: a set
+// is unbounded in principle, and TEXT refuses (or, under a relaxed
+// --mysql-sql-mode, truncates) a write past 64 KB.
+const tableSetColumnDef = "LONGTEXT NULL"
+
+// mysqlNowMillisExpr is the server's clock in Unix milliseconds, with no
 // time-zone conversion anywhere: UTC_TIMESTAMP(6) is UTC whatever the
 // session's time_zone, and TIMESTAMPDIFF over two DATETIMEs is plain
 // arithmetic. UNIX_TIMESTAMP(NOW(6)) was not DST-proof: NOW renders the
 // session zone's local time, and in a fall-back hour that local time names
 // two instants, of which UNIX_TIMESTAMP picks one — an hour off for the other
-// (pinned by TestMySQLServerNowMillis_DSTFallBack).
-const mysqlServerNowMillis = "SELECT TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(6)) DIV 1000"
+// (pinned by TestMySQLServerNowMillis_DSTFallBack). It rides the SELECT that
+// reads the control row (P1): vtgate sends a table-less SELECT to a tablet of
+// its choosing, which on a sharded keyspace need not hold the row.
+const mysqlNowMillisExpr = "TIMESTAMPDIFF(MICROSECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP(6)) DIV 1000"
 
 // tableSetQueries renders the statements the shared table-set helpers run
 // against one column of this applier's control table.
 func (a *ChangeApplier) tableSetQueries(col string) appliershared.TableSetQueries {
 	ref := controlTableRef(a.controlKeyspace, controlTableName)
+	read := "SELECT " + col + ", " + mysqlNowMillisExpr + " FROM " + ref + " WHERE stream_id = ?"
 	return appliershared.TableSetQueries{
 		Column:          col,
-		Read:            "SELECT " + col + " FROM " + ref + " WHERE stream_id = ?",
-		ReadForUpdate:   "SELECT " + col + " FROM " + ref + " WHERE stream_id = ? FOR UPDATE",
+		Read:            read,
+		ReadForUpdate:   read + " FOR UPDATE",
 		Update:          "UPDATE " + ref + " SET " + col + " = ? WHERE stream_id = ?",
-		ServerNowMillis: mysqlServerNowMillis,
 		IsMissingColumn: isMySQLUnknownColumnErr,
 	}
 }
@@ -52,32 +68,85 @@ func (a *ChangeApplier) pendingAddQueries() appliershared.PendingAddQueries {
 	}
 }
 
-// ensureTableSetColumns adds table-set columns on first write rather than at
-// every start (the detect-then-ALTER path issues no DDL when they are
-// present): `sync start` on a control table this binary cannot ALTER — a
-// PlanetScale safe-migrations branch, a DBA-pre-created table — keeps running
-// as before, and only the write that needs a column fails, loudly, with the
-// statement to ship. LONGTEXT: a set is unbounded in principle, and TEXT
-// refuses a write past 64 KB.
-func (a *ChangeApplier) ensureTableSetColumns(ctx context.Context, streamID string, cols ...string) error {
+// tableSetColumnsDDL is the statement that adds all three columns, named in
+// every refusal for a missing one.
+func (a *ChangeApplier) tableSetColumnsDDL() string {
+	adds := make([]string, len(tableSetColumnNames))
+	for i, c := range tableSetColumnNames {
+		adds[i] = "ADD COLUMN `" + c + "` " + tableSetColumnDef
+	}
+	return "ALTER TABLE " + controlTableRef(a.controlKeyspace, controlTableName) + " " + strings.Join(adds, ", ")
+}
+
+// ensureTableSetColumns adds the three table-set columns on first write
+// rather than at every start (the detect-then-ALTER path issues no DDL when
+// they are present): `sync start` on a control table this binary cannot
+// ALTER — a PlanetScale safe-migrations branch, a DBA-pre-created table —
+// keeps running as before, and only the write that needs the columns fails,
+// loudly, naming the one statement that adds all three. Then their type is
+// verified.
+func (a *ChangeApplier) ensureTableSetColumns(ctx context.Context, streamID string) error {
 	if streamID == "" {
 		return errors.New("mysql: applier: table sets: streamID is empty")
 	}
-	for _, col := range cols {
-		if err := ensureCrossEngineParityColumn(ctx, a.db, a.controlKeyspace, col, "LONGTEXT NULL"); err != nil {
-			return err
+	for _, col := range tableSetColumnNames {
+		if err := ensureCrossEngineParityColumn(ctx, a.db, a.controlKeyspace, col, tableSetColumnDef); err != nil {
+			return fmt.Errorf("%w (the three table-set columns are added together; to add them by hand: %s)", err, a.tableSetColumnsDDL())
 		}
+	}
+	return a.verifyTableSetColumnTypes(ctx)
+}
+
+// verifyTableSetColumnTypes refuses a table-set column of any type but
+// LONGTEXT (L2): a DBA-created TEXT or VARCHAR column refuses a long set
+// under sluice's strict sql_mode and, under a relaxed --mysql-sql-mode,
+// truncates it — at a line boundary, which the codec cannot see. A column
+// that does not exist yet is not judged. Verified once per applier.
+func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
+	if a.tableSetColumnsVerified.Load() {
+		return nil
+	}
+	schemaRHS, schemaArgs := controlSchemaPredicate(a.controlKeyspace)
+	q := "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " + schemaRHS +
+		" AND TABLE_NAME = ? AND COLUMN_NAME IN (?, ?, ?)"
+	args := append(append([]any{}, schemaArgs...), controlTableName,
+		tableSetColumnNames[0], tableSetColumnNames[1], tableSetColumnNames[2])
+	rows, err := a.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	found := 0
+	for rows.Next() {
+		var name, typ string
+		if err := rows.Scan(&name, &typ); err != nil {
+			return fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
+		}
+		found++
+		if !strings.EqualFold(typ, "longtext") {
+			return fmt.Errorf("mysql: applier: control-table column %s is %s, not LONGTEXT, so a long record is refused "+
+				"or, under a relaxed sql_mode, cut short where the record cannot tell; change it with: ALTER TABLE %s "+
+				"MODIFY COLUMN `%s` %s", name, typ, controlTableRef(a.controlKeyspace, controlTableName), name, tableSetColumnDef)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
+	}
+	if found == len(tableSetColumnNames) {
+		a.tableSetColumnsVerified.Store(true)
 	}
 	return nil
 }
 
-// updateTableSet runs edit against col, ensuring the column first when ensure
-// is set.
+// updateTableSet runs edit against col: ensuring all three columns first
+// when ensure is set, and verifying the type of whichever exist otherwise.
 func (a *ChangeApplier) updateTableSet(ctx context.Context, streamID, col string, ensure, requireRow bool, edit appliershared.TableSetEdit) error {
 	if ensure {
-		if err := a.ensureTableSetColumns(ctx, streamID, col); err != nil {
+		if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
 			return err
 		}
+	} else if err := a.verifyTableSetColumnTypes(ctx); err != nil {
+		return err
 	}
 	return appliershared.UpdateTableSet(ctx, a.db, controlCfg, a.tableSetQueries(col), streamID, requireRow, edit)
 }
@@ -102,8 +171,7 @@ func (a *ChangeApplier) TouchPendingAddedTable(ctx context.Context, streamID, ta
 
 // CompletePendingAddedTable implements [ir.PendingAddedTablesStore].
 func (a *ChangeApplier) CompletePendingAddedTable(ctx context.Context, streamID, table, token string) error {
-	if err := a.ensureTableSetColumns(ctx, streamID, appliershared.PendingAddedTablesColumn,
-		appliershared.EstablishedTablesColumn, appliershared.DroppedTablesColumn); err != nil {
+	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
 		return err
 	}
 	return appliershared.CompletePendingAdd(ctx, a.db, controlCfg, a.pendingAddQueries(), streamID, table, token)
@@ -124,7 +192,7 @@ func (a *ChangeApplier) AbandonPendingAddedTable(ctx context.Context, streamID, 
 
 // NarrowEstablishedRecord implements [ir.EstablishedTablesStore].
 func (a *ChangeApplier) NarrowEstablishedRecord(ctx context.Context, streamID string, inScope, gone []string) ([]string, error) {
-	if err := a.ensureTableSetColumns(ctx, streamID, appliershared.EstablishedTablesColumn, appliershared.DroppedTablesColumn); err != nil {
+	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
 		return nil, err
 	}
 	ref := controlTableRef(a.controlKeyspace, controlTableName)

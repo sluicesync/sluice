@@ -86,6 +86,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -159,6 +160,9 @@ type scopeDriftTable struct {
 	// dropped: it left the scope after it was established; its changes since
 	// were discarded.
 	dropped bool
+	// droppedUnknown: never established, on a stream whose dropped set was
+	// unreadable at its last cold start ([ir.EstablishedRecord.DroppedAllUncopied]).
+	droppedUnknown bool
 	// notEstablished: never copied, and named literally by --include-table.
 	notEstablished bool
 	// appliedWhy, non-empty: never copied, admitted by a glob or an
@@ -171,6 +175,9 @@ type scopeDriftTable struct {
 	// addAbandoned: its add-table was retired by `--abandon` and its changes
 	// would still be applied onto the possibly partial copy (R4-1).
 	addAbandoned bool
+	// addMalformed: the raw text of the table's pending record, which does
+	// not decode (R6 L1); judged like a dead add.
+	addMalformed string
 	// addInProgress / addIncomplete: a pending add-table with a fresh / stale
 	// heartbeat; heartbeatAge is its age.
 	addInProgress, addIncomplete bool
@@ -186,14 +193,14 @@ type scopeDriftTable struct {
 // something an add cures, and still convicts.
 func (d *scopeDriftTable) yieldToLiveAdd() {
 	if d.addInProgress {
-		d.dropped, d.notEstablished, d.appliedWhy, d.legacyUnpublished = false, false, "", false
+		d.dropped, d.droppedUnknown, d.notEstablished, d.appliedWhy, d.legacyUnpublished = false, false, false, "", false
 	}
 }
 
 // onlyInProgress reports a table convicted by nothing but a live add-table
 // (after [scopeDriftTable.yieldToLiveAdd]).
 func (d scopeDriftTable) onlyInProgress() bool {
-	return d.addInProgress && !d.addIncomplete && !d.addAbandoned && !d.dropped && !d.notEstablished &&
+	return d.addInProgress && !d.addIncomplete && !d.addAbandoned && !d.dropped && !d.droppedUnknown && !d.notEstablished &&
 		d.appliedWhy == "" && !d.unpublished && !d.legacyUnpublished
 }
 
@@ -224,7 +231,9 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 		slog.ErrorContext(ctx, "warm resume refused: INCLUDE-TABLE-SCOPE-DRIFT (COLD-START-INCOMPLETE)", slog.String("stream_id", streamID))
 		return coldStartIncompleteError(streamID)
 	}
-	inScope := func(table string) bool { return s.Filter.Allows(table) || liveAdded[table] }
+	inScope := func(table string) bool {
+		return scopeAdmits(table, s.Filter, func(t string) bool { return liveAdded[t] })
+	}
 	scope, err := s.readStreamScope(ctx, inScope)
 	if err != nil {
 		return err
@@ -270,7 +279,9 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 		return s.scopeDriftRefusal(ctx, streamID, membership, drift)
 	}
 	if rec.Recorded {
-		s.narrowEstablished(ctx, applier, streamID, rec, scope)
+		if err := s.narrowEstablished(ctx, applier, streamID, rec, scope); err != nil {
+			return err
+		}
 	}
 	clearAbandonedAdds(ctx, applier, streamID, clearable)
 	return nil
@@ -344,9 +355,29 @@ func readEstablishedRecord(ctx context.Context, applier ir.ChangeApplier, stream
 	}
 	rec, err := store.ReadEstablishedRecord(ctx, streamID)
 	if err != nil {
-		return ir.EstablishedRecord{}, controlReadFailure(fmt.Errorf("pipeline: include-table scope door: %w", err))
+		return ir.EstablishedRecord{}, recordReadFailure(err)
 	}
 	return rec, nil
+}
+
+// malformedPendingRecovery is the recovery for a pending record with no
+// readable table name.
+func malformedPendingRecovery(streamID string) string {
+	return fmt.Sprintf("clear the stream's pending add-table records with `UPDATE sluice_cdc_state SET "+
+		"pending_added_tables = NULL WHERE stream_id = '%s'` on the target, then bring each table they named in again "+
+		"with `sluice schema add-table` (empty its target table first) or re-copy the stream", streamID)
+}
+
+// recordReadFailure classifies a failed read of the stream's records: a
+// value that does not decode is the terminal INCLUDE-TABLE-SCOPE-DRIFT
+// refusal, naming the recovery (a restart reads the same bytes, R6 L1);
+// anything else is a restartable control-read failure.
+func recordReadFailure(err error) error {
+	var bad *ir.UndecodableTableSetError
+	if errors.As(err, &bad) {
+		return fmt.Errorf("pipeline: warm resume refused: %w: %w", ir.ErrIncludeTableScopeDrift, err)
+	}
+	return controlReadFailure(fmt.Errorf("pipeline: include-table scope door: %w", err))
 }
 
 // judgePendingAdds marks every in-scope table whose add-table is pending:
@@ -371,6 +402,12 @@ func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplie
 	}
 	var absent []string
 	for _, p := range pending {
+		if p.Malformed != "" && p.Table == "" {
+			// No table name can be read out of it, so no scope judges it.
+			return nil, nil, fmt.Errorf("pipeline: warm resume refused: %w: stream %q has a pending add-table record that "+
+				"does not decode (%q), so the door cannot tell which table it covers; recovery: %s",
+				ir.ErrIncludeTableScopeDrift, streamID, p.Malformed, malformedPendingRecovery(streamID))
+		}
 		if !inScope(p.Table) {
 			if p.Abandoned() {
 				clearable = append(clearable, p.Table)
@@ -391,10 +428,16 @@ func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplie
 				continue
 			}
 			e := entry(t)
-			e.heartbeatAge = now.Sub(p.HeartbeatAt).Round(time.Second)
-			if p.Fresh(now) {
+			switch {
+			case p.Malformed != "":
+				// A record that does not decode is judged like a dead add:
+				// its copy may be partial.
+				e.addIncomplete, e.addMalformed = true, p.Malformed
+			case p.Fresh(now):
+				e.heartbeatAge = now.Sub(p.HeartbeatAt).Round(time.Second)
 				e.addInProgress = true
-			} else {
+			default:
+				e.heartbeatAge = now.Sub(p.HeartbeatAt).Round(time.Second)
 				e.addIncomplete = true
 			}
 		}
@@ -427,6 +470,10 @@ func (s *Streamer) judgeAgainstRecord(ctx context.Context, streamID string, scop
 	var candidates []scopeTable // never established, admitted by a glob or no filter
 	for _, t := range scope.tables {
 		switch {
+		case rec.DroppedAllUncopied && !established[t.key()]:
+			// The dropped set was unreadable at the last cold start (R6 L1):
+			// any table that cold start did not copy may be a stale one.
+			entry(t).droppedUnknown = true
 		case dropped[t.key()]:
 			entry(t).dropped = true
 		case !established[t.key()]:
@@ -593,29 +640,44 @@ func (s *Streamer) scopeDriftRefusal(ctx context.Context, streamID string, m *ir
 // one row-locked read-modify-write of both sets
 // ([ir.EstablishedTablesStore.NarrowEstablishedRecord], R4-4), so a
 // `schema add-table` completing concurrently is judged under the lock rather
-// than overwritten by a replace computed from an older read. A failed write
-// WARNs: it is the re-widen check that weakens, not this stream.
-func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeApplier, streamID string, rec ir.EstablishedRecord, scope streamScope) {
+// than overwritten by a replace computed from an older read.
+//
+// A narrowing that cannot be recorded REFUSES the start (R6 S1,
+// INCLUDE-TABLE-NARROWING-UNRECORDED). It used to WARN and go on: the table
+// stayed established while its changes were discarded, and a later re-widen
+// passed it with the narrowed window missing on the target, at exit 0. The
+// likeliest cause is the dropped_tables column missing on a control table
+// this role cannot ALTER, which the refusal names. A failure that only
+// concerns pruning dropped entries the source no longer has (nothing is
+// leaving) WARNs: keeping a stale dropped entry can only refuse more.
+func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeApplier, streamID string, rec ir.EstablishedRecord, scope streamScope) error {
 	inScope := make([]string, 0, len(scope.tables))
 	in := map[string]bool{}
 	for _, t := range scope.tables {
 		inScope = append(inScope, t.key())
 		in[t.key()] = true
 	}
-	candidates := append([]string(nil), rec.Dropped...)
+	var planned []string // established tables this resume no longer applies
 	for _, k := range rec.Established {
 		if !in[k] {
-			candidates = append(candidates, k)
+			planned = append(planned, k)
 		}
 	}
+	candidates := append(append([]string(nil), rec.Dropped...), planned...)
 	if len(candidates) == 0 {
-		return
+		return nil
+	}
+	fail := func(step string, err error) error {
+		if len(planned) == 0 {
+			slog.WarnContext(ctx, "could not prune the stream's dropped-table record; it is left as it was",
+				slog.String("stream_id", streamID), slog.String("step", step), slog.String("error", err.Error()))
+			return nil
+		}
+		return narrowingUnrecordedError(streamID, planned, step, err)
 	}
 	present, err := s.presentInSource(ctx, scope, candidates)
 	if err != nil {
-		slog.WarnContext(ctx, "could not read the source catalog to narrow the established-table record; it is left as it "+
-			"was", slog.String("stream_id", streamID), slog.String("error", err.Error()))
-		return
+		return fail("read the source catalog", err)
 	}
 	var gone []string
 	for _, k := range candidates {
@@ -625,18 +687,32 @@ func (s *Streamer) narrowEstablished(ctx context.Context, applier ir.ChangeAppli
 	}
 	leaving, err := applier.(ir.EstablishedTablesStore).NarrowEstablishedRecord(ctx, streamID, inScope, gone)
 	if err != nil {
-		slog.WarnContext(ctx, "could not narrow the stream's established-table record; bringing a table back into scope "+
-			"later may not be refused", slog.String("stream_id", streamID), slog.String("error", err.Error()))
-		return
+		return fail("record the narrowing", err)
 	}
 	if len(leaving) > 0 {
 		shown := make([]string, len(leaving))
 		for i, k := range leaving {
 			shown[i] = strings.ReplaceAll(k, "\x00", ".")
 		}
-		slog.InfoContext(ctx, "tables left this stream's scope: their changes are no longer applied, and bringing one back "+
-			"refuses until it is copied again", slog.String("stream_id", streamID), slog.String("tables", strings.Join(shown, ", ")))
+		slog.WarnContext(ctx, "tables left this stream's scope: their changes are NO LONGER APPLIED from here on, and "+
+			"bringing one back later refuses (INCLUDE-TABLE-RE-WIDEN) until it is copied again",
+			slog.String("stream_id", streamID), slog.String("tables", strings.Join(shown, ", ")))
 	}
+	return nil
+}
+
+// narrowingUnrecordedError is the R6 S1 refusal.
+func narrowingUnrecordedError(streamID string, leaving []string, step string, err error) error {
+	shown := make([]string, len(leaving))
+	for i, k := range leaving {
+		shown[i] = strings.ReplaceAll(k, "\x00", ".")
+	}
+	return fmt.Errorf("pipeline: warm resume refused: INCLUDE-TABLE-NARROWING-UNRECORDED: this start narrows stream %q's "+
+		"scope — %s leave it, and their changes would no longer be applied — but it could not %s, so a later start that "+
+		"brings them back could not know their target copies went stale. Nothing was applied. Either restore the scope "+
+		"the stream had (the same --include-table / --exclude-table as before), or fix what the error names (on a control "+
+		"table this role cannot ALTER, ship the statement it gives) and start again: %w",
+		streamID, strings.Join(shown, ", "), step, err)
 }
 
 // presentInSource reports which of keys name a table the source catalog
@@ -686,6 +762,10 @@ func (s *Streamer) includeTableScopeDriftError(streamID, publication string, tab
 		if t.dropped {
 			why = append(why, "it left this stream's scope earlier and its changes since then were discarded, so its target copy is stale")
 		}
+		if t.droppedUnknown {
+			why = append(why, "the stream's dropped-table record could not be read at its last cold start, so every table that "+
+				"cold start did not copy counts as possibly stale")
+		}
 		if t.notEstablished {
 			why = append(why, "named by --include-table and never copied by this stream (not in its established-table record)")
 		}
@@ -699,7 +779,11 @@ func (s *Streamer) includeTableScopeDriftError(streamID, publication string, tab
 		if t.legacyUnpublished {
 			why = append(why, fmt.Sprintf("named by --include-table and not in publication %q, so the source never sends its changes", publication))
 		}
-		if t.addIncomplete {
+		switch {
+		case t.addMalformed != "":
+			why = append(why, fmt.Sprintf("its pending add-table record does not decode (%q), so its copy may be partial; "+
+				"`sluice schema add-table --abandon %s --yes` retires the record", t.addMalformed, t.name))
+		case t.addIncomplete:
 			why = append(why, fmt.Sprintf("its `sluice schema add-table` started and did not complete (last heartbeat %s ago), "+
 				"so its copy may be partial", t.heartbeatAge))
 		}
@@ -833,9 +917,28 @@ func (s *Streamer) recordColdStartEstablished(ctx context.Context, applier ir.Ch
 
 // recordEstablishedAfterCopy writes the copied set: dropped minus copied,
 // then established.
+//
+// A record that does not decode (R6 L1) is overwritten: the cold start's
+// copy is the truth about what is established. The dropped set cannot be
+// recomputed from an unreadable value, and treating it as empty could pass a
+// stale table as never-established, so it becomes the all-uncopied marker
+// ([ir.EstablishedRecord.DroppedAllUncopied]): every table this copy did not
+// cover counts as dropped. That direction never yields a false "not
+// dropped"; its cost is that a table the stream never had refuses where it
+// would only have been WARNed about, until it is brought in or excluded.
 func recordEstablishedAfterCopy(ctx context.Context, store ir.EstablishedTablesStore, streamID string, keys []string) error {
 	rec, err := store.ReadEstablishedRecord(ctx, streamID)
-	if err != nil {
+	var bad *ir.UndecodableTableSetError
+	switch {
+	case errors.As(err, &bad):
+		slog.ErrorContext(ctx, "cold start: the stream's established-table record does not decode; overwriting it with the "+
+			"tables this copy covered, and marking every other table as possibly stale (all-uncopied)",
+			slog.String("stream_id", streamID), slog.String("column", bad.Column), slog.Int("discarded_bytes", bad.RawBytes))
+		if err := store.RecordDroppedTables(ctx, streamID, []string{ir.DroppedAllUncopiedEntry}); err != nil {
+			return err
+		}
+		return store.RecordEstablishedTables(ctx, streamID, keys)
+	case err != nil:
 		return err
 	}
 	copied := toSet(keys)
@@ -844,6 +947,10 @@ func recordEstablishedAfterCopy(ctx context.Context, store ir.EstablishedTablesS
 		if !copied[k] {
 			dropped = append(dropped, k)
 		}
+	}
+	if rec.DroppedAllUncopied {
+		dropped = append(dropped, ir.DroppedAllUncopiedEntry)
+		rec.Dropped = append(rec.Dropped, ir.DroppedAllUncopiedEntry)
 	}
 	if !sameSet(dropped, rec.Dropped) {
 		if err := store.RecordDroppedTables(ctx, streamID, dropped); err != nil {

@@ -304,6 +304,13 @@ func (f TableFilter) Allows(tableName string) bool {
 	return true
 }
 
+// ExcludesExplicitly reports whether an --exclude-table pattern names
+// tableName — an operator exclusion, which a table added to the stream by
+// `schema add-table` does not override (Bug 321 R6 A).
+func (f TableFilter) ExcludesExplicitly(tableName string) bool {
+	return len(f.Exclude) > 0 && matchesAny(f.Exclude, tableName)
+}
+
 // EffectiveTableFilter merges engine-supplied default exclusion
 // patterns into the operator's filter when the engine implements
 // [ir.DefaultTableExcluder]. Used today for PlanetScale's `_vt_*`

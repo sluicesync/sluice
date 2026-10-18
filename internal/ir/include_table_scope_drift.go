@@ -6,6 +6,7 @@ package ir
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -67,7 +68,35 @@ type EstablishedRecord struct {
 	// copy is stale and a scope that re-admits them refuses until they are
 	// copied again.
 	Dropped []string
+	// DroppedAllUncopied: the dropped set was unreadable when a cold start
+	// rewrote the record, so which tables had left the scope is unknown.
+	// Every table not established then counts as dropped — the direction
+	// that can never pass a stale copy as current.
+	DroppedAllUncopied bool
 }
+
+// DroppedAllUncopiedEntry is the dropped-set value behind
+// [EstablishedRecord.DroppedAllUncopied]. It cannot collide with a real
+// entry: a bare table name contains no NUL, and a multi-database entry has a
+// non-empty namespace before its NUL.
+const DroppedAllUncopiedEntry = "\x00all-uncopied"
+
+// UndecodableTableSetError is a table-set column whose stored value does not
+// decode (corrupted, truncated, hand-edited). Its message names the
+// recovery. A replace write (a cold start's record) overwrites such a value
+// without reading it.
+type UndecodableTableSetError struct {
+	Column   string
+	RawBytes int
+	Recovery string
+	Err      error
+}
+
+func (e *UndecodableTableSetError) Error() string {
+	return fmt.Sprintf("the stream's %s value does not decode (%d bytes stored): %v; recovery: %s", e.Column, e.RawBytes, e.Err, e.Recovery)
+}
+
+func (e *UndecodableTableSetError) Unwrap() error { return e.Err }
 
 // EstablishedTablesStore is the optional [ChangeApplier] surface that keeps a
 // stream's [EstablishedRecord] on its row of `sluice_cdc_state`
@@ -123,11 +152,20 @@ type PendingAddedTable struct {
 	Token       string
 	StartedAt   time.Time
 	HeartbeatAt time.Time
+	// Malformed holds the raw stored text of an entry that does not decode;
+	// empty for a well-formed entry. Such an entry is reported, never
+	// skipped: Table is the name before its first NUL when that much is
+	// readable (so `--abandon <table>` can retire it), "" otherwise.
+	Malformed string
 }
 
 // Fresh reports whether the add that wrote the entry was alive within
-// [PendingAddStaleAfter] of now, the control-table server's time.
+// [PendingAddStaleAfter] of now, the control-table server's time. A
+// malformed entry is never fresh.
 func (p PendingAddedTable) Fresh(now time.Time) bool {
+	if p.Malformed != "" {
+		return false
+	}
 	age := now.Sub(p.HeartbeatAt)
 	return age < PendingAddStaleAfter && age >= -PendingAddFutureTolerance
 }

@@ -56,10 +56,24 @@ func TestWireCDCScopePredicate(t *testing.T) {
 	// dispatch filter and the reader-side predicate must agree here too —
 	// a live-added table under XA must refuse, not stream).
 	live := &liveAddedFilter{}
-	live.Set([]string{"orders"})
+	live.Set([]string{"orders", "audit"})
 	s.liveFilterRef.Store(live)
-	if !r.allowed("app", "orders") {
+	if r.allowed("app", "orders") {
+		t.Fatal("a live-added table the operator's --exclude-table names is in scope; an explicit exclusion wins " +
+			"(Bug 321 R6 A)")
+	}
+	if !r.allowed("app", "audit") {
 		t.Fatal("a live-ADDED table must be in scope for the reader-side policy check, exactly as it is " +
 			"for the dispatch filter")
+	}
+	// Include mode: a live-added table outside the --include-table list is in
+	// scope — the staged-wave add-table case.
+	inc, err := migcore.NewTableFilter([]string{"users"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Filter = inc
+	if !r.allowed("app", "orders") {
+		t.Fatal("a live-added table outside an --include-table list is out of the reader's scope")
 	}
 }

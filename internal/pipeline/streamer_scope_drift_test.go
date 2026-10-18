@@ -30,6 +30,8 @@ type scopeDriftApplier struct {
 	completeErr error
 	writes      []string // "established=a,b" / "dropped=a" / "begin" / "clear=a" / "touch=a alive" / "complete=a"
 	liveAdded   []string
+	narrowErr   error // NarrowEstablishedRecord fails with it
+	recErr      error // ReadEstablishedRecord fails with it
 }
 
 func (a *scopeDriftApplier) now() time.Time {
@@ -71,6 +73,9 @@ func (a *scopeDriftApplier) AbandonPendingAddedTable(_ context.Context, _, table
 }
 
 func (a *scopeDriftApplier) NarrowEstablishedRecord(_ context.Context, _ string, inScope, gone []string) ([]string, error) {
+	if a.narrowErr != nil {
+		return nil, a.narrowErr
+	}
 	est, drop, leaving := appliershared.NarrowRecord(a.rec.Established, a.rec.Dropped, inScope, gone)
 	if len(leaving) > 0 || !sameSet(drop, a.rec.Dropped) {
 		a.writes = append(a.writes, "narrow=established:"+strings.Join(est, ",")+" dropped:"+strings.Join(drop, ","))
@@ -84,6 +89,9 @@ func (a *scopeDriftApplier) ReadPendingAddedTables(context.Context, string) ([]i
 }
 
 func (a *scopeDriftApplier) ReadEstablishedRecord(context.Context, string) (ir.EstablishedRecord, error) {
+	if a.recErr != nil {
+		return ir.EstablishedRecord{}, a.recErr
+	}
 	return a.rec, nil
 }
 

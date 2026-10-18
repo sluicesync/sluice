@@ -235,7 +235,7 @@ func (a *AddTable) runAbandon(ctx context.Context) error {
 		}
 	}
 	if entry == nil {
-		return fmt.Errorf("pipeline: add-table --abandon: stream %q has no pending add-table for %q", a.StreamID, a.TableName)
+		return a.abandonCompletedAdd(ctx, applier)
 	}
 	if entry.Fresh(now) {
 		return fmt.Errorf("pipeline: add-table --abandon: the add-table of %q is still running (heartbeat %s ago); "+
@@ -247,8 +247,13 @@ func (a *AddTable) runAbandon(ctx context.Context) error {
 	if scoper, ok := a.Source.(ir.PublicationScoper); ok && status.PublicationName != "" {
 		a.Source = scoper.WithPublicationScope(status.PublicationName, activeSlotName(status))
 	}
-	a.abandonPublicationMembership(ctx, applier)
+	if err := a.abandonPublicationMembership(ctx, applier); err != nil {
+		return err
+	}
 	a.dropAbandonedSnapshotSlot(ctx)
+	if err := a.removeFromLiveAdded(ctx, applier); err != nil {
+		return err
+	}
 
 	if err := store.AbandonPendingAddedTable(ctx, a.StreamID, a.TableName); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table --abandon: %w", err))
@@ -274,32 +279,93 @@ func warnFutureHeartbeat(ctx context.Context, p ir.PendingAddedTable, now time.T
 		slog.String("table", p.Table), slog.Time("heartbeat_at", p.HeartbeatAt), slog.Time("server_now", now))
 }
 
+// abandonCompletedAdd is `--abandon` of a table whose add-table completed:
+// it has no pending entry, but it is in the stream's live-added set, which
+// keeps it in scope on every start whatever --include-table says. Taking it
+// out of that set is the only way an include-mode stream (which cannot also
+// pass --exclude-table) lets go of an added table (Bug 321 R6 A). The next
+// start narrows it: its changes stop being applied, and the record moves it
+// to the dropped set, so a later re-admit refuses until it is copied again.
+func (a *AddTable) abandonCompletedAdd(ctx context.Context, applier ir.ChangeApplier) error {
+	reader, ok := applier.(liveAddedTablesReader)
+	if ok {
+		added, err := reader.ReadLiveAddedTables(ctx, a.StreamID)
+		if err != nil {
+			return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table --abandon: %w", err))
+		}
+		ok = toSet(added)[a.TableName]
+	}
+	if !ok {
+		return fmt.Errorf("pipeline: add-table --abandon: stream %q has no pending add-table for %q, and the table is not in "+
+			"its live-added set", a.StreamID, a.TableName)
+	}
+	if err := a.removeFromLiveAdded(ctx, applier); err != nil {
+		return err
+	}
+	slog.WarnContext(ctx, "add-table --abandon: took the table out of the stream's live-added set. RESTART THE STREAM: on "+
+		"its next start the table leaves the stream's scope unless --include-table names it — its changes are no longer "+
+		"applied, and bringing it back later refuses until it is copied again. The target table is left as it is",
+		slog.String("stream_id", a.StreamID), slog.String("table", a.TableName))
+	return nil
+}
+
+// removeFromLiveAdded takes the table out of the stream's live-added set.
+// A target without the set has nothing to remove.
+func (a *AddTable) removeFromLiveAdded(ctx context.Context, applier ir.ChangeApplier) error {
+	remover, ok := applier.(liveAddedTablesRemover)
+	if !ok {
+		return nil
+	}
+	if err := remover.RemoveLiveAddedTable(ctx, a.StreamID, a.TableName); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf("pipeline: add-table --abandon: take %q out of the "+
+			"stream's live-added set: %w", a.TableName, err))
+	}
+	return nil
+}
+
 // abandonPublicationMembership takes an abandoned table out of the
 // publication when nothing else needs it there. Best-effort with a WARN: a
 // member left behind is streamed onto the target table again, and the next
-// warm resume judges it like any other unestablished table.
-func (a *AddTable) abandonPublicationMembership(ctx context.Context, applier ir.ChangeApplier) {
+// warm resume judges it like any other unestablished table. It REFUSES —
+// before anything is changed — when the stream's record cannot be read
+// (R6 S2): an undecodable record is not "the stream did not establish it",
+// and taking an established table out of the publication would stop its
+// changes at exit 0.
+func (a *AddTable) abandonPublicationMembership(ctx context.Context, applier ir.ChangeApplier) error {
 	dropper, ok := a.Source.(publicationTableDropper)
 	checker, ok2 := a.Source.(publicationMembershipChecker)
 	if !ok || !ok2 {
-		return
+		return nil
 	}
-	if rec, err := readEstablishedRecord(ctx, applier, a.StreamID); err == nil && toSet(rec.Established)[a.TableName] {
-		return // the stream established it; it belongs in the publication
+	rec, err := readEstablishedRecord(ctx, applier, a.StreamID)
+	if err != nil {
+		return fmt.Errorf("pipeline: add-table --abandon: cannot read the stream's established-table record, so it cannot "+
+			"tell whether the stream established %q and must keep it in the publication; nothing was changed: %w", a.TableName, err)
+	}
+	if toSet(rec.Established)[a.TableName] {
+		return nil // the stream established it; it belongs in the publication
 	}
 	m, err := checker.UnpublishedTables(ctx, a.SourceDSN, []string{a.TableName})
-	if err != nil || m.Publication == "" || len(m.Missing) == 1 || m.AllTables {
-		return
+	if err != nil {
+		// Best-effort, and this direction is safe: a member left behind is
+		// judged at the next start like any other unestablished table.
+		slog.WarnContext(ctx, "add-table --abandon: could not read the publication's membership; the table is left in it",
+			slog.String("table", a.TableName), slog.String("error", err.Error()))
+		return nil //nolint:nilerr // best-effort, see above
+	}
+	if m.Publication == "" || len(m.Missing) == 1 || m.AllTables {
+		return nil
 	}
 	if m.Shared {
 		slog.WarnContext(ctx, "add-table --abandon: left the table in the source publication, because another sluice "+
 			"slot exists on the source database and may read it through the same publication", slog.String("table", a.TableName))
-		return
+		return nil
 	}
 	if err := dropper.DropPublicationTables(ctx, a.SourceDSN, []string{a.TableName}); err != nil {
 		slog.WarnContext(ctx, "add-table --abandon: could not take the table out of the source publication",
 			slog.String("table", a.TableName), slog.String("error", err.Error()))
 	}
+	return nil
 }
 
 // dropAbandonedSnapshotSlot drops the dead add's snapshot slot. The slot is

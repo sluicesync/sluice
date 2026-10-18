@@ -116,6 +116,10 @@ type ChangeApplier struct {
 	db     *sql.DB
 	schema string
 
+	// tableSetColumnsVerified: the three table-set columns exist as LONGTEXT
+	// (table_sets_store.go, L2). Set once verified.
+	tableSetColumnsVerified atomic.Bool
+
 	// barrierFoldCommitHookForTest, when non-nil, runs in a lane barrier's
 	// transaction that folds a checkpoint (ADR-0190 amendment E) after the
 	// position is written and before the COMMIT; an error rolls the whole
@@ -1099,6 +1103,15 @@ func (a *ChangeApplier) RecordLiveAddedTable(ctx context.Context, streamID, tabl
 		return errors.New("mysql: applier: RecordLiveAddedTable: streamID is empty")
 	}
 	return recordLiveAddedTable(ctx, a.db, a.controlKeyspace, streamID, tableName)
+}
+
+// RemoveLiveAddedTable takes tableName out of the stream's live-added set:
+// the `--abandon` of a completed add (Bug 321 R6 A).
+func (a *ChangeApplier) RemoveLiveAddedTable(ctx context.Context, streamID, tableName string) error {
+	if streamID == "" {
+		return errors.New("mysql: applier: RemoveLiveAddedTable: streamID is empty")
+	}
+	return removeLiveAddedTable(ctx, a.db, a.controlKeyspace, streamID, tableName)
 }
 
 // WritePosition implements [ir.PositionWriter]: upserts the position

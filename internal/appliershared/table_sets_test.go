@@ -148,3 +148,28 @@ func TestNarrowRecord(t *testing.T) {
 		t.Fatalf("established %#v; want the empty, non-nil set", est)
 	}
 }
+
+// TestDecodePendingSet is R6 L1's tolerant pending decode: every line comes
+// back — well-formed, an entry that does not decode (Table readable), or a
+// line that is not even quoted (Table "") — and none is skipped.
+func TestDecodePendingSet(t *testing.T) {
+	good := ir.PendingAddedTable{Table: "kd", Token: "tok", StartedAt: time.UnixMilli(1).UTC(), HeartbeatAt: time.UnixMilli(2).UTC()}
+	stored := EncodeTableSet([]string{EncodePendingEntry(good), "nt\x00broken"}) + "\nnot quoted"
+	got := DecodePendingSet(stored)
+	if len(got) != 3 {
+		t.Fatalf("decoded %d entries, want 3: %+v", len(got), got)
+	}
+	byRaw := map[string]ir.PendingAddedTable{}
+	for _, p := range got {
+		byRaw[p.Malformed] = p
+	}
+	if byRaw[""] != good {
+		t.Fatalf("the well-formed entry: %+v", byRaw[""])
+	}
+	if p := byRaw["nt\x00broken"]; p.Table != "nt" {
+		t.Fatalf("an undecodable entry: %+v; want Table nt", p)
+	}
+	if p, ok := byRaw["not quoted"]; !ok || p.Table != "" {
+		t.Fatalf("an unquoted line: %+v; want reported with no table", p)
+	}
+}

@@ -126,6 +126,8 @@ func writePendingAddedTablesText(ctx context.Context, out io.Writer, applier ir.
 		parts := make([]string, 0, len(pending))
 		for _, p := range pending {
 			switch {
+			case p.Malformed != "":
+				parts = append(parts, "malformed record "+malformedPendingText(PendingAddHealth{Table: p.Table, Malformed: p.Malformed}, st.StreamID))
 			case p.Abandoned():
 				abandoned = true
 				parts = append(parts, p.Table+" (abandoned: restart the stream)")

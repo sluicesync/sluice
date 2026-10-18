@@ -101,6 +101,10 @@ import (
 type ChangeApplier struct {
 	db *sql.DB
 
+	// tableSetColumnsVerified: the three table-set columns exist with the
+	// type sluice declares (table_sets_store.go, L2). Set once verified.
+	tableSetColumnsVerified atomic.Bool
+
 	// isNeki records that this applier's target is a PlanetScale Neki
 	// router, probed once per server at open (neki_probe.go). It gates the
 	// shard-key handling in the UPDATE path (neki_update_shardkey.go) and

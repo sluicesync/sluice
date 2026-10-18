@@ -278,8 +278,13 @@ type AddTable struct {
 	// failed add may take it back out ([AddTable.undoFailedAdd]).
 	publicationAddedByThisRun bool
 
-	// Abandon removes a pending add-table's record instead of adding the
-	// table (`sluice schema add-table --abandon`; see [AddTable.runAbandon]).
+	// Abandon retires an add-table instead of adding the table (`sluice
+	// schema add-table --abandon`; see [AddTable.runAbandon]): it marks a
+	// pending record ABANDONED, drops the dead add's inactive snapshot slot,
+	// takes the table out of an unshared publication (no other sluice slot on
+	// the same database) unless the stream established it, and takes it out
+	// of the live-added set; it refuses while the add's heartbeat is fresh.
+	// The operator then restarts the stream.
 	Abandon bool
 	// pendingHeartbeatEvery overrides [ir.PendingAddHeartbeatInterval]
 	// (tests); zero is the default.
@@ -552,6 +557,13 @@ func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, p
 	if err := a.notePublicationAdd(ctx); err != nil {
 		return err
 	}
+	// Bug 321 R6 A: on a publication source the table joins the stream's
+	// scope before the publication starts delivering it.
+	if _, publicationSource := a.Source.(publicationAdder); publicationSource {
+		if err := a.recordAddedTable(ctx, applier); err != nil {
+			return err
+		}
+	}
 	lsnBeforePubAdd, lsnAfterPubAdd, err := a.extendPublicationScope(ctx)
 	if err != nil {
 		return err
@@ -761,33 +773,44 @@ func (a *AddTable) diagSnapshotConsistentPoint(ctx context.Context, pos ir.Posit
 	}
 }
 
-// recordLiveAddedTable performs the MySQL-side filter-flip (ADR-0034):
-// in live binlog-source mode it records the new table on the per-target
-// sluice_cdc_state.live_added_tables column so the running streamer's
-// poll goroutine merges it into the dispatch filter on its next tick. A
-// no-op on the drained path and on the PG publication-add path (whose
-// equivalent step ran before the snapshot in extendPublicationScope).
-func (a *AddTable) recordLiveAddedTable(ctx context.Context, applier ir.ChangeApplier, preflight addTablePreflight) error {
-	if !a.LiveMode || preflight.mode != liveModeBinlogFilterFlip {
-		return nil
+// recordLiveAddedTable records the new table in the stream's live-added set
+// (sluice_cdc_state.live_added_tables), which makes it part of the stream's
+// scope on every later start whatever --include-table says, and on the
+// running streamer's next poll tick (ADR-0034's filter-flip). Bug 321 R6 A
+// made this every source and path: it used to run only on MySQL's --no-drain
+// path, so a restart of a Postgres stream (or after any drained add) with the
+// stream's original --include-table — the documented staged-wave flow —
+// dropped every change to the added table at the dispatch filter, silently.
+//
+// On a publication source it runs before the publication add (the
+// [AddTable.bringInTable] call site): from that point the publication
+// delivers the table, and a running stream must apply what it delivers, as
+// an unfiltered stream always did. Elsewhere it runs here, after the copy,
+// where ADR-0034's MySQL --no-drain path always ran it.
+func (a *AddTable) recordLiveAddedTable(ctx context.Context, applier ir.ChangeApplier, _ addTablePreflight) error {
+	if _, publicationSource := a.Source.(publicationAdder); publicationSource {
+		return nil // recorded before the publication add
 	}
+	return a.recordAddedTable(ctx, applier)
+}
+
+// recordAddedTable writes the live-added entry. A target applier without
+// the surface (SQLite/D1) cannot carry it, and the WARN says what that means.
+func (a *AddTable) recordAddedTable(ctx context.Context, applier ir.ChangeApplier) error {
 	writer, ok := applier.(liveAddedTablesWriter)
 	if !ok {
-		// Shouldn't happen — preflightLive's structural-interface check
-		// already guarded this — but be loud if a regression in the
-		// dispatch ladder slips through.
-		return errors.New("pipeline: add-table: --no-drain (binlog-source path): target applier no longer implements RecordLiveAddedTable; this is a regression in the dispatch ladder")
+		slog.WarnContext(ctx, "add-table: the target keeps no live-added table set, so the stream applies this table only "+
+			"while its --include-table names it; name it on every restart", slog.String("table", a.TableName))
+		return nil
 	}
 	if err := writer.RecordLiveAddedTable(ctx, a.StreamID, a.TableName); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
-			"pipeline: add-table: --no-drain: record live-added table on cdc-state: %w", err,
+			"pipeline: add-table: record %q in the stream's live-added table set (sluice_cdc_state.live_added_tables): %w", a.TableName, err,
 		))
 	}
-	slog.InfoContext(
-		ctx, "add-table: live mode: recorded table on cdc-state.live_added_tables; running streamer's poll will merge into dispatch filter on next tick (ADR-0034)",
-		slog.String("table", a.TableName),
-		slog.String("stream_id", a.StreamID),
-	)
+	slog.InfoContext(ctx, "add-table: recorded the table in the stream's live-added set: it is in the stream's scope on every "+
+		"start from now on (only --exclude-table or `schema add-table --abandon` takes it out), and a running stream picks it "+
+		"up on its next poll tick", slog.String("table", a.TableName), slog.String("stream_id", a.StreamID))
 	return nil
 }
 
@@ -1225,7 +1248,10 @@ func (a *AddTable) preflightLive(ctx context.Context, applier ir.ChangeApplier, 
 	if _, ok := a.Source.(publicationAdder); ok {
 		return a.preflightLivePG(ctx, status)
 	}
-	if _, ok := applier.(liveAddedTablesWriter); ok {
+	// The filter-flip live path is MySQL-target-only (ADR-0034). Since Bug 321
+	// R6 A the Postgres applier carries a live-added set too, so the surface
+	// alone no longer identifies the path.
+	if _, ok := applier.(liveAddedTablesWriter); ok && migcore.IsMySQLFamilyEngine(engineNameOrEmpty(a.Target)) {
 		return a.preflightLiveBinlog(ctx, applier, status)
 	}
 	return addTablePreflight{}, fmt.Errorf(

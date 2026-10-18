@@ -406,7 +406,7 @@ func (s *Streamer) compareUniqueKeys(ctx context.Context, scopes []uniqueKeyDoor
 			if restrict != nil {
 				return restrict[strings.ToLower(name)]
 			}
-			return s.Filter.Allows(name) || liveAdded[name]
+			return scopeAdmits(name, s.Filter, func(t string) bool { return liveAdded[t] })
 		}
 		src, err := s.readUniqueKeyDoorSource(ctx, sc, inScope)
 		if err != nil {

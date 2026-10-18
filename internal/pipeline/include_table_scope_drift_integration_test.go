@@ -1116,3 +1116,139 @@ func newScopeDriftRigWith(t *testing.T, bin, driver, src, tgt string) *scopeDrif
 	}
 	return &scopeDriftRig{t: t, bin: bin, driver: driver, sqlDriver: sqlDriver, src: src, tgt: tgt, streamID: "r42", logDir: t.TempDir()}
 }
+
+// stagedWaveKeepsTheAddedTable is R6 A's Mechanism A, on one source: a
+// stream filtered to kd, `schema add-table users`, then the SAME `sync start
+// --include-table=kd` again. users must keep streaming. Then `--abandon
+// users` of the completed add takes it out: the next start logs the WARN
+// naming it and its changes stop.
+func stagedWaveKeepsTheAddedTable(t *testing.T, r *scopeDriftRig) {
+	t.Helper()
+	r.establishKD("kd")
+	r.exec(r.src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x')")
+	if code, out := r.addTable("users"); code != 0 {
+		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
+	}
+	run := r.startSync("kd")
+	requireStreaming(t, run, 8*time.Second, "restart with the original --include-table after add-table")
+	r.exec(r.src, "INSERT INTO users VALUES (2, 'y')")
+	if got, ok := r.waitRows(r.tgt, "users", "e", "1|x,2|y", 60*time.Second); !ok {
+		t.Fatalf("the added table stopped streaming on a restart whose --include-table does not name it: target users = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+
+	args := append([]string{"schema", "add-table", "users", "--abandon", "--yes"}, r.connArgs()...)
+	if stdout, stderr, code := runSluice(t, r.bin, append(args, "--stream-id="+r.streamID)...); code != 0 || !strings.Contains(stdout+stderr, "RESTART THE STREAM") {
+		t.Fatalf("--abandon of a completed add: exit %d\n%s%s", code, stdout, stderr)
+	}
+	run = r.startSync("kd")
+	requireStreaming(t, run, 8*time.Second, "restart after --abandon of the completed add")
+	waitLog(t, run, "NO LONGER APPLIED")
+	r.exec(r.src, "INSERT INTO users VALUES (3, 'z'); INSERT INTO kd VALUES (9, 'k')")
+	if _, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b,9|k", 60*time.Second); !ok {
+		t.Fatalf("kd stopped streaming%s", run.logTail())
+	}
+	if got := r.rows(r.tgt, "users", "e"); got != "1|x,2|y" {
+		t.Fatalf("users = %q after it left the scope; want its changes no longer applied", got)
+	}
+}
+
+// TestIncludeTableScopeDrift_PgoutputAddedTableStaysInScope is R6 A on
+// pgoutput. Before R6 the restart dropped every users change at exit 0.
+func TestIncludeTableScopeDrift_PgoutputAddedTableStaysInScope(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	stagedWaveKeepsTheAddedTable(t, newScopeDriftRig(t, "postgres", src, tgt))
+}
+
+// TestIncludeTableScopeDrift_BinlogDrainedAddedTableStaysInScope is R6 A on a
+// MySQL binlog source with the drained add (no --no-drain), which never
+// recorded the live-added set before R6.
+func TestIncludeTableScopeDrift_BinlogDrainedAddedTableStaysInScope(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	stagedWaveKeepsTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt))
+}
+
+// TestIncludeTableScopeDrift_ExcludeNarrowsAnAddedTable is R6 A's other
+// exit: on an exclude-mode stream, an explicit --exclude-table naming an
+// added table wins over the live-added set — the start narrows it with the
+// WARN, and a later start that re-admits it refuses.
+func TestIncludeTableScopeDrift_ExcludeNarrowsAnAddedTable(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.exec(src, "CREATE TABLE other (id INT PRIMARY KEY)")
+	r.exec(src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a')")
+	run := r.startSync("", "--exclude-table=other")
+	if got, ok := r.waitRows(tgt, "kd", "k", "1|a", 90*time.Second); !ok {
+		t.Fatalf("cold start: target kd = %q%s", got, run.logTail())
+	}
+	r.exec(src, "INSERT INTO kd VALUES (2, 'b')")
+	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
+		t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+	r.exec(src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x')")
+	if code, out := r.addTable("users"); code != 0 {
+		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
+	}
+
+	run = r.startSync("", "--exclude-table=users")
+	requireStreaming(t, run, 8*time.Second, "restart excluding the added table")
+	waitLog(t, run, "NO LONGER APPLIED")
+	if !strings.Contains(scopeDriftLog(t, run), "users") {
+		t.Fatalf("the narrowing WARN does not name users%s", run.logTail())
+	}
+	r.exec(src, "INSERT INTO users VALUES (2, 'y')")
+	time.Sleep(3 * time.Second)
+	run.end()
+	time.Sleep(2 * time.Second)
+
+	r.requireScopeDriftRefusal(r.startSync("", "--exclude-table=other"), "users", scopeDriftReasonDropped)
+}
+
+// TestIncludeTableScopeDrift_CorruptRecordRecovers is R6 L1 through the
+// binary: an undecodable established and dropped record, and a malformed
+// pending entry, written by raw SQL. `sync health` reports the entry (exit
+// 1) instead of failing; the warm start refuses naming the recovery; the
+// re-copy it names recovers, after which a plain start streams and health
+// is clean.
+func TestIncludeTableScopeDrift_CorruptRecordRecovers(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishKD("kd")
+	r.exec(tgt, `UPDATE sluice_cdc_state SET established_tables = '"unterminated', dropped_tables = 'garbage', `+
+		`pending_added_tables = '"kd\x00oops"' WHERE stream_id = 'itsd'`)
+
+	if code, out := r.health(); code != 1 || !strings.Contains(out, "malformed") || !strings.Contains(out, "oops") {
+		t.Fatalf("health with a malformed pending entry: exit %d, want 1 reporting it raw\n%s", code, out)
+	}
+	run := r.startSync("kd")
+	if !waitExit(run, 90*time.Second) {
+		t.Fatalf("a warm start on an undecodable record kept streaming%s", run.logTail())
+	}
+	if log := scopeDriftLog(t, run); !strings.Contains(log, "does not decode") || !strings.Contains(log, "--restart-from-scratch") {
+		t.Fatalf("the refusal does not name the decode failure and its recovery%s", run.logTail())
+	}
+
+	if stdout, stderr, code := runSluice(t, r.bin, "slot", "drop", "sluice_"+r.streamID, "--source-driver=postgres", "--source="+src, "--yes"); code != 0 {
+		t.Fatalf("slot drop: exit %d\n%s%s", code, stdout, stderr)
+	}
+	run = r.startSync("kd", "--restart-from-scratch")
+	r.exec(src, "INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 90*time.Second); !ok {
+		t.Fatalf("the re-copy over a corrupt record: target kd = %q%s", got, run.logTail())
+	}
+	waitLog(t, run, "does not decode")
+	run.end()
+	time.Sleep(2 * time.Second)
+
+	requireStreaming(t, r.startSync("kd"), 8*time.Second, "plain restart after the re-copy rewrote the record")
+	if code, out := r.health(); code != 0 || strings.Contains(out, "pending_added_table") {
+		t.Fatalf("health after the re-copy: exit %d\n%s", code, out)
+	}
+}

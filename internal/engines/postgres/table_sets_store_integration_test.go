@@ -8,6 +8,8 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,4 +74,106 @@ func tableSetsStoreFixture(ctx context.Context, t *testing.T) (string, ir.Change
 		}
 	})
 	return dsn, applier
+}
+
+// TestTableSetsStore_RawRoundTrip runs [tablesetstest.RawRoundTrip] against
+// a real server, writing and reading the raw column with this test's own SQL.
+func TestTableSetsStore_RawRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, applier := tableSetsStoreFixture(ctx, t)
+	store := applier.(tablesetstest.Store)
+	if err := store.RecordEstablishedTables(ctx, "s1", nil); err != nil { // adds the three columns
+		t.Fatal(err)
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	tablesetstest.RawRoundTrip(ctx, t, store, tablesetstest.RawColumn{
+		Set: func(column, value string, ok bool) {
+			v := sql.NullString{String: value, Valid: ok}
+			if _, err := db.ExecContext(ctx, `UPDATE sluice_cdc_state SET `+column+` = $1 WHERE stream_id = 's1'`, v); err != nil {
+				t.Fatal(err)
+			}
+		},
+		Get: func(column string) (string, bool) {
+			var v sql.NullString
+			if err := db.QueryRowContext(ctx, `SELECT `+column+` FROM sluice_cdc_state WHERE stream_id = 's1'`).Scan(&v); err != nil {
+				t.Fatal(err)
+			}
+			return v.String, v.Valid
+		},
+	})
+}
+
+// TestTableSetsStore_RefusesANarrowColumn is R6 L2: a pre-existing record
+// column of another type than TEXT is refused, naming the ALTER, rather than
+// written into.
+func TestTableSetsStore_RefusesANarrowColumn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, cleanup := startPostgresForApplier(t)
+	t.Cleanup(cleanup)
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id VARCHAR(255) NOT NULL, source_position TEXT NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, established_tables VARCHAR(40),
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state" (stream_id, source_position) VALUES ('s1', 'tok');
+	`)
+	applier, err := Engine{}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = applier.(interface{ Close() error }).Close() }()
+	err = applier.(tablesetstest.Store).RecordEstablishedTables(ctx, "s1", []string{"orders"})
+	if err == nil || !strings.Contains(err.Error(), "ALTER COLUMN established_tables TYPE TEXT") {
+		t.Fatalf("a VARCHAR(40) established_tables: %v; want the refusal naming the ALTER", err)
+	}
+}
+
+// TestTableSetsStore_NarrowingOnAControlTableThisRoleCannotAlter is R6 S1's
+// likeliest cause, on a real server: a DBA shipped established_tables only,
+// and the stream's role holds DML alone. The narrowing's write must fail —
+// naming the statement that adds all three record columns — rather than
+// pass (the door then refuses the start: TestScopeDriftDoor_NarrowingMustBeRecorded).
+func TestTableSetsStore_NarrowingOnAControlTableThisRoleCannotAlter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, cleanup := startPostgresForApplier(t)
+	t.Cleanup(cleanup)
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id VARCHAR(255) NOT NULL, source_position TEXT NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, established_tables TEXT,
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state" (stream_id, source_position, established_tables) VALUES ('s1', 'tok', '"kd"' || chr(10) || '"nt"');
+		DROP ROLE IF EXISTS sluice_dml_only;
+		CREATE ROLE sluice_dml_only LOGIN PASSWORD 'dml';
+		GRANT USAGE ON SCHEMA public TO sluice_dml_only;
+		GRANT SELECT, INSERT, UPDATE, DELETE ON "public"."sluice_cdc_state" TO sluice_dml_only;
+	`)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword("sluice_dml_only", "dml")
+	applier, err := Engine{}.OpenChangeApplier(ctx, u.String())
+	if err != nil {
+		t.Skipf("the DML-only role cannot open an applier here (%v); the refusal is pinned by the unit door test", err)
+	}
+	defer func() { _ = applier.(interface{ Close() error }).Close() }()
+	_, err = applier.(tablesetstest.Store).NarrowEstablishedRecord(ctx, "s1", []string{"kd"}, nil)
+	if err == nil {
+		t.Fatal("the narrowing wrote nothing and reported success on a control table lacking dropped_tables")
+	}
+	for _, want := range []string{"pending_added_tables", "established_tables", "dropped_tables"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal does not name %s in its statement: %v", want, err)
+		}
+	}
 }

@@ -146,7 +146,19 @@ func cdcStateTable(schema string) controlTable {
 			// the change. NULL == "no refusal recorded".
 			unforwardedRefusalColumn,
 		},
+		firstWrite: firstWriteCDCStateColumns(),
 	}
+}
+
+// firstWriteCDCStateColumns are the sluice_cdc_state columns ensured on the
+// first write that needs them (Bug 321): the three table-set columns and the
+// live-added set. Single-sourced from the lists the write paths ensure.
+func firstWriteCDCStateColumns() []controlColumn {
+	out := make([]controlColumn, 0, len(tableSetColumnNames)+1)
+	for _, c := range tableSetColumnNames {
+		out = append(out, tableSetColumn(c))
+	}
+	return append(out, tableSetColumn(liveAddedTablesColumn))
 }
 
 // ensureControlTable brings sluice_cdc_state to its current shape,

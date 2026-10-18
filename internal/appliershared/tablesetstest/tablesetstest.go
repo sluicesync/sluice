@@ -13,6 +13,8 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,10 +29,19 @@ type Store interface {
 }
 
 // Corpus is every shape a recorded table name can take: each must come back
-// byte-exact through the real column.
+// byte-exact through the real column. It includes the longest names the
+// engines allow (R6 pin 4): a 63-byte Postgres identifier, and a
+// 64-character MySQL one in a 3-byte character (192 bytes).
 var Corpus = []string{
 	"orders", "Orders", "naïve_表", "a,b", "line\nbreak", `quo"te`, `back\slash`, " padded ", "😀", "\xff\xferaw",
+	strings.Repeat("p", 63), strings.Repeat("表", 64),
 }
+
+// EstablishedCorpus adds what only the established and dropped sets carry:
+// multi-database `<namespace>\x00<table>` keys, one with the longest
+// namespace and table names MySQL allows.
+var EstablishedCorpus = append(append([]string(nil), Corpus...),
+	strings.Repeat("n", 64)+"\x00"+strings.Repeat("t", 64), "app\x00orders")
 
 // PendingRoundTrip runs the pending-record contract on stream s1, whose row
 // exists in a control table that predates the column.
@@ -42,9 +53,10 @@ func PendingRoundTrip(ctx context.Context, t *testing.T, store ir.PendingAddedTa
 		if err != nil {
 			t.Fatal(err)
 		}
-		// S-C: "now" is the server's clock, read with the entries. The
+		// S-C / P1: "now" is the clock of the server holding the row, read in
+		// the same statement; with no row or no column there is none. The
 		// container shares the host's kernel clock, so it is near ours.
-		if d := time.Since(now); d > time.Minute || d < -time.Minute {
+		if d := time.Since(now); len(got) > 0 && (d > time.Minute || d < -time.Minute) {
 			t.Fatalf("Read's server now %v is not near the host's %v", now, time.Now())
 		}
 		return got, now
@@ -187,13 +199,13 @@ func EstablishedRoundTrip(ctx context.Context, t *testing.T, store Store, errStr
 		t.Fatalf("Complete on an unrecorded stream: %+v pending %q", read(), pending())
 	}
 
-	if err := store.RecordEstablishedTables(ctx, "s1", Corpus); err != nil {
+	if err := store.RecordEstablishedTables(ctx, "s1", EstablishedCorpus); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RecordDroppedTables(ctx, "s1", []string{"orders", "line\nbreak"}); err != nil {
 		t.Fatal(err)
 	}
-	want := append([]string(nil), Corpus...)
+	want := append([]string(nil), EstablishedCorpus...)
 	sort.Strings(want)
 	if rec := read(); !rec.Recorded || rec.ColdStartInProgress || !reflect.DeepEqual(rec.Established, want) ||
 		!reflect.DeepEqual(rec.Dropped, []string{"line\nbreak", "orders"}) {
@@ -350,4 +362,96 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"ab"}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// RawColumn writes and reads stream s1's raw column value with the test's
+// own SQL, bypassing the store — the independent reader and writer the
+// codec checklist asks for. set with ok=false stores NULL.
+type RawColumn struct {
+	Set func(column, value string, ok bool)
+	Get func(column string) (value string, ok bool)
+}
+
+// RawRoundTrip is R6 pin 6 and pin 3: the encoding checked from outside the
+// store in both directions, and every corrupted shape refusing with its
+// recovery, or recovered by the write a cold start makes, on stream s1.
+func RawRoundTrip(ctx context.Context, t *testing.T, store Store, raw RawColumn) {
+	t.Helper()
+	read := func() (ir.EstablishedRecord, error) { return store.ReadEstablishedRecord(ctx, "s1") }
+
+	// A hand-written value, read through the store.
+	raw.Set("established_tables", `"orders"`+"\n"+`"a\nb"`+"\n"+`"\u00e9"`+"\n"+`"app\x00orders"`, true)
+	raw.Set("dropped_tables", "", true)
+	rec, err := read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := append([]string(nil), rec.Established...)
+	sort.Strings(got)
+	if want := []string{"a\nb", "app\x00orders", "orders", "é"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("a hand-written record read back as %q; want %q", got, want)
+	}
+
+	// A store write, inspected byte for byte.
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"x\ny", "é", `q"\`}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := raw.Get("established_tables"); v != `"q\"\\"`+"\n"+`"x\ny"`+"\n"+`"\u00e9"` {
+		t.Fatalf("stored bytes %q", v)
+	}
+	if err := store.BeginColdStartRecord(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := raw.Get("established_tables"); v != strconv.QuoteToASCII("\x00cold-start-in-progress") {
+		t.Fatalf("the in-progress sentinel is stored as %q", v)
+	}
+
+	// Corruption, then recovery by the cold start's writes.
+	var bad *ir.UndecodableTableSetError
+	raw.Set("established_tables", `"unterminated`, true)
+	if _, err := read(); !errors.As(err, &bad) || bad.Column != "established_tables" || !strings.Contains(bad.Recovery, "--restart-from-scratch") {
+		t.Fatalf("an undecodable established set: %v; want UndecodableTableSetError naming --restart-from-scratch", err)
+	}
+	if err := store.BeginColdStartRecord(ctx, "s1"); err != nil {
+		t.Fatalf("a cold start could not overwrite an undecodable record: %v", err)
+	}
+	if rec, err := read(); err != nil || !rec.ColdStartInProgress {
+		t.Fatalf("after the overwrite: %+v, %v", rec, err)
+	}
+	raw.Set("dropped_tables", "garbage", true)
+	if _, err := read(); !errors.As(err, &bad) || bad.Column != "dropped_tables" {
+		t.Fatalf("an undecodable dropped set: %v", err)
+	}
+	if err := store.RecordDroppedTables(ctx, "s1", []string{ir.DroppedAllUncopiedEntry}); err != nil {
+		t.Fatalf("overwriting an undecodable dropped set: %v", err)
+	}
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"kd"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := read(); err != nil || !rec.DroppedAllUncopied || len(rec.Dropped) != 0 || !reflect.DeepEqual(rec.Established, []string{"kd"}) {
+		t.Fatalf("after the cold start's writes: %+v, %v; want established [kd] and all-uncopied", rec, err)
+	}
+
+	// A malformed pending entry is reported, not an error, and --abandon
+	// retires it; a line that is not even quoted is reported too, and the
+	// write that would need to decode it names the SQL recovery.
+	raw.Set("pending_added_tables", strconv.QuoteToASCII("kd\x00bad"), true)
+	pending, _, err := store.ReadPendingAddedTables(ctx, "s1")
+	if err != nil || len(pending) != 1 || pending[0].Table != "kd" || pending[0].Malformed == "" {
+		t.Fatalf("a malformed entry: %+v, %v; want it reported for kd", pending, err)
+	}
+	if err := store.AbandonPendingAddedTable(ctx, "s1", "kd"); err != nil {
+		t.Fatal(err)
+	}
+	if pending, _, err = store.ReadPendingAddedTables(ctx, "s1"); err != nil || len(pending) != 1 || !pending[0].Abandoned() || pending[0].Malformed != "" {
+		t.Fatalf("after --abandon of a malformed entry: %+v, %v", pending, err)
+	}
+	raw.Set("pending_added_tables", "not quoted", true)
+	if pending, _, err = store.ReadPendingAddedTables(ctx, "s1"); err != nil || len(pending) != 1 || pending[0].Malformed != "not quoted" || pending[0].Table != "" {
+		t.Fatalf("an unquoted line: %+v, %v", pending, err)
+	}
+	if err := store.AbandonPendingAddedTable(ctx, "s1", "kd"); !errors.As(err, &bad) || !strings.Contains(bad.Recovery, "pending_added_tables = NULL") {
+		t.Fatalf("a write over an unquoted pending line: %v; want the SQL recovery", err)
+	}
+	raw.Set("pending_added_tables", "", false)
 }

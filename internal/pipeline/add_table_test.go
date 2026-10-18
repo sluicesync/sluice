@@ -528,7 +528,7 @@ func TestAddTable_LiveMode_BinlogPath_SucceedsWithFilterFlipWriter(t *testing.T)
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	tgt := newAddTableTargetEngineWithLiveAdd("filter-flip-target")
+	tgt := newAddTableTargetEngineWithLiveAdd("mysql") // the filter-flip path is MySQL-target-only (Bug 321 R6 A)
 	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
 
 	a := &AddTable{
@@ -560,7 +560,7 @@ func TestAddTable_LiveMode_BinlogPath_RecordsBeforeReturning(t *testing.T) {
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "events", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	tgt := newAddTableTargetEngineWithLiveAdd("filter-flip-target")
+	tgt := newAddTableTargetEngineWithLiveAdd("mysql") // the filter-flip path is MySQL-target-only (Bug 321 R6 A)
 	tgt.applier.streams = []ir.StreamStatus{{StreamID: "stream-a"}}
 
 	a := &AddTable{

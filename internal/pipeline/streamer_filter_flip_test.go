@@ -130,11 +130,11 @@ func TestChangeAllowedWithLiveAdd_OrSemantics(t *testing.T) {
 			allowed: false,
 		},
 		{
-			name:    "exclude drops the table; live admits it → pass (additive override)",
+			name:    "exclude drops the table; live admits it → still dropped (an explicit exclusion wins, Bug 321 R6 A)",
 			base:    migcore.TableFilter{Exclude: []string{"audit_*"}},
 			live:    []string{"audit_special"},
 			change:  ir.Insert{Schema: "s", Table: "audit_special"},
-			allowed: true,
+			allowed: false,
 		},
 		{
 			name:    "exclude drops the table; live empty → drop",

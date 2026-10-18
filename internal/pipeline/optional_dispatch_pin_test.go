@@ -159,6 +159,15 @@ var (
 	// accurate but unspecific — and a backup chain's no longer refusing the
 	// sync acknowledgement by name.
 	_ resumeOriginNoter = (*postgres.CDCReader)(nil)
+	// The stream's live-added set (Bug 321 R6 A): a completed add-table's
+	// table is in scope on every start. A rename would make the assertion miss
+	// and the added table drop out of the stream silently on the next restart.
+	_ liveAddedTablesReader  = (*mysql.ChangeApplier)(nil)
+	_ liveAddedTablesWriter  = (*mysql.ChangeApplier)(nil)
+	_ liveAddedTablesRemover = (*mysql.ChangeApplier)(nil)
+	_ liveAddedTablesReader  = (*postgres.ChangeApplier)(nil)
+	_ liveAddedTablesWriter  = (*postgres.ChangeApplier)(nil)
+	_ liveAddedTablesRemover = (*postgres.ChangeApplier)(nil)
 	// INCLUDE-TABLE-SCOPE-DRIFT (Bug 321): the warm-resume door's publication
 	// evidence. A rename would make the assertion miss and the door's pgoutput
 	// arm a no-op — the widened table streaming nothing at exit 0 again.
@@ -185,8 +194,6 @@ var unpinnedPipelineSurfaces = map[string]string{
 	"RawDefaultReader":            "not yet pinned",
 	"currentRoleReporter":         "not yet pinned",
 	"currentWALPositionReader":    "not yet pinned",
-	"liveAddedTablesReader":       "not yet pinned",
-	"liveAddedTablesWriter":       "not yet pinned",
 	"lsnComparer":                 "not yet pinned",
 	"pollIntervalSetter":          "not yet pinned",
 	"publicationAdder":            "not yet pinned",

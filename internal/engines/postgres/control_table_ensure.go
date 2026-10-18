@@ -47,6 +47,12 @@ type controlTable struct {
 	columns []controlColumn
 	indexes []controlIndex
 
+	// firstWrite are columns ensured on the first write that needs them,
+	// never at start (a role that cannot ALTER keeps starting): printed by
+	// `sluice control-tables ddl` like any other column, so the printed set
+	// and what sluice ensures cannot drift apart (TestControlTableDDLPrintsEveryEnsuredColumn).
+	firstWrite []controlColumn
+
 	// utcDefaults names the naive TIMESTAMP columns whose writes RELY on the
 	// column DEFAULT for their value. Each must default to [utcNowSQL]: a
 	// table an older binary created carries DEFAULT CURRENT_TIMESTAMP, which
@@ -87,6 +93,9 @@ func (t controlTable) statements() []string {
 	out := make([]string, 0, 1+len(t.columns)+len(t.indexes)+len(t.utcDefaults))
 	out = append(out, t.create)
 	for _, c := range t.columns {
+		out = append(out, t.addColumnDDL(c))
+	}
+	for _, c := range t.firstWrite {
 		out = append(out, t.addColumnDDL(c))
 	}
 	for _, ix := range t.indexes {

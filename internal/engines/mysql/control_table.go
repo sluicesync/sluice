@@ -369,6 +369,10 @@ func controlTableDDL(controlKeyspace string) string {
 	target_schema          VARCHAR(255) NULL,
 	rows_applied           BIGINT       NOT NULL DEFAULT 0,
 	unforwarded_refusal    TEXT         NULL,
+	live_added_tables      TEXT         NULL,
+	pending_added_tables   ` + tableSetColumnDef + `,
+	established_tables     ` + tableSetColumnDef + `,
+	dropped_tables         ` + tableSetColumnDef + `,
 	PRIMARY KEY (stream_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }
@@ -1248,6 +1252,13 @@ func recordLiveAddedTable(ctx context.Context, db *sql.DB, controlKeyspace, stre
 	if tableName == "" {
 		return errors.New("mysql: record live-added table: tableName is empty")
 	}
+	// The column is a comma list, so a name holding a comma cannot be
+	// recorded faithfully: it would read back as two other tables. Refuse
+	// rather than admit the wrong ones.
+	if strings.Contains(tableName, ",") {
+		return fmt.Errorf("mysql: record live-added table: %q contains a comma, which live_added_tables cannot hold; "+
+			"rename the table, or re-copy the stream with it named in --include-table", tableName)
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("mysql: record live-added table: begin tx: %w", err)
@@ -1277,6 +1288,49 @@ func recordLiveAddedTable(ctx context.Context, db *sql.DB, controlKeyspace, stre
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("mysql: record live-added table: commit: %w", err)
+	}
+	return nil
+}
+
+// removeLiveAddedTable takes tableName out of the row's live_added_tables
+// (`sluice schema add-table --abandon` of a completed add, Bug 321 R6 A).
+// No row, no column or no entry is nothing to remove.
+func removeLiveAddedTable(ctx context.Context, db *sql.DB, controlKeyspace, streamID, tableName string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mysql: remove live-added table: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	ref := controlTableRef(controlKeyspace, controlTableName)
+	var raw sql.NullString
+	if err := tx.QueryRowContext(ctx, "SELECT live_added_tables FROM "+ref+" WHERE stream_id = ? FOR UPDATE", streamID).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isMySQLUnknownColumnErr(err) {
+			return nil
+		}
+		return fmt.Errorf("mysql: remove live-added table: select for update: %w", err)
+	}
+	if !raw.Valid {
+		return nil
+	}
+	existing := parseLiveAddedTables(raw.String)
+	kept := make([]string, 0, len(existing))
+	for _, t := range existing {
+		if t != tableName {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) == len(existing) {
+		return nil
+	}
+	var value any
+	if len(kept) > 0 {
+		value = strings.Join(kept, ",")
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE "+ref+" SET live_added_tables = ? WHERE stream_id = ?", value, streamID); err != nil {
+		return fmt.Errorf("mysql: remove live-added table: update: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mysql: remove live-added table: commit: %w", err)
 	}
 	return nil
 }

@@ -46,6 +46,32 @@ func TestApplyPendingAddsHealth(t *testing.T) {
 	}
 }
 
+// TestApplyPendingAddsHealth_Malformed is R6 L1: an entry that does not
+// decode trips exit 1 and is printed raw with its recovery, instead of
+// failing the command.
+func TestApplyPendingAddsHealth_Malformed(t *testing.T) {
+	r := HealthResult{Found: true, StreamID: "st"}
+	applyPendingAddsHealth(&r, []ir.PendingAddedTable{
+		{Table: "nt", Malformed: "nt\x00garbage"},
+		{Malformed: "not quoted"},
+	}, time.Now())
+	if !r.PendingAddedTablesTripped {
+		t.Fatalf("malformed entries did not trip: %+v", r)
+	}
+	var out bytes.Buffer
+	if err := renderHealthText(&out, r); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"nt\x00garbage"`, "--abandon nt --yes", `"not quoted"`, "pending_added_tables = NULL WHERE stream_id = 'st'"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("health text lacks %q:\n%s", want, out.String())
+		}
+	}
+	if err := (pendingAddedTablesError{streamID: "st", result: r}); !strings.Contains(err.Error(), "do not decode") {
+		t.Fatalf("the error: %q", err.Error())
+	}
+}
+
 // TestApplyPendingAddsHealth_Abandoned is R4-1: an entry `--abandon` retired
 // is not removed, and it trips `sync health` with ADD-TABLE ABANDONED and a
 // remedy that says to restart the stream — the only thing that judges the

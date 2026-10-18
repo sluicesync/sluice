@@ -70,6 +70,13 @@ type liveAddedTablesWriter interface {
 	RecordLiveAddedTable(ctx context.Context, streamID, tableName string) error
 }
 
+// liveAddedTablesRemover takes a table out of the live-added set: the
+// `schema add-table --abandon` path (Bug 321 R6 A). MySQL and Postgres
+// implement it.
+type liveAddedTablesRemover interface {
+	RemoveLiveAddedTable(ctx context.Context, streamID, tableName string) error
+}
+
 // liveAddedFilter is the streamer-side state for ADR-0034. It holds the
 // atomically-swappable set of tables that have been live-added to this
 // stream's scope mid-run. The dispatch filter consults [Contains] on
@@ -233,13 +240,26 @@ func changeAllowedWithLiveAdd(c ir.Change, base migcore.TableFilter, live *liveA
 // refuses it in Allows, and it is checked again here so a live-add naming
 // it cannot readmit it either.
 func tableAllowedWithLiveAdd(unqualified string, base migcore.TableFilter, live *liveAddedFilter) bool {
+	return scopeAdmits(unqualified, base, live.Contains)
+}
+
+// scopeAdmits is the stream's effective scope, the one rule the dispatch
+// filter, the reader's scope predicate, the INCLUDE-TABLE-SCOPE-DRIFT door
+// and the unique-key door all ask: sluice's own tables never; a table the
+// operator's filter allows; and a table added to the stream (live-added: on
+// every source since Bug 321 R6 A, by any completed `schema add-table`)
+// unless an explicit --exclude-table names it. The exclusion winning over the
+// live-add is what ADR-0034 promised ("the operator's safety-isolation
+// filter still excludes what it always excluded") and what this function did
+// not do before R6: it admitted a live-added table its --exclude-table named.
+func scopeAdmits(unqualified string, base migcore.TableFilter, liveAdded func(string) bool) bool {
 	if appliershared.IsControlTable(unqualified) || base.IsSluiceOwned(unqualified) {
 		return false
 	}
 	if base.Allows(unqualified) {
 		return true
 	}
-	return live.Contains(unqualified)
+	return !base.ExcludesExplicitly(unqualified) && liveAdded(unqualified)
 }
 
 // wireCDCScopePredicate hands a CDC reader the sync's EFFECTIVE table scope

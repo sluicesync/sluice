@@ -138,6 +138,9 @@ type PendingAddHealth struct {
 	HeartbeatAt string `json:"heartbeat_at"`
 	InProgress  bool   `json:"in_progress"`
 	Abandoned   bool   `json:"abandoned,omitempty"`
+	// Malformed is the raw text of an entry that does not decode (R6 L1):
+	// reported, tripping exit 1, rather than failing the command.
+	Malformed string `json:"malformed,omitempty"`
 }
 
 // applyPendingAddsHealth classifies each pending entry fresh (in progress),
@@ -147,10 +150,15 @@ func applyPendingAddsHealth(r *HealthResult, pending []ir.PendingAddedTable, now
 	for _, p := range pending {
 		abandoned := p.Abandoned()
 		fresh := !abandoned && p.Fresh(now)
-		r.PendingAddedTables = append(r.PendingAddedTables, PendingAddHealth{
+		h := PendingAddHealth{
 			Table: p.Table, StartedAt: p.StartedAt.UTC().Format(time.RFC3339),
 			HeartbeatAt: p.HeartbeatAt.UTC().Format(time.RFC3339), InProgress: fresh, Abandoned: abandoned,
-		})
+			Malformed: p.Malformed,
+		}
+		if p.Malformed != "" {
+			h.StartedAt, h.HeartbeatAt = "", ""
+		}
+		r.PendingAddedTables = append(r.PendingAddedTables, h)
 		if !fresh {
 			r.PendingAddedTablesTripped = true
 		}
@@ -312,9 +320,11 @@ type pendingAddedTablesError struct {
 func (pendingAddedTablesError) ExitCode() int { return 1 }
 
 func (e pendingAddedTablesError) Error() string {
-	var stale, abandoned []string
+	var stale, abandoned, malformed []string
 	for _, p := range e.result.PendingAddedTables {
 		switch {
+		case p.Malformed != "":
+			malformed = append(malformed, malformedPendingText(p, e.streamID))
 		case p.Abandoned:
 			abandoned = append(abandoned, p.Table)
 		case !p.InProgress:
@@ -322,6 +332,10 @@ func (e pendingAddedTablesError) Error() string {
 		}
 	}
 	var parts []string
+	if len(malformed) > 0 {
+		parts = append(parts, fmt.Sprintf("stream %q has pending add-table records that do not decode: %s",
+			e.streamID, strings.Join(malformed, "; ")))
+	}
 	if len(abandoned) > 0 {
 		parts = append(parts, fmt.Sprintf("stream %q has an abandoned `sluice schema add-table` for: %s — %s",
 			e.streamID, strings.Join(abandoned, ", "), pendingAddedTablesAbandonedRemedy))
@@ -332,6 +346,18 @@ func (e pendingAddedTablesError) Error() string {
 			e.streamID, strings.Join(stale, ", "), pendingAddedTablesRemedy))
 	}
 	return strings.Join(parts, "; ")
+}
+
+// malformedPendingText renders a pending entry that does not decode, raw,
+// with its recovery: `--abandon <table>` when a table name is readable out
+// of it, the SQL that clears the stream's pending records otherwise.
+func malformedPendingText(p PendingAddHealth, streamID string) string {
+	if p.Table != "" {
+		return fmt.Sprintf("%q for table %s — its copy may be partial; `sluice schema add-table --abandon %s --yes` retires it",
+			p.Malformed, p.Table, p.Table)
+	}
+	return fmt.Sprintf("%q — no table name is readable; clear the stream's pending records with `UPDATE sluice_cdc_state SET "+
+		"pending_added_tables = NULL WHERE stream_id = '%s'` on the target, then bring each table they named in again", p.Malformed, streamID)
 }
 
 // pendingAddedTablesAbandonedRemedy is the remedy for an entry `--abandon`
@@ -645,6 +671,11 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 	for _, t := range r.PendingAddedTables {
 		state := "stopped without completing"
 		switch {
+		case t.Malformed != "":
+			if _, err := fmt.Fprintf(w, "pending_added_table: malformed %s\n", malformedPendingText(t, r.StreamID)); err != nil {
+				return err
+			}
+			continue
 		case t.Abandoned:
 			state = "abandoned"
 		case t.InProgress:

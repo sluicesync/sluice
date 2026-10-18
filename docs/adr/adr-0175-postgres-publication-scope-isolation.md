@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted — implemented 2026-07-22.** Filed from a staged-migration design question: whether sluice supports bringing tables across in waves, with several concurrently-running streams scoped to disjoint table sets. It does on a MySQL-family source; on a Postgres source the shared publication made it a **silent-loss** shape.
+**Accepted — implemented 2026-07-22; detection narrowed to the publication's own database (Bug 321, unreleased).** A logical slot decodes only its own database through that database's publications, so the peer probe now counts only `sluice\_%` slots on `current_database()`: a stream on another database of the same server can never read this publication, and counting it made the guard refuse (and the INCLUDE-TABLE-SCOPE-DRIFT door's no-record fallback stand down) on any server that also hosted a stream on a second database. Pinned in both directions by `TestOtherSluiceSlots_OnlyThisDatabase`. Filed from a staged-migration design question: whether sluice supports bringing tables across in waves, with several concurrently-running streams scoped to disjoint table sets. It does on a MySQL-family source; on a Postgres source the shared publication made it a **silent-loss** shape.
 
 **The bug was reproduced empirically before the fix landed, not only by code reading.** The Tier-1 gate (`internal/pipeline/publication_scope_conflict_pg_integration_test.go`) was written first and run against deliberately-disabled fix code: `TestPublicationScope_TwoStreams_IsolatedByPublicationName` failed at exactly the load-bearing assertion — *"wave A stopped receiving changes after wave B cold-started"* — and `..._ConflictRefusedWithoutIsolation` failed with *"the guard did not fire"*, while `..._WideningIsNotAConflict` **passed even pre-fix**, confirming the gate is targeted at the narrowing case rather than blanket. All three pass with the fix restored.
 
@@ -88,7 +88,10 @@ The detection signal is **other active sluice replication slots on the source**:
 ```sql
 SELECT slot_name FROM pg_replication_slots
 WHERE slot_name LIKE 'sluice\_%' AND active AND slot_name <> $1
+  AND database = pg_catalog.current_database()   -- added by Bug 321
 ```
+
+(As shipped since v0.99.289 the `active` predicate is gone — existence, not activity, is the signal; see the residual closure below. The database predicate was added by Bug 321: a slot on another database cannot read this publication.)
 
 This is a sound layer for the check because the cold-start ordering makes it clean: `EnsurePublication` runs **before** `OpenSnapshotStream` (deliberately, so the snapshot's slot pins a catalog snapshot that already has the scoped publication), so the calling stream's own slot does not yet exist at check time. The `<> $1` exclusion covers cold-start recovery shapes where it does.
 
