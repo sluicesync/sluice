@@ -1168,6 +1168,112 @@ func TestIncludeTableScopeDrift_PgoutputAddedTableStaysInScope(t *testing.T) {
 	stagedWaveKeepsTheAddedTable(t, newScopeDriftRig(t, "postgres", src, tgt))
 }
 
+// recopyKeepsTheAddedTable is R7b: a table `schema add-table` brought in,
+// changed while the stream is stopped, then a cold start with the stream's
+// original --include-table (recopy: the flags that make it one). The cold
+// start must copy every table the stream applies — the live-added one too —
+// or it streams the added table from its new snapshot onto a target copy
+// missing what changed while the stream was stopped. prep runs before the
+// cold start (the Postgres slot drop).
+func recopyKeepsTheAddedTable(t *testing.T, r *scopeDriftRig, prep func(), recopy ...string) {
+	t.Helper()
+	r.establishKD("kd")
+	r.exec(r.src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x')")
+	if code, out := r.addTable("users"); code != 0 {
+		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
+	}
+	r.exec(r.src, "INSERT INTO users VALUES (2, 'y'); UPDATE users SET e = 'x2' WHERE id = 1")
+	if prep != nil {
+		prep()
+	}
+	run := r.startSync("kd", recopy...)
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 90*time.Second); !ok {
+		t.Fatalf("cold start: target kd = %q%s", got, run.logTail())
+	}
+	r.exec(r.src, "INSERT INTO kd VALUES (3, 'c'); INSERT INTO users VALUES (3, 'z')")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
+		t.Fatalf("cdc after the cold start: target kd = %q%s", got, run.logTail())
+	}
+	if got, ok := r.waitRows(r.tgt, "users", "e", "1|x2,2|y,3|z", 30*time.Second); !ok {
+		t.Fatalf("the cold start did not copy the added table: target users = %q, want 1|x2,2|y,3|z — the changes made "+
+			"while the stream was stopped are missing (R7b)%s", got, run.logTail())
+	}
+}
+
+// pgSlotDrop drops the rig's stream slot, as a Postgres re-copy's refusal
+// instructs.
+func (r *scopeDriftRig) pgSlotDrop() {
+	r.t.Helper()
+	if stdout, stderr, code := runSluice(r.t, r.bin, "slot", "drop", "sluice_"+r.streamID, "--source-driver=postgres", "--source="+r.src, "--yes"); code != 0 {
+		r.t.Fatalf("slot drop: exit %d\n%s%s", code, stdout, stderr)
+	}
+}
+
+// TestIncludeTableScopeDrift_PgoutputRestartFromScratchCopiesTheAddedTable
+// is R7b on pgoutput with --restart-from-scratch.
+func TestIncludeTableScopeDrift_PgoutputRestartFromScratchCopiesTheAddedTable(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	recopyKeepsTheAddedTable(t, r, r.pgSlotDrop, "--restart-from-scratch")
+}
+
+// TestIncludeTableScopeDrift_BinlogRestartFromScratchCopiesTheAddedTable is
+// R7b on a MySQL binlog source.
+func TestIncludeTableScopeDrift_BinlogRestartFromScratchCopiesTheAddedTable(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	recopyKeepsTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt), nil, "--restart-from-scratch")
+}
+
+// resetDiscardsTheAddedTable is R7b's --reset-target-data shape: the reset
+// deletes the control row and the live-added set with it, so the copy covers
+// only the flags' scope and the stream applies only that — they agree. The
+// start WARNs naming the discarded table, its target copy is left stale, and
+// nothing streams into it afterwards.
+func resetDiscardsTheAddedTable(t *testing.T, r *scopeDriftRig, prep func()) {
+	t.Helper()
+	r.establishKD("kd")
+	r.exec(r.src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x')")
+	if code, out := r.addTable("users"); code != 0 {
+		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
+	}
+	r.exec(r.src, "INSERT INTO users VALUES (2, 'y')")
+	if prep != nil {
+		prep()
+	}
+	run := r.startSync("kd", "--reset-target-data", "--yes")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 90*time.Second); !ok {
+		t.Fatalf("reset cold start: target kd = %q%s", got, run.logTail())
+	}
+	waitLog(t, run, "discards the stream's live-added set")
+	r.exec(r.src, "INSERT INTO users VALUES (3, 'z'); INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
+		t.Fatalf("cdc after the reset: target kd = %q%s", got, run.logTail())
+	}
+	if got := r.rows(r.tgt, "users", "e"); got != "1|x" {
+		t.Fatalf("target users = %q after a reset that discarded it; want its copy left as it was, 1|x, with nothing "+
+			"streamed into it", got)
+	}
+}
+
+// TestIncludeTableScopeDrift_PgoutputResetDiscardsTheAddedTable is R7b's
+// reset shape on pgoutput.
+func TestIncludeTableScopeDrift_PgoutputResetDiscardsTheAddedTable(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	resetDiscardsTheAddedTable(t, r, r.pgSlotDrop)
+}
+
+// TestIncludeTableScopeDrift_BinlogResetDiscardsTheAddedTable is R7b's reset
+// shape on a MySQL binlog source.
+func TestIncludeTableScopeDrift_BinlogResetDiscardsTheAddedTable(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	resetDiscardsTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt), nil)
+}
+
 // TestIncludeTableScopeDrift_BinlogDrainedAddedTableStaysInScope is R6 A on a
 // MySQL binlog source with the drained add (no --no-drain), which never
 // recorded the live-added set before R6.

@@ -56,7 +56,7 @@ func TestRefuseLiveAddedTableExcluded_AtStart(t *testing.T) {
 	pg := &resumeDispatchEngine{name: "postgres"}
 	s := &Streamer{Source: pg, Target: pg, Filter: migcore.TableFilter{Exclude: []string{"tmp_*"}}}
 
-	err := s.refuseLiveAddedTableExcluded(ctx, app, "st")
+	err := s.phaseReadLiveAddedScope(ctx, app, "st")
 	if err == nil {
 		t.Fatal("a live-added table an --exclude-table names started")
 	}
@@ -73,13 +73,29 @@ func TestRefuseLiveAddedTableExcluded_AtStart(t *testing.T) {
 	}
 
 	s.ResetTargetData = true
-	if err := s.refuseLiveAddedTableExcluded(ctx, app, "st"); err != nil {
+	if err := s.phaseReadLiveAddedScope(ctx, app, "st"); err != nil {
 		t.Fatalf("--reset-target-data deletes the live-added set; refused anyway: %v", err)
+	}
+	if s.startLiveAdded != nil {
+		t.Fatalf("--reset-target-data kept the set %v for the copy scope; it deletes it", s.startLiveAdded)
 	}
 	s.ResetTargetData = false
 	app.Set([]string{"orders"})
-	if err := s.refuseLiveAddedTableExcluded(ctx, app, "st"); err != nil {
+	if err := s.phaseReadLiveAddedScope(ctx, app, "st"); err != nil {
 		t.Fatalf("no contradiction, refused: %v", err)
+	}
+
+	// R7b: the set becomes part of the cold start's copy scope.
+	s.Filter = migcore.TableFilter{Include: []string{"kd"}}
+	if err := s.phaseReadLiveAddedScope(ctx, app, "st"); err != nil {
+		t.Fatal(err)
+	}
+	if cf := s.copyFilter(); !cf.Allows("orders") || !cf.Allows("kd") || cf.Allows("other") {
+		t.Fatalf("copy scope: orders %v kd %v other %v; want the include list plus the live-added set",
+			cf.Allows("orders"), cf.Allows("kd"), cf.Allows("other"))
+	}
+	if s.Filter.Allows("orders") {
+		t.Fatal("the stream's own filter was widened; only the copy scope is")
 	}
 }
 

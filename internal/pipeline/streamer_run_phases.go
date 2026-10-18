@@ -719,10 +719,10 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			s.recordColdStartEstablished(ctx, applier, streamID)
 		}
 	}()
-	// LIVE-ADDED-TABLE-EXCLUDED (R6-S1): before any branch copies, drops or
-	// applies anything — a cold start would leave the table uncopied and a
-	// warm resume would apply none of its changes, both silently.
-	if err := s.refuseLiveAddedTableExcluded(ctx, applier, streamID); err != nil {
+	// The live-added set, before any branch copies, drops or applies
+	// anything: LIVE-ADDED-TABLE-EXCLUDED (R6-S1) refuses here, and a cold
+	// start copies the set's tables (R7b, [Streamer.copyFilter]).
+	if err := s.phaseReadLiveAddedScope(ctx, applier, streamID); err != nil {
 		return nil, func() {}, false, err
 	}
 	var resumeCopyFrom ir.Position
@@ -997,9 +997,9 @@ func (s *Streamer) phasePreflightUpsertKeys(ctx context.Context, applier ir.Chan
 	if !ok {
 		return nil
 	}
-	// The stream's table scope, so a deferrable-key table this stream
-	// never touches is never refused over.
-	inScope := func(table string) bool { return s.Filter.Allows(table) }
+	// The stream's table scope, live-added tables included (R7b), so a
+	// deferrable-key table this stream never touches is never refused over.
+	inScope := s.copyFilter().Allows
 	// Returned verbatim: the engine's refusal already carries its
 	// sluicecode + remedy hint, and WrapWithHint would re-classify it
 	// against the substring registry and could overwrite both.

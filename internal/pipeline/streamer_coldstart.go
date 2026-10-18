@@ -398,13 +398,13 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	migcore.ApplyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	// catalog Bug 76: scope per-column type validation to the filtered
 	// table set (s.Filter already has engine defaults merged in Run).
-	scopeTally := migcore.ApplyTableScopeTallied(sr, s.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, s.copyFilter())
 	// Large-object census (roadmap item 68c) — advisory WARN only; runs
 	// BEFORE ReadSchema so the named-suspect branch is reachable: an
 	// in-scope oid/lo column refuses at the schema read as an unsupported
 	// column type (Bug 205; see the migrate call site). Probe failure
 	// skips silently.
-	warnLargeObjects(ctx, sr, s.Source.Capabilities(), s.Filter)
+	warnLargeObjects(ctx, sr, s.Source.Capabilities(), s.copyFilter())
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		migcore.CloseIf(sr)
@@ -433,7 +433,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 
 	// Prune by table filter before mappings + bulk-copy so the
 	// excluded tables never reach the target schema-apply phase.
-	if err := migcore.ApplyTableFilter(ctx, schema, s.Filter); err != nil {
+	if err := migcore.ApplyTableFilter(ctx, schema, s.copyFilter()); err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
@@ -447,7 +447,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	// snapshot/publication scope is computed below, so a continuous sync
 	// neither cold-copies nor (on publication-scoped sources) streams them.
 	// No-op unless SkipORMTables is set (the sync CLI default).
-	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.Filter)
+	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.copyFilter())
 
 	// Collect the surviving (filtered) table names so a source that
 	// implements ir.TableScopedSnapshotOpener (PlanetScale VStream) can
@@ -547,7 +547,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	}
 	// Foreign-table census (roadmap item 68a) — WARN-and-proceed on
 	// FDW foreign tables the schema read silently filtered out.
-	if err := warnForeignTables(ctx, sr, s.Source.Capabilities(), s.Filter); err != nil {
+	if err := warnForeignTables(ctx, sr, s.Source.Capabilities(), s.copyFilter()); err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}

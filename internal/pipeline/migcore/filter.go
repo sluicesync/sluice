@@ -123,6 +123,11 @@ type TableFilter struct {
 	// the flag spelled it. Set via [TableFilter.WithSluiceOwnedTable]; not
 	// a pattern, so never reported as unmatched.
 	sluiceOwned map[string]bool
+
+	// addedTables are the Include patterns [TableFilter.WithAddedTables]
+	// added for the stream's live-added tables, not the operator's own:
+	// never reported as unmatched.
+	addedTables map[string]bool
 }
 
 // scopeCensus records the table names the engine-side push-down was asked
@@ -216,6 +221,49 @@ func (f TableFilter) WithSluiceOwnedTable(name string) TableFilter {
 	return f
 }
 
+// WithAddedTables returns a copy of f that also admits names: tables a
+// stream's `schema add-table` brought in (its live-added set), which the
+// stream applies whatever its --include-table says — so a cold start must
+// copy them too, under the one scope rule the stream applies (Bug 321 R7b).
+// Only an include list needs widening: an unfiltered stream already admits
+// them, and an explicit --exclude-table keeps excluding (the stream refuses
+// that contradiction, LIVE-ADDED-TABLE-EXCLUDED, before any copy). Each name
+// joins Include as an escaped literal, so a name carrying a glob
+// metacharacter admits only itself, and is never reported as an unmatched
+// pattern: the operator did not type it. The receiver is not modified.
+func (f TableFilter) WithAddedTables(names []string) TableFilter {
+	if len(f.Include) == 0 || len(names) == 0 {
+		return f
+	}
+	include := append([]string(nil), f.Include...)
+	added := make(map[string]bool, len(f.addedTables)+len(names))
+	for k := range f.addedTables {
+		added[k] = true
+	}
+	for _, n := range names {
+		if n == "" || matchesAny(f.Include, n) {
+			continue
+		}
+		p := escapeGlob(n)
+		include = append(include, p)
+		added[p] = true
+	}
+	f.Include, f.addedTables = include, added
+	return f
+}
+
+// escapeGlob makes name a [path.Match] pattern that matches only name.
+func escapeGlob(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if strings.ContainsRune(`*?[\`, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // IsSluiceOwned reports whether tableName is a sluice-owned table this
 // filter refuses ([TableFilter.WithSluiceOwnedTable]).
 func (f TableFilter) IsSluiceOwned(tableName string) bool {
@@ -277,7 +325,7 @@ func (f TableFilter) UnmatchedPatterns(tableNames []string) []string {
 				break
 			}
 		}
-		if !hit && !f.engineDefaults[p] {
+		if !hit && !f.engineDefaults[p] && !f.addedTables[p] {
 			unmatched = append(unmatched, p)
 		}
 	}

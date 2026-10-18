@@ -391,29 +391,65 @@ func (c liveAddedCheck) refusal(tables []string, running bool) error {
 		ir.ErrIncludeTableScopeDrift, LiveAddedTableExcludedMarker, c.streamID, list, c.source, c.target, c.streamID, what)
 }
 
-// refuseLiveAddedTableExcluded is LIVE-ADDED-TABLE-EXCLUDED at a start, on
+// phaseReadLiveAddedScope reads the stream's live-added set at a start, on
 // every dispatch branch (cold and warm) before anything is copied, dropped or
-// applied. A target without the live-added set has nothing to contradict, and
-// neither has --reset-target-data, which deletes the control row the set
-// lives on before its cold start.
-func (s *Streamer) refuseLiveAddedTableExcluded(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
-	if len(s.Filter.Exclude) == 0 || s.ResetTargetData {
-		return nil
-	}
+// applied, and does two things with it:
+//
+//   - LIVE-ADDED-TABLE-EXCLUDED (R6-S1): a live-added table an explicit
+//     --exclude-table names refuses the start;
+//   - the cold start's copy scope (R7b): it records the set in
+//     s.startLiveAdded, which [Streamer.copyFilter] adds to the filter, so a
+//     cold start copies every table the stream will apply. Before R7b it
+//     copied only what the flags named, then streamed a live-added table from
+//     its new snapshot onto a target copy missing everything that changed
+//     while the stream was stopped, at exit 0.
+//
+// A read failure fails the start (restartable): a copy scope that silently
+// lost the set is the defect itself. A target without the set has nothing to
+// add. --reset-target-data deletes the control row the set lives on before its
+// cold start, so the set is discarded rather than copied; the WARN names what
+// that leaves unreplicated.
+func (s *Streamer) phaseReadLiveAddedScope(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+	s.startLiveAdded = nil
 	reader, ok := applier.(liveAddedTablesReader)
 	if !ok {
 		return nil
 	}
 	tables, err := reader.ReadLiveAddedTables(ctx, streamID)
 	if err != nil {
-		return controlReadFailure(fmt.Errorf("pipeline: live-added table check: read live-added tables: %w", err))
+		return controlReadFailure(fmt.Errorf("pipeline: read the stream's live-added tables: %w", err))
+	}
+	if s.ResetTargetData {
+		var discarded []string
+		for _, t := range tables {
+			if !s.Filter.Allows(t) {
+				discarded = append(discarded, t)
+			}
+		}
+		if len(discarded) > 0 {
+			sort.Strings(discarded)
+			slog.WarnContext(ctx, "--reset-target-data discards the stream's live-added set with its control row: these tables "+
+				"`schema add-table` brought in are neither copied nor applied from here on, and their target tables are left "+
+				"as they are (stale). Name them in --include-table or `schema add-table` them again to keep replicating them",
+				slog.String("stream_id", streamID), slog.String("tables", strings.Join(discarded, ", ")))
+		}
+		return nil
 	}
 	if excluded := liveAddedExcluded(s.Filter, tables); len(excluded) > 0 {
 		slog.ErrorContext(ctx, "start refused: "+LiveAddedTableExcludedMarker, slog.String("stream_id", streamID),
 			slog.String("tables", strings.Join(excluded, ", ")))
 		return s.liveAddedCheckFor(streamID).refusal(excluded, false)
 	}
+	s.startLiveAdded = tables
 	return nil
+}
+
+// copyFilter is the cold start's copy scope: the operator's filter plus the
+// live-added tables [Streamer.phaseReadLiveAddedScope] read — the same set
+// [scopeAdmits] applies, so the copy, the publication scope it derives and
+// the apply agree (R7b).
+func (s *Streamer) copyFilter() migcore.TableFilter {
+	return s.Filter.WithAddedTables(s.startLiveAdded)
 }
 
 // wireCDCScopePredicate hands a CDC reader the sync's EFFECTIVE table scope

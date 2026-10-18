@@ -784,7 +784,7 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 		return nil, connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
 	defer migcore.CloseIf(sr)
-	scopeTally := migcore.ApplyTableScopeTallied(sr, s.Filter)
+	scopeTally := migcore.ApplyTableScopeTallied(sr, s.copyFilter())
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -809,7 +809,7 @@ func (s *Streamer) coldStartReadOneDatabaseSchema(
 	// Quiet: one pass of the fan-out. A pattern naming a table in another
 	// selected database looks dead here (Bug 273 arm 4); the driver reports
 	// once against the accumulated census after the copy loop.
-	if err := migcore.ApplyTableFilterQuiet(ctx, schema, s.Filter); err != nil {
+	if err := migcore.ApplyTableFilterQuiet(ctx, schema, s.copyFilter()); err != nil {
 		return nil, fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 	s.multiDBFilterTally.Add(0, len(schema.Tables))
@@ -1062,7 +1062,7 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 		return connectHint(fmt.Errorf("pipeline: open source schema reader for %q: %w", database, err))
 	}
 	defer migcore.CloseIf(sr)
-	migcore.ApplyTableScope(sr, s.Filter)
+	migcore.ApplyTableScope(sr, s.copyFilter())
 	applyMultiDatabaseScope(sr, &multiDBScope{database: database, inScope: inScope})
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -1074,7 +1074,7 @@ func (s *Streamer) preflightOneNamespaceReplicaIdentity(ctx context.Context, src
 	// Quiet: an auxiliary per-namespace preflight, not the authoritative
 	// prune. Reporting here would both double-report and repeat the
 	// per-pass mistake.
-	if err := migcore.ApplyTableFilterQuiet(ctx, schema, s.Filter); err != nil {
+	if err := migcore.ApplyTableFilterQuiet(ctx, schema, s.copyFilter()); err != nil {
 		return fmt.Errorf("pipeline: filter tables for %q: %w", database, err)
 	}
 	// The post-filter names, bare, which is the same list the copy loop
@@ -1223,7 +1223,7 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 	// ADR-0143: skip ORM/framework migration-bookkeeping tables in the
 	// per-database sync fan-out too. No-op unless SkipORMTables is set.
-	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.Filter)
+	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.copyFilter())
 
 	// SLM-1d: fold this namespace's RAW source IR into the fan-out's
 	// cold-start reader seed, captured HERE — after the filters, before the

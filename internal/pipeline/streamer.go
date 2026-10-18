@@ -362,6 +362,12 @@ type Streamer struct {
 	// before then, which the predicate treats as "no live-adds yet".
 	liveFilterRef atomic.Pointer[liveAddedFilter]
 
+	// startLiveAdded is the live-added set read at this attempt's start
+	// ([Streamer.phaseReadLiveAddedScope]), which the cold start's copy
+	// scope includes ([Streamer.copyFilter], Bug 321 R7b). Nil under
+	// --reset-target-data, which discards the set.
+	startLiveAdded []string
+
 	// ViewFilter selects which source views are created on the
 	// target during the cold-start phase. CDC events for views
 	// don't exist (views aren't replicated by either engine's CDC
