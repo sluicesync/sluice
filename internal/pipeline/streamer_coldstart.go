@@ -73,8 +73,10 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	stop = func() {}
 
 	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
-	// first.
-	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
+	// first — and so does its established-table record
+	// (INCLUDE-TABLE-SCOPE-DRIFT, N3), so a failure from here leaves the
+	// stream unrecorded, not stale.
+	if err := s.resetStreamRecordsForColdStart(ctx, applier, streamID); err != nil {
 		return nil, stop, err
 	}
 

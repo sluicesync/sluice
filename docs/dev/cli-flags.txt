@@ -431,6 +431,7 @@ restore --target-driver
 restore --target-schema
 restore --target-tls-ca
 restore --verify-key
+schema add-table --abandon
 schema add-table --accept-target-only-unique-key
 schema add-table --control-keyspace
 schema add-table --dry-run

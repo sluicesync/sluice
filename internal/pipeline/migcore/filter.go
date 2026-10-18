@@ -619,16 +619,21 @@ func dropSequencesOwnedByFilteredTables(ctx context.Context, schema *ir.Schema, 
 	schema.Sequences = kept
 }
 
-// matchesAny returns true when name matches at least one pattern
-// under [path.Match]. Errors from path.Match (only possible from
-// malformed character classes that NewTableFilter would already
-// have rejected) are silently treated as non-match.
 // NamesLiterally reports whether an --include-table entry names table
-// literally — an entry with no glob metacharacter that matches it — as
-// opposed to a glob or the absence of any include list. The
-// INCLUDE-TABLE-SCOPE-DRIFT door refuses only the tables the operator named
-// this way: a glob or an unfiltered stream admitting a table created on the
-// source keeps ADR-0021's "new tables stay out" behaviour.
+// literally, as opposed to a glob or the absence of any include list. The
+// INCLUDE-TABLE-SCOPE-DRIFT door refuses a never-copied table the operator
+// named this way even where its changes would not be applied.
+//
+// The rules, which follow [TableFilter.Allows] exactly:
+//
+//   - an entry containing any of `*`, `?`, `[` or `\` is a glob, never a
+//     literal — `\` included, because path.Match reads it as an escape, so
+//     `my\_t` matches `my_t` without spelling it;
+//   - the comparison is the filter's own path.Match equality, so it is
+//     case-sensitive: `Orders` does not name `orders`;
+//   - a schema-qualified entry (`app.t`) is compared whole against the bare
+//     table name, exactly as Allows compares it, so it names no table here
+//     (and admits none there).
 func (f TableFilter) NamesLiterally(table string) bool {
 	for _, p := range f.Include {
 		if !strings.ContainsAny(p, `*?[\`) && matchesAny([]string{p}, table) {
@@ -638,6 +643,10 @@ func (f TableFilter) NamesLiterally(table string) bool {
 	return false
 }
 
+// matchesAny returns true when name matches at least one pattern
+// under [path.Match]. Errors from path.Match (only possible from
+// malformed character classes that NewTableFilter would already
+// have rejected) are silently treated as non-match.
 func matchesAny(patterns []string, name string) bool {
 	for _, p := range patterns {
 		ok, err := path.Match(p, name)

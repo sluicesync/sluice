@@ -277,6 +277,13 @@ type AddTable struct {
 	// put the table in the publication ([AddTable.notePublicationAdd]), so a
 	// failed add may take it back out ([AddTable.undoFailedAdd]).
 	publicationAddedByThisRun bool
+
+	// Abandon removes a pending add-table's record instead of adding the
+	// table (`sluice schema add-table --abandon`; see [AddTable.runAbandon]).
+	Abandon bool
+	// pendingHeartbeatEvery overrides [ir.PendingAddHeartbeatInterval]
+	// (tests); zero is the default.
+	pendingHeartbeatEvery time.Duration
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -289,6 +296,9 @@ type AddTable struct {
 func (a *AddTable) Run(ctx context.Context) error {
 	if err := a.validate(); err != nil {
 		return err
+	}
+	if a.Abandon {
+		return a.runAbandon(ctx)
 	}
 
 	// Item 135 / audit B-2: add-table is the SECOND entry point that
@@ -508,7 +518,10 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := a.recordPendingAdd(ctx, applier); err != nil {
 		return err
 	}
-	if err := a.bringInTable(ctx, applier, preflight, scoped, sw, rw); err != nil {
+	stopHeartbeat := a.startPendingHeartbeat(ctx, applier)
+	err = a.bringInTable(ctx, applier, preflight, scoped, sw, rw)
+	stopHeartbeat()
+	if err != nil {
 		return a.undoFailedAdd(ctx, applier, err)
 	}
 	if err := a.recordCompletedAdd(ctx, applier); err != nil {
@@ -636,7 +649,7 @@ func (a *AddTable) recordPendingAdd(ctx context.Context, applier ir.ChangeApplie
 		slog.DebugContext(ctx, "add-table: target applier keeps no pending-add record; skipping it", slog.String("target", a.Target.Name()))
 		return nil
 	}
-	if err := store.RecordPendingAddedTable(ctx, a.StreamID, a.TableName); err != nil {
+	if err := store.RecordPendingAddedTable(ctx, a.StreamID, a.TableName, time.Now()); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
 			"pipeline: add-table: record %q as pending on the stream's control row before changing anything "+
 				"(nothing was changed): %w", a.TableName, err,
@@ -687,11 +700,11 @@ func (a *AddTable) notePublicationAdd(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	missing, publication, _, err := checker.UnpublishedTables(ctx, a.SourceDSN, []string{a.TableName})
+	m, err := checker.UnpublishedTables(ctx, a.SourceDSN, []string{a.TableName})
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read publication membership: %w", err))
 	}
-	a.publicationAddedByThisRun = publication != "" && len(missing) == 1
+	a.publicationAddedByThisRun = m.Publication != "" && len(m.Missing) == 1
 	return nil
 }
 
@@ -704,14 +717,22 @@ func (a *AddTable) notePublicationAdd(ctx context.Context) error {
 // is the commonest way to get here. The returned error names both facts.
 func (a *AddTable) undoFailedAdd(ctx context.Context, applier ir.ChangeApplier, cause error) error {
 	note := fmt.Sprintf("the add of %q did not complete", a.TableName)
-	if _, ok := applier.(ir.PendingAddedTablesStore); ok {
+	undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if store, ok := applier.(ir.PendingAddedTablesStore); ok {
 		note += "; it stays recorded as pending, so `sync start` refuses INCLUDE-TABLE-SCOPE-DRIFT for it until " +
 			"a re-run of add-table succeeds (empty the target table first if rows landed) or a " +
 			"--restart-from-scratch re-copies it"
+		// This add is not running any more: age its heartbeat out now, so a
+		// restart reads it as dead (terminal) at once rather than as an add
+		// in progress (restartable) for the next PendingAddStaleAfter. A kill
+		// cannot do this; the heartbeat simply stops and ages out.
+		if err := store.HeartbeatPendingAddedTable(undoCtx, a.StreamID, a.TableName, time.Unix(0, 0)); err != nil {
+			slog.WarnContext(ctx, "add-table: could not mark the failed add's pending record as no longer running; "+
+				"a restart in the next few minutes defers as INCLUDE-TABLE-ADD-IN-PROGRESS", slog.String("error", err.Error()))
+		}
 	}
 	if dropper, ok := a.Source.(publicationTableDropper); ok && a.publicationAddedByThisRun {
-		undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
 		if err := dropper.DropPublicationTables(undoCtx, a.SourceDSN, []string{a.TableName}); err != nil {
 			slog.WarnContext(ctx, "add-table: could not take the table back out of the source publication after the "+
 				"add failed; a running stream keeps streaming its changes into the partial target copy until the "+

@@ -452,28 +452,32 @@ func (e Engine) AddPublicationTables(ctx context.Context, dsn string, tables []s
 // this engine value's publication does not deliver, for the pipeline's
 // INCLUDE-TABLE-SCOPE-DRIFT door (Bug 321), with the publication's name for
 // the refusal. The name is empty when the publication does not exist: no
-// evidence either way.
+// evidence either way. AllTables reports a FOR ALL TABLES publication.
 //
-// shared reports whether any OTHER sluice replication slot exists on the
+// Shared reports whether any OTHER sluice replication slot exists on the
 // source (ADR-0175's [otherSluiceSlots], existence not activity). A
 // publication another stream may read through is the union of their scopes —
 // and [guardPublicationNarrowing] refuses to narrow it while that slot
 // exists — so its membership says nothing about what THIS stream copied: the
 // caller must not treat a member as established. Read-only. Discovered by
 // the pipeline via structural interface (publicationMembershipChecker).
-func (e Engine) UnpublishedTables(ctx context.Context, dsn string, tables []string) (missing []string, publication string, shared bool, err error) {
+func (e Engine) UnpublishedTables(ctx context.Context, dsn string, tables []string) (ir.PublicationMembership, error) {
 	cfg, err := e.parseDSN(dsn)
 	if err != nil {
-		return nil, "", false, err
+		return ir.PublicationMembership{}, err
 	}
 	db, err := openDB(ctx, cfg)
 	if err != nil {
-		return nil, "", false, err
+		return ir.PublicationMembership{}, err
 	}
 	defer func() { _ = db.Close() }()
 	missing, checked, err := unpublishedTables(ctx, db, e.publicationName(), cfg.schema, tables)
 	if err != nil || !checked {
-		return nil, "", false, err
+		return ir.PublicationMembership{}, err
+	}
+	var allTables bool
+	if err := db.QueryRowContext(ctx, "SELECT puballtables FROM pg_publication WHERE pubname = $1", e.publicationName()).Scan(&allTables); err != nil {
+		return ir.PublicationMembership{}, fmt.Errorf("postgres: check publication %q: %w", e.publicationName(), err)
 	}
 	own := e.ownSlot
 	if own == "" {
@@ -481,9 +485,9 @@ func (e Engine) UnpublishedTables(ctx context.Context, dsn string, tables []stri
 	}
 	others, err := otherSluiceSlots(ctx, db, own)
 	if err != nil {
-		return nil, "", false, err
+		return ir.PublicationMembership{}, err
 	}
-	return missing, e.publicationName(), len(others) > 0, nil
+	return ir.PublicationMembership{Publication: e.publicationName(), Missing: missing, AllTables: allTables, Shared: len(others) > 0}, nil
 }
 
 // DropPublicationTables removes tables from this engine value's publication

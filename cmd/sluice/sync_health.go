@@ -118,7 +118,35 @@ type HealthResult struct {
 	// publication add and the end of its copy leaves a running stream
 	// applying changes onto a partial copy, and nothing else shows that until
 	// the stream restarts and refuses.
-	PendingAddedTables []string `json:"pending_added_tables,omitempty"`
+	PendingAddedTables []PendingAddHealth `json:"pending_added_tables,omitempty"`
+	// PendingAddedTablesTripped: at least one entry is stale (its add-table
+	// stopped refreshing it [ir.PendingAddStaleAfter] ago). A fresh entry is
+	// an add-table still copying — reported, not tripped, so a cron probe
+	// does not page through every normal --no-drain add.
+	PendingAddedTablesTripped bool `json:"pending_added_tables_tripped,omitempty"`
+}
+
+// PendingAddHealth is one pending add-table entry in the health output.
+type PendingAddHealth struct {
+	Table       string `json:"table"`
+	StartedAt   string `json:"started_at"`
+	HeartbeatAt string `json:"heartbeat_at"`
+	InProgress  bool   `json:"in_progress"`
+}
+
+// applyPendingAddsHealth classifies each pending entry fresh (in progress) or
+// stale (the add died; trips). Pure, so the classifier is unit-pinnable.
+func applyPendingAddsHealth(r *HealthResult, pending []ir.PendingAddedTable, now time.Time) {
+	for _, p := range pending {
+		fresh := p.Fresh(now)
+		r.PendingAddedTables = append(r.PendingAddedTables, PendingAddHealth{
+			Table: p.Table, StartedAt: p.StartedAt.UTC().Format(time.RFC3339),
+			HeartbeatAt: p.HeartbeatAt.UTC().Format(time.RFC3339), InProgress: fresh,
+		})
+		if !fresh {
+			r.PendingAddedTablesTripped = true
+		}
+	}
 }
 
 // SkippedTableHealth is one C-11 skip-ledger row in the health output.
@@ -188,7 +216,7 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 			runErr = err
 			return operationalError{err: fmt.Errorf("read pending add-table record: %w", err)}
 		}
-		result.PendingAddedTables = pending
+		applyPendingAddsHealth(&result, pending, time.Now())
 	}
 
 	// Optional source-side probe (v0.15.0, fixed in v0.15.1 / Bug 32).
@@ -257,30 +285,40 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 		return staleStreamError{streamID: s.StreamID, lagBytes: result.LagBytes, lagThreshold: s.MaxLagBytes}
 	case result.SkippedTablesTripped:
 		return skippedTablesError{streamID: s.StreamID, result: result}
-	case len(result.PendingAddedTables) > 0:
-		return pendingAddedTablesError{streamID: s.StreamID, tables: result.PendingAddedTables}
+	case result.PendingAddedTablesTripped:
+		return pendingAddedTablesError{streamID: s.StreamID, result: result}
 	}
 	return nil
 }
 
-// pendingAddedTablesError signals "an add-table on this stream did not
-// complete" with exit code 1, the skipped-tables alerting class.
+// pendingAddedTablesError signals "an add-table on this stream died" with
+// exit code 1, the skipped-tables alerting class.
 type pendingAddedTablesError struct {
 	streamID string
-	tables   []string
+	result   HealthResult
 }
 
 func (pendingAddedTablesError) ExitCode() int { return 1 }
 
 func (e pendingAddedTablesError) Error() string {
-	return fmt.Sprintf("stream %q has an incomplete `sluice schema add-table` for: %s — unless that add-table is still "+
-		"running, the table's target copy may be partial while the stream applies its changes (INCLUDE-TABLE-SCOPE-DRIFT); %s",
-		e.streamID, strings.Join(e.tables, ", "), pendingAddedTablesRemedy)
+	var stale []string
+	for _, p := range e.result.PendingAddedTables {
+		if !p.InProgress {
+			stale = append(stale, fmt.Sprintf("%s (last heartbeat %s)", p.Table, p.HeartbeatAt))
+		}
+	}
+	return fmt.Sprintf("stream %q has a `sluice schema add-table` that stopped without completing, for: %s — the "+
+		"table's target copy may be partial while the stream applies its changes (INCLUDE-TABLE-SCOPE-DRIFT); %s",
+		e.streamID, strings.Join(stale, ", "), pendingAddedTablesRemedy)
 }
 
-// pendingAddedTablesRemedy is shared by `sync health` and `sync status`.
-const pendingAddedTablesRemedy = "stop the stream, empty the target table, and add it again with `sluice schema add-table`, " +
-	"or re-copy with `sync start --restart-from-scratch`"
+// pendingAddedTablesRemedy is shared by `sync health` and `sync status`. Run
+// with the stream's own driver/DSN flags; --abandon is the only exit for a
+// table no add-table can clear.
+const pendingAddedTablesRemedy = "if the table still exists on the source and is in the stream's scope: stop the " +
+	"stream, empty the target table and add it again with `sluice schema add-table <table>`, or re-copy with " +
+	"`sync start --restart-from-scratch`; if it was dropped on the source or taken out of the stream's scope: " +
+	"`sluice schema add-table --abandon <table> --yes` removes the record (the target table may hold a partial copy)"
 
 // applySkippedTablesHealth folds the C-11 skip ledger into the health
 // result: the stream's rows, the total, and the trip flag (nonzero
@@ -519,8 +557,8 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		state = fmt.Sprintf("STALE (lag %d bytes, threshold %d)", r.LagBytes, r.LagThreshold)
 	case r.SkippedTablesTripped:
 		state = fmt.Sprintf("SKIPPING (%d event(s) skipped for %d table(s) the target lacks)", r.SkippedEventsTotal, len(r.SkippedTables))
-	case len(r.PendingAddedTables) > 0:
-		state = fmt.Sprintf("ADD-TABLE INCOMPLETE (%d table(s))", len(r.PendingAddedTables))
+	case r.PendingAddedTablesTripped:
+		state = "ADD-TABLE INCOMPLETE (an add-table stopped without completing)"
 	}
 	if _, err := fmt.Fprintf(w,
 		"stream: %s\nfound: true\nstate: %s\nposition: %s\nupdated_at: %s\nseconds_since_last_apply: %d\n",
@@ -571,11 +609,15 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		}
 	}
 	for _, t := range r.PendingAddedTables {
-		if _, err := fmt.Fprintf(w, "pending_added_table: %s\n", t); err != nil {
+		state := "stopped without completing"
+		if t.InProgress {
+			state = "in progress"
+		}
+		if _, err := fmt.Fprintf(w, "pending_added_table: %s %s started_at=%s heartbeat_at=%s\n", t.Table, state, t.StartedAt, t.HeartbeatAt); err != nil {
 			return err
 		}
 	}
-	if len(r.PendingAddedTables) > 0 {
+	if r.PendingAddedTablesTripped {
 		if _, err := fmt.Fprintf(w, "pending_added_tables_remedy: %s\n", pendingAddedTablesRemedy); err != nil {
 			return err
 		}

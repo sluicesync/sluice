@@ -79,6 +79,8 @@ type SchemaAddTableCmd struct {
 
 	AcceptTargetOnlyUniqueKey []string `name:"accept-target-only-unique-key" placeholder:"TABLE.KEY=FINGERPRINT" help:"Accept a unique key a PRE-CREATED target table carries beyond the source's, as the SOURCE-UNIQUE-KEY-ABSENT refusal prints it (repeatable): the fingerprint is a hash of the key's definition as the target engine reports it, with the catalog row of every column the key depends on, so any later change to either refuses again until re-accepted (see docs/operator/cdc-streaming.md for exactly what is and is not hashed). Without it, a target unique key no source key implies refuses with SOURCE-UNIQUE-KEY-ABSENT before the table is copied: every insert reaches the target as an upsert that resolves a conflict through any unique key the target has, so the source's next duplicate of such a key would overwrite a different row. Pass the same acceptance to every later 'sync start' of the stream."`
 
+	Abandon bool `help:"Retire a pending add-table instead of adding the table: remove the stream's pending record for TABLE, which a failed or killed add-table leaves and 'sync start' refuses on (INCLUDE-TABLE-SCOPE-DRIFT). For a table since dropped on the source or taken out of the stream's scope, which no add-table can clear. Refuses while the add-table's heartbeat is fresh (it is still running). On a Postgres source it also takes TABLE out of the publication unless the stream established it or another sluice slot exists. The target table is left as it is and may hold a partial copy."`
+
 	DryRun bool `help:"Print the plan (which table, source publication update, target DDL summary) without modifying the source publication, target schema, or capturing a snapshot." short:"n"`
 	Yes    bool `help:"Confirm the add. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed table-name prompt." short:"y"`
 
@@ -163,9 +165,11 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 		if err := refuseUnlessTerminal(fmt.Sprintf("adding table %q to the stream", s.Table)); err != nil {
 			return err
 		}
-		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, os.Stdout,
-			fmt.Sprintf("This will create table %q on the target, bulk-copy its rows, and extend the source publication. Type %q to confirm: ", s.Table, s.Table),
-			s.Table)
+		prompt := fmt.Sprintf("This will create table %q on the target, bulk-copy its rows, and extend the source publication. Type %q to confirm: ", s.Table, s.Table)
+		if s.Abandon {
+			prompt = fmt.Sprintf("This will remove the pending add-table record for %q (its target table may hold a partial copy) and may take it out of the source publication. Type %q to confirm: ", s.Table, s.Table)
+		}
+		ok, err := confirmTypedDestructive(kongContext(), os.Stdin, os.Stdout, prompt, s.Table)
 		if err != nil {
 			return err
 		}
@@ -191,6 +195,7 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 		DryRun:             s.DryRun,
 		LiveMode:           s.NoDrain,
 		TargetSchema:       s.TargetSchema,
+		Abandon:            s.Abandon,
 
 		AcceptTargetOnlyUniqueKeys: s.AcceptTargetOnlyUniqueKey,
 	}

@@ -38,6 +38,9 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/ir"
+
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
 	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
@@ -244,6 +247,8 @@ const (
 	scopeDriftReasonNotEstablished = "never copied by this stream"
 	scopeDriftReasonIncompleteAdd  = "did not complete"
 	scopeDriftReasonUnpublished    = "not in publication"
+	scopeDriftReasonDropped        = "left this stream's scope earlier"
+	scopeDriftReasonRecreated      = "no longer in publication"
 )
 
 // establishKD cold-starts the stream on kd alone (tables names its filter;
@@ -322,8 +327,8 @@ func TestIncludeTableScopeDrift_PgoutputWidenedTableRefusedThenAddTableConverges
 	time.Sleep(2 * time.Second)
 
 	// Coming back to nt refuses: it stayed in the publication, so only the
-	// narrowed record knows (INCLUDE-TABLE-RE-WIDEN).
-	r.requireScopeDriftRefusal(r.startSync("kd,nt"), "nt", scopeDriftReasonNotEstablished)
+	// record moved it to the dropped set (INCLUDE-TABLE-RE-WIDEN).
+	r.requireScopeDriftRefusal(r.startSync("kd,nt"), "nt", scopeDriftReasonDropped)
 }
 
 // TestIncludeTableScopeDrift_UnfilteredNewTableWarnsAndStreams pins round 1's
@@ -512,7 +517,7 @@ func failAddTable(t *testing.T, r *scopeDriftRig, checkDDL, dropCheckDDL string)
 func requireRefusedRestart(t *testing.T, r *scopeDriftRig, tables string) {
 	t.Helper()
 	partial := r.rows(r.tgt, "nt", "e")
-	r.requireScopeDriftRefusal(r.startSync(tables), "nt", scopeDriftReasonIncompleteAdd, "wait for it to finish")
+	r.requireScopeDriftRefusal(r.startSync(tables), "nt", scopeDriftReasonIncompleteAdd)
 	if got := r.rows(r.tgt, "nt", "e"); got != partial {
 		t.Fatalf("the refused run wrote to nt: %q, was %q", got, partial)
 	}
@@ -599,5 +604,243 @@ func TestIncludeTableScopeDrift_PendingTableDroppedOnSourceConverges(t *testing.
 	}
 	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
 		t.Fatalf("target kd = %q%s", got, run.logTail())
+	}
+}
+
+// establishTwo cold-starts the stream over two tables with the given filter,
+// proves both copied, and stops it.
+func (r *scopeDriftRig) establishTwo(second, tables string, extra ...string) {
+	r.t.Helper()
+	r.exec(r.src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a');"+
+		"CREATE TABLE "+second+" (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO "+second+" VALUES (1, 'x'), (2, 'y')")
+	run := r.startSync(tables, extra...)
+	if got, ok := r.waitRows(r.tgt, second, "e", "1|x,2|y", 90*time.Second); !ok {
+		r.t.Fatalf("cold start: target %s = %q%s", second, got, run.logTail())
+	}
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a", 30*time.Second); !ok {
+		r.t.Fatalf("cold start: target kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+}
+
+// narrowThenChange restarts with a narrower scope (proved streaming by a kd
+// write), stops, then changes the narrowed-away table on the source — the
+// changes this narrowed stream discards.
+func (r *scopeDriftRig) narrowThenChange(table, tables string, extra ...string) {
+	r.t.Helper()
+	r.exec(r.src, "INSERT INTO kd VALUES (2, 'b')")
+	run := r.startSync(tables, extra...)
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
+		r.t.Fatalf("narrowed restart: target kd = %q%s", got, run.logTail())
+	}
+	r.exec(r.src, "UPDATE "+table+" SET e = 'Y' WHERE id = 2; DELETE FROM "+table+" WHERE id = 1; INSERT INTO "+table+" VALUES (3, 'z')")
+	time.Sleep(3 * time.Second)
+	run.end()
+	time.Sleep(2 * time.Second)
+}
+
+// TestIncludeTableScopeDrift_UnfilteredRewidenRefuses is N1: an unfiltered
+// stream narrowed with --exclude-table and widened back. nt never left the
+// publication, so the narrowed run discarded its changes; before the dropped
+// set the re-widened stream only WARNed and applied the rest onto the stale
+// copy (target 1:x,2:y,4:w against source 2:Y,3:z,4:w) at exit 0.
+func TestIncludeTableScopeDrift_UnfilteredRewidenRefuses(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishTwo("nt", "")
+	r.narrowThenChange("nt", "", "--exclude-table=nt")
+	r.requireScopeDriftRefusal(r.startSync(""), "nt", scopeDriftReasonDropped)
+}
+
+// TestIncludeTableScopeDrift_GlobRewidenRefuses is N1 through a glob.
+func TestIncludeTableScopeDrift_GlobRewidenRefuses(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishTwo("kx", "k*")
+	r.narrowThenChange("kx", "kd")
+	r.requireScopeDriftRefusal(r.startSync("k*"), "kx", scopeDriftReasonDropped)
+}
+
+// TestIncludeTableScopeDrift_MySQLExcludedPendingRefuses is N1's MySQL arm:
+// a failed add-table, a --restart-from-scratch that excludes the table, then
+// the exclude dropped. A cold start clears pending only for what it copied,
+// so the partial table still refuses.
+func TestIncludeTableScopeDrift_MySQLExcludedPendingRefuses(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "mysql", src, tgt)
+	r.establishKD("")
+	failAddTable(t, r, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20), CONSTRAINT nt_lt3 CHECK (id < 3))",
+		"ALTER TABLE nt DROP CHECK nt_lt3")
+
+	run := r.startSync("", "--restart-from-scratch", "--exclude-table=nt")
+	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b", 90*time.Second); !ok {
+		t.Fatalf("--restart-from-scratch: target kd = %q%s", got, run.logTail())
+	}
+	// A row written after the copy finished can only arrive through CDC,
+	// after the apply loop starts — which is after the cold start's record
+	// writes and pending clears. So its arrival proves those ran.
+	waitLog(t, run, "entering CDC mode")
+	r.exec(src, "INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
+		t.Fatalf("--restart-from-scratch then CDC: target kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+	if code, out := r.health(); code != 1 || !strings.Contains(out, "pending_added_table: nt") {
+		t.Fatalf("a re-copy that did not copy nt cleared its pending record (exit %d)\n%s", code, out)
+	}
+
+	r.requireScopeDriftRefusal(r.startSync(""), "nt", scopeDriftReasonIncompleteAdd)
+}
+
+// TestIncludeTableScopeDrift_RecreatedTableRefusesThenConverges is N2: a
+// table dropped and recreated while the stream was stopped leaves the FOR
+// TABLE publication; before, the stream kept going with zero log lines while
+// the target held the old table's rows. The remedy — empty the target table,
+// add-table — converges.
+func TestIncludeTableScopeDrift_RecreatedTableRefusesThenConverges(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishTwo("nt", "kd,nt")
+	r.exec(src, "DROP TABLE nt; CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO nt VALUES (10, 'a'), (11, 'b')")
+
+	r.requireScopeDriftRefusal(r.startSync("kd,nt"), "nt", scopeDriftReasonRecreated)
+
+	r.exec(tgt, "DELETE FROM nt")
+	if code, out := r.addTable("nt"); code != 0 {
+		t.Fatalf("schema add-table nt: exit %d\n%s", code, out)
+	}
+	run := r.startSync("kd,nt")
+	requireStreaming(t, run, 8*time.Second, "restart after the remedy")
+	r.exec(src, "INSERT INTO nt VALUES (12, 'c')")
+	if got, ok := r.waitRows(tgt, "nt", "e", "10|a,11|b,12|c", 60*time.Second); !ok {
+		t.Fatalf("after the remedy: target nt = %q, want 10|a,11|b,12|c%s", got, run.logTail())
+	}
+}
+
+// waitLog waits until run has logged substr.
+func waitLog(t *testing.T, run *straddleBinaryRun, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(run.logPath); err == nil && strings.Contains(string(b), substr) {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatalf("the run never logged %q%s", substr, run.logTail())
+}
+
+// setPending writes a pending add-table entry for table straight into the
+// control row — the state a running (fresh heartbeat) or killed (stale) add
+// leaves, which no add-table process can be held in for a test.
+func (r *scopeDriftRig) setPending(table string, heartbeat time.Time) {
+	r.t.Helper()
+	db, err := sql.Open(r.sqlDriver, r.tgt)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, "ALTER TABLE sluice_cdc_state ADD COLUMN IF NOT EXISTS pending_added_tables TEXT"); err != nil {
+		r.t.Fatal(err)
+	}
+	value := appliershared.EncodeTableSet([]string{appliershared.EncodePendingEntry(table, heartbeat.Add(-time.Hour), heartbeat)})
+	if _, err := db.ExecContext(ctx, "UPDATE sluice_cdc_state SET pending_added_tables = $1 WHERE stream_id = $2", value, r.streamID); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// TestIncludeTableScopeDrift_PendingLivenessInHealthAndAbandon is F1: `sync
+// health` reports an add-table that is still running as in progress (exit 0),
+// one whose heartbeat went stale as ADD-TABLE INCOMPLETE (exit 1), and
+// `schema add-table --abandon` clears it.
+func TestIncludeTableScopeDrift_PendingLivenessInHealthAndAbandon(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishKD("kd")
+	r.exec(src, "CREATE TABLE nt (id INT PRIMARY KEY, e VARCHAR(20))")
+
+	r.setPending("nt", time.Now())
+	if code, out := r.health(); code != 0 || !strings.Contains(out, "pending_added_table: nt in progress") {
+		t.Fatalf("health with an add in progress: exit %d, want 0 reporting it\n%s", code, out)
+	}
+	r.setPending("nt", time.Now().Add(-ir.PendingAddStaleAfter-time.Minute))
+	if code, out := r.health(); code != 1 || !strings.Contains(out, "ADD-TABLE INCOMPLETE") || !strings.Contains(out, "--abandon") {
+		t.Fatalf("health with a stale add: exit %d, want 1 naming --abandon\n%s", code, out)
+	}
+	args := append([]string{"schema", "add-table", "nt", "--abandon", "--yes"}, r.connArgs()...)
+	stdout, stderr, code := runSluice(t, r.bin, append(args, "--stream-id="+r.streamID)...)
+	if code != 0 || !strings.Contains(stdout+stderr, "may hold a partial copy") {
+		t.Fatalf("add-table --abandon: exit %d\n%s%s", code, stdout, stderr)
+	}
+	if code, out := r.health(); code != 0 || strings.Contains(out, "pending_added_table") {
+		t.Fatalf("health after --abandon: exit %d\n%s", code, out)
+	}
+}
+
+// TestIncludeTableScopeDrift_RestartDuringAddTableIsRestartable is F2: a
+// restart while an add-table is still running (fresh heartbeat) defers with
+// the restartable INCLUDE-TABLE-ADD-IN-PROGRESS, and once the add has cleared
+// its entry the stream resumes.
+func TestIncludeTableScopeDrift_RestartDuringAddTableIsRestartable(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "postgres", src, tgt)
+	r.establishTwo("nt", "kd,nt")
+
+	r.setPending("nt", time.Now())
+	run := r.startSync("kd,nt")
+	if !waitExit(run, 90*time.Second) {
+		t.Fatalf("a restart during an add-table kept streaming%s", run.logTail())
+	}
+	log := scopeDriftLog(t, run)
+	if !strings.Contains(log, "INCLUDE-TABLE-ADD-IN-PROGRESS") || strings.Contains(log, "warm resume refused: INCLUDE-TABLE-SCOPE-DRIFT") {
+		t.Fatalf("want the restartable INCLUDE-TABLE-ADD-IN-PROGRESS only%s", run.logTail())
+	}
+
+	// The add finishes: it clears its entry, as add-table's last step does.
+	r.exec(tgt, "UPDATE sluice_cdc_state SET pending_added_tables = NULL")
+	run = r.startSync("kd,nt")
+	requireStreaming(t, run, 8*time.Second, "restart after the add-table finished")
+	r.exec(src, "INSERT INTO nt VALUES (3, 'z')")
+	if got, ok := r.waitRows(tgt, "nt", "e", "1|x,2|y,3|z", 60*time.Second); !ok {
+		t.Fatalf("target nt = %q%s", got, run.logTail())
+	}
+}
+
+// TestIncludeTableScopeDrift_MultiDatabaseRemedyIsTheRecopy is F3: on a
+// multi-database stream add-table cannot record a table, so the refusal names
+// --restart-from-scratch instead of an add-table that would loop.
+func TestIncludeTableScopeDrift_MultiDatabaseRemedyIsTheRecopy(t *testing.T) {
+	srcServer, _, srcCleanup := startMySQLBinlog(t)
+	defer srcCleanup()
+	_, tgtHome, tgtCleanup := startMySQLBinlog(t)
+	defer tgtCleanup()
+	r := newScopeDriftRig(t, "mysql", serverDSN(t, srcServer), tgtHome)
+	r.exec(r.src, "CREATE DATABASE shop_db; CREATE TABLE source_db.kd (id INT PRIMARY KEY, k VARCHAR(20)); "+
+		"INSERT INTO source_db.kd VALUES (1, 'a'); CREATE TABLE shop_db.kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO shop_db.kd VALUES (1, 'b')")
+	run := r.startSync("kd", "--include-database=source_db,shop_db")
+	if got, ok := r.waitRows(r.tgt, "shop_db.kd", "k", "1|b", 90*time.Second); !ok {
+		t.Fatalf("multi-database cold start: target shop_db.kd = %q%s", got, run.logTail())
+	}
+	r.exec(r.src, "INSERT INTO shop_db.kd VALUES (2, 'c')")
+	if got, ok := r.waitRows(r.tgt, "shop_db.kd", "k", "1|b,2|c", 60*time.Second); !ok {
+		t.Fatalf("multi-database cdc: target shop_db.kd = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+
+	r.exec(r.src, "CREATE TABLE source_db.nt (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO source_db.nt VALUES (1, 'x')")
+	log := r.requireScopeDriftRefusal(r.startSync("kd,nt", "--include-database=source_db,shop_db"), "source_db.nt", scopeDriftReasonNotEstablished)
+	if !strings.Contains(log, "re-copy the stream with --restart-from-scratch") || strings.Contains(log, "run `sluice schema add-table") {
+		t.Fatal("the multi-database refusal must name the re-copy, not add-table")
 	}
 }

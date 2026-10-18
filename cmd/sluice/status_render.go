@@ -109,6 +109,7 @@ func writePendingAddedTablesText(ctx context.Context, out io.Writer, applier ir.
 		return nil
 	}
 	header := false
+	now := time.Now()
 	for _, st := range streams {
 		pending, err := store.ReadPendingAddedTables(ctx, st.StreamID)
 		if err != nil {
@@ -118,12 +119,20 @@ func writePendingAddedTablesText(ctx context.Context, out io.Writer, applier ir.
 			continue
 		}
 		if !header {
-			if _, err := fmt.Fprintln(out, "\nINCOMPLETE ADD-TABLE (INCLUDE-TABLE-SCOPE-DRIFT; the target copy may be partial):"); err != nil {
+			if _, err := fmt.Fprintln(out, "\nPENDING ADD-TABLE (INCLUDE-TABLE-SCOPE-DRIFT; a stopped one may have left a partial target copy):"); err != nil {
 				return err
 			}
 			header = true
 		}
-		if _, err := fmt.Fprintf(out, "  %s: %s\n", st.StreamID, strings.Join(pending, ", ")); err != nil {
+		parts := make([]string, 0, len(pending))
+		for _, p := range pending {
+			state := "stopped without completing"
+			if p.Fresh(now) {
+				state = "in progress"
+			}
+			parts = append(parts, fmt.Sprintf("%s (%s, heartbeat %s ago)", p.Table, state, now.Sub(p.HeartbeatAt).Round(time.Second)))
+		}
+		if _, err := fmt.Fprintf(out, "  %s: %s\n", st.StreamID, strings.Join(parts, ", ")); err != nil {
 			return err
 		}
 	}

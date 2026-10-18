@@ -11,9 +11,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
-// The two table-set columns of sluice_cdc_state behind the
+// The table-set columns of sluice_cdc_state behind the
 // INCLUDE-TABLE-SCOPE-DRIFT door (Bug 321). Both hold a set of table names in
 // the codec below, and both are added on first write, never at startup.
 const (
@@ -27,7 +30,43 @@ const (
 	// recorded" (a stream cold-started before the column existed), which is
 	// NOT the empty set.
 	EstablishedTablesColumn = "established_tables"
+	// DroppedTablesColumn records the tables that left the stream's scope
+	// after it established them (see [ir.EstablishedRecord.Dropped]). NULL
+	// reads as the empty set.
+	DroppedTablesColumn = "dropped_tables"
 )
+
+// EncodePendingEntry renders one pending add-table entry for the
+// pending_added_tables set: `<table>\x00<started ms>\x00<heartbeat ms>`. A
+// NUL cannot occur in a table name on either engine, so the split is
+// unambiguous; the set codec carries the NULs like any other byte.
+func EncodePendingEntry(table string, started, heartbeat time.Time) string {
+	return table + "\x00" + strconv.FormatInt(started.UnixMilli(), 10) + "\x00" + strconv.FormatInt(heartbeat.UnixMilli(), 10)
+}
+
+// DecodePendingEntry parses an entry [EncodePendingEntry] wrote. A malformed
+// entry is an error, never a skipped one.
+func DecodePendingEntry(entry string) (ir.PendingAddedTable, error) {
+	parts := strings.Split(entry, "\x00")
+	if len(parts) != 3 {
+		return ir.PendingAddedTable{}, fmt.Errorf("pending add-table entry %q is not <table>\\x00<started>\\x00<heartbeat>", entry)
+	}
+	started, err1 := strconv.ParseInt(parts[1], 10, 64)
+	heartbeat, err2 := strconv.ParseInt(parts[2], 10, 64)
+	if err1 != nil || err2 != nil {
+		return ir.PendingAddedTable{}, fmt.Errorf("pending add-table entry %q carries a malformed timestamp", entry)
+	}
+	return ir.PendingAddedTable{Table: parts[0], StartedAt: time.UnixMilli(started).UTC(), HeartbeatAt: time.UnixMilli(heartbeat).UTC()}, nil
+}
+
+// pendingEntryTable is the table an encoded pending entry names; the entry
+// itself when it does not decode (so an edit by table name still matches it).
+func pendingEntryTable(entry string) string {
+	if p, err := DecodePendingEntry(entry); err == nil {
+		return p.Table
+	}
+	return entry
+}
 
 // EncodeTableSet renders a table set for a table-set column: one
 // strconv.QuoteToASCII'd name per line, sorted, duplicates dropped. An empty
@@ -118,6 +157,38 @@ func ReadTableSet(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q Ta
 	return tables, true, nil
 }
 
+// ReadPendingEntries reads and decodes a pending_added_tables set.
+func ReadPendingEntries(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q TableSetQueries, streamID string) ([]ir.PendingAddedTable, error) {
+	entries, _, err := ReadTableSet(ctx, db, cfg, q, streamID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ir.PendingAddedTable, 0, len(entries))
+	for _, e := range entries {
+		p, err := DecodePendingEntry(e)
+		if err != nil {
+			return nil, fmt.Errorf("%s: read %s of stream %q: %w", cfg.EngineName, q.Column, streamID, err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// ReadEstablishedRecord reads the established and dropped sets. The record
+// is Recorded when the established column holds a value; a NULL dropped set
+// reads as empty.
+func ReadEstablishedRecord(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, established, dropped TableSetQueries, streamID string) (ir.EstablishedRecord, error) {
+	est, recorded, err := ReadTableSet(ctx, db, cfg, established, streamID)
+	if err != nil || !recorded {
+		return ir.EstablishedRecord{}, err
+	}
+	drop, _, err := ReadTableSet(ctx, db, cfg, dropped, streamID)
+	if err != nil {
+		return ir.EstablishedRecord{}, err
+	}
+	return ir.EstablishedRecord{Recorded: true, Established: est, Dropped: drop}, nil
+}
+
 // TableSetEdit computes the next value of a set from the current one.
 // recorded is false when the column is NULL. A nil next with write true
 // stores NULL; write false leaves the row untouched.
@@ -183,24 +254,71 @@ func UpdateTableSet(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q 
 	return nil
 }
 
-// PendingAdd is the [TableSetEdit] that adds table to a pending set.
-func PendingAdd(table string) TableSetEdit {
+// PendingAdd is the [TableSetEdit] that writes table's pending entry, started
+// and alive at now, replacing any earlier entry for it.
+func PendingAdd(table string, now time.Time) TableSetEdit {
 	return func(set map[string]struct{}, _ bool) (map[string]struct{}, bool) {
-		set[table] = struct{}{}
+		removePendingEntries(set, []string{table})
+		set[EncodePendingEntry(table, now, now)] = struct{}{}
 		return set, true
 	}
 }
 
-// PendingClear is the [TableSetEdit] that removes tables from a pending set,
-// storing NULL when it comes out empty.
+// PendingHeartbeat is the [TableSetEdit] that refreshes table's heartbeat to
+// now, keeping its start; no entry, no write.
+func PendingHeartbeat(table string, now time.Time) TableSetEdit {
+	return func(set map[string]struct{}, _ bool) (map[string]struct{}, bool) {
+		for entry := range set {
+			p, err := DecodePendingEntry(entry)
+			if err != nil || p.Table != table {
+				continue
+			}
+			delete(set, entry)
+			set[EncodePendingEntry(table, p.StartedAt, now)] = struct{}{}
+			return set, true
+		}
+		return nil, false
+	}
+}
+
+// PendingClear is the [TableSetEdit] that removes tables' entries from a
+// pending set, storing NULL when it comes out empty.
 func PendingClear(tables []string) TableSetEdit {
 	return func(set map[string]struct{}, _ bool) (map[string]struct{}, bool) {
-		for _, t := range tables {
-			delete(set, t)
-		}
+		removePendingEntries(set, tables)
 		if len(set) == 0 {
 			return nil, true
 		}
+		return set, true
+	}
+}
+
+func removePendingEntries(set map[string]struct{}, tables []string) {
+	drop := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		drop[t] = true
+	}
+	for entry := range set {
+		if drop[pendingEntryTable(entry)] {
+			delete(set, entry)
+		}
+	}
+}
+
+// SetNull is the [TableSetEdit] that stores NULL (the record reset a cold
+// start makes before it copies).
+func SetNull() TableSetEdit {
+	return func(map[string]struct{}, bool) (map[string]struct{}, bool) { return nil, true }
+}
+
+// SetRemove is the [TableSetEdit] that removes table from a set (a completed
+// add-table leaving the dropped set); an unrecorded set stays unrecorded.
+func SetRemove(table string) TableSetEdit {
+	return func(set map[string]struct{}, recorded bool) (map[string]struct{}, bool) {
+		if !recorded {
+			return nil, false
+		}
+		delete(set, table)
 		return set, true
 	}
 }
@@ -222,10 +340,20 @@ func EstablishedReplace(tables []string) TableSetEdit {
 // leaves an unrecorded (NULL) set unrecorded: one table is not a record of
 // what the stream established, and writing it would turn every other table
 // the stream does stream into "never copied".
+//
+// It also leaves a multi-database stream's record alone (F3): add-table names
+// a bare table, the record keys `<namespace>\x00<table>`, and a bare entry
+// would be junk no scope ever matches. Such a stream re-records with a
+// --restart-from-scratch, which its refusal names instead of add-table.
 func EstablishedAdd(table string) TableSetEdit {
 	return func(set map[string]struct{}, recorded bool) (map[string]struct{}, bool) {
 		if !recorded {
 			return nil, false
+		}
+		for k := range set {
+			if strings.IndexByte(k, 0) >= 0 {
+				return nil, false
+			}
 		}
 		set[table] = struct{}{}
 		return set, true
