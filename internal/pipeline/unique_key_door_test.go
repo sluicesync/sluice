@@ -269,8 +269,11 @@ func TestValidateAcceptedUniqueKeys(t *testing.T) {
 			t.Errorf("%q accepted", bad)
 		}
 	}
-	if _, ok := parseAcceptedUniqueKeys([]string{"db1.t.k=0123456789ab"}).match("t", "k", "DB1"); !ok {
+	if _, ok := parseAcceptedUniqueKeys([]string{"db1.t.k=0123456789ab"}).match("t", "k", "db1"); !ok {
 		t.Error("a namespace-qualified acceptance does not match its namespace")
+	}
+	if _, ok := parseAcceptedUniqueKeys([]string{"db1.t.k=0123456789ab"}).match("t", "k", "DB1"); ok {
+		t.Error("a namespace-qualified acceptance matched the namespace in another case (round-8 LOW-4b: exact)")
 	}
 	if _, ok := parseAcceptedUniqueKeys([]string{"db1.t.k=0123456789ab"}).match("t", "k", "db2"); ok {
 		t.Error("a namespace-qualified acceptance does not scope to its namespace")

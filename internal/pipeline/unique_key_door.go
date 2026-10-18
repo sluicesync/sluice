@@ -1028,7 +1028,8 @@ func lowerSet(names []string) map[string]bool {
 
 // acceptedUniqueKeys is the parsed --accept-target-only-unique-key list:
 // `<table>.<key>=<fingerprint>`, or `<namespace>.<table>.<key>=<fingerprint>`
-// on a multi-database stream. Names compare without case.
+// on a multi-database stream. Table and key names compare without case, the
+// namespace exactly ([acceptedUniqueKeys.match]).
 //
 // The fingerprint ([definitionFingerprint]) binds the acceptance to the key's
 // definition as the target reports it (round-6 MEDIUM-A, round-7 MEDIUM-1):
@@ -1100,11 +1101,6 @@ func validateAcceptedUniqueKeys(entries []string) error {
 // ([ir.UniqueKeyDefinitionReader]), which the acceptance fingerprint hashes.
 type keyDefiner func(ctx context.Context, table, key string) (string, error)
 
-// errKeyDefinitionUnsupported is a target engine with no
-// [ir.UniqueKeyDefinitionReader]: its keys cannot be fingerprinted, so none
-// can be accepted, and the refusal says so.
-var errKeyDefinitionUnsupported = errors.New("the target engine cannot report a unique key's definition")
-
 // openKeyDefiner returns a [keyDefiner] over the target, opening its schema
 // reader on first use (most checks fingerprint nothing), and the func that
 // closes it.
@@ -1125,7 +1121,7 @@ func openKeyDefiner(target ir.Engine, dsn, targetSchema string) (define keyDefin
 		}
 		dr, ok := tr.(ir.UniqueKeyDefinitionReader)
 		if !ok {
-			return "", errKeyDefinitionUnsupported
+			return "", fmt.Errorf("%w: the target engine has no definition surface", ir.ErrUniqueKeyDefinitionUnsupported)
 		}
 		return dr.UniqueKeyDefinition(ctx, table, key)
 	}
@@ -1179,7 +1175,8 @@ func judgeUncoveredKeysWith(ctx context.Context, define keyDefiner, keys []uncov
 // an acceptance carries the fingerprint of the key's definition as the
 // target reports it now, else the key to refuse, carrying that fingerprint
 // (the value the refusal prints) and the acceptance's stale one, if any.
-// A target engine that cannot report a definition refuses the key with no
+// A target that cannot report a definition ([ir.ErrUniqueKeyDefinitionUnsupported])
+// or reports an empty one refuses the key with no
 // fingerprint (nothing could be accepted); any other read failure fails the
 // check — never a fallback to a shape sluice renders itself (round-7 review
 // MEDIUM-1: that list of dimensions missed one every round).
@@ -1190,10 +1187,14 @@ func judgeUncoveredKey(ctx context.Context, define keyDefiner, display string, t
 	if key.Name != "" {
 		def, err := define(ctx, t.Name, key.Name)
 		switch {
-		case errors.Is(err, errKeyDefinitionUnsupported):
-			k.DefinitionUnreadable = err.Error()
+		case errors.Is(err, ir.ErrUniqueKeyDefinitionUnsupported):
+			k.DefinitionUnreadable = err.Error() + "; drop the key on the target instead"
 		case err != nil:
 			return nil, fmt.Errorf("read the definition of target unique key %s.%s: %w", display, key.Name, err)
+		case def == "":
+			// An empty definition hashes to one fingerprint for every key
+			// (round-8 review LOW-2): never honoured.
+			k.DefinitionUnreadable = "the target engine reported an empty definition for it"
 		default:
 			k.Definition, k.Fingerprint = definitionDisplay(def), definitionFingerprint(def)
 		}
@@ -1243,7 +1244,13 @@ func definitionDisplay(def string) string {
 // check passes the same namespaces: the scope's source namespace and its
 // target namespace, the one the refusal prints (round-7 review MEDIUM-2:
 // the boundary gate compared the source's alone, so a value pasted from a
-// `--target-schema` refusal was never judged at a schema change).
+// `--target-schema` refusal was never judged at a schema change). The
+// namespace compares exactly (round-8 review LOW-4b): two MySQL databases
+// differing only in case are distinct under lower_case_table_names=0, and
+// the refusal prints the server's own spelling to paste. Table and key names
+// fold case; the fingerprint carries both as the server spells them, and on
+// MySQL the database too, so an entry folded onto another table or database
+// never carries its fingerprint.
 func (a acceptedUniqueKeys) match(table, key string, namespaces ...string) (int, bool) {
 	for i, e := range a {
 		if strings.EqualFold(e.table, table) && strings.EqualFold(e.key, key) && e.inNamespace(namespaces) {
@@ -1269,7 +1276,7 @@ func (e acceptedUniqueKey) inNamespace(namespaces []string) bool {
 		return true
 	}
 	for _, ns := range namespaces {
-		if ns != "" && strings.EqualFold(e.namespace, ns) {
+		if ns != "" && e.namespace == ns {
 			return true
 		}
 	}

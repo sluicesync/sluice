@@ -3,7 +3,10 @@
 
 package ir
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // UniqueKeyFact is what a catalog knows about one unique index that the
 // schema IR does not carry, read for the stream's unique-key door
@@ -94,3 +97,13 @@ type UniqueKeyFactReader interface {
 type UniqueKeyDefinitionReader interface {
 	UniqueKeyDefinition(ctx context.Context, table, key string) (string, error)
 }
+
+// ErrUniqueKeyDefinitionUnsupported is a key whose definition the target
+// cannot report completely — a target engine without
+// [UniqueKeyDefinitionReader], or a key shape the engine's reader cannot
+// describe on that server (a functional key part on PlanetScale or Vitess,
+// whose comparison collation lives in a hidden column those servers do not
+// expose). Such a key cannot be accepted: the door refuses it, naming the
+// reason, and dropping the key is the remedy. A reader wraps it with the
+// reason (fmt.Errorf("%w: …", ErrUniqueKeyDefinitionUnsupported)).
+var ErrUniqueKeyDefinitionUnsupported = errors.New("the target cannot report this unique key's full definition, so it cannot be accepted")

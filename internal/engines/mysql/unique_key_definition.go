@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // uniqueKeyDefinitionSep separates the fields of one line of a
@@ -36,23 +38,31 @@ const uniqueKeyDefinitionSep = "\x1f"
 //     recorded, and taking them all is the superset;
 //   - on vanilla MySQL, a functional part's hidden generated column as SHOW
 //     EXTENDED FULL COLUMNS reports it (its type and the collation the part
-//     compares under). PlanetScale and Vitess do not serve that statement;
-//     there the expression text and every column it can read stand in for
-//     it, since the hidden column is derived from them.
+//     compares under);
+//   - the database and table as STATISTICS reports them (round-8 review
+//     LOW-4): Postgres's pg_get_indexdef names its schema, and without the
+//     database a fingerprint minted in one database of a multi-database
+//     stream would accept the identical key in another.
 //
-// A key not found, not unique, or whose lines cannot be found exactly once
-// is an error.
+// A functional part on PlanetScale or Vitess is
+// [ir.ErrUniqueKeyDefinitionUnsupported] ([functionalPartSupported]). A key
+// not found, not unique, or whose lines cannot be found exactly once is an
+// error.
 func (r *SchemaReader) UniqueKeyDefinition(ctx context.Context, table, key string) (string, error) {
 	fail := func(err error) (string, error) {
 		return "", fmt.Errorf("mysql: unique-key definition of %s.%s.%s: %w", r.schema, table, key, err)
 	}
-	lines, plain, functional, err := r.uniqueKeyStatistics(ctx, table, key)
+	where, lines, plain, functional, err := r.uniqueKeyStatistics(ctx, table, key)
 	if err != nil {
 		return fail(err)
 	}
 	if len(lines) == 0 {
 		return fail(errors.New("no index of that name on the table"))
 	}
+	if err := functionalPartSupported(r.flavor, functional); err != nil {
+		return fail(err)
+	}
+	lines = append([]string{where}, lines...)
 
 	ddl, err := r.showCreateTable(ctx, table)
 	if err != nil {
@@ -73,7 +83,7 @@ func (r *SchemaReader) UniqueKeyDefinition(ctx context.Context, table, key strin
 		return fail(err)
 	}
 	lines = append(lines, columns...)
-	if functional && r.flavor == FlavorVanilla {
+	if functional { // vanilla only: functionalPartSupported refused the rest
 		hidden, err := r.uniqueKeyHiddenColumns(ctx, table, key)
 		if err != nil {
 			return fail(err)
@@ -83,34 +93,50 @@ func (r *SchemaReader) UniqueKeyDefinition(ctx context.Context, table, key strin
 	return strings.Join(lines, "\n"), nil
 }
 
+// functionalPartSupported refuses a functional key part on a flavor that
+// does not serve SHOW EXTENDED FULL COLUMNS (round-8 review LOW-1): the
+// part compares under its hidden column's collation, which can come from the
+// session at CREATE time and then leaves no trace in the expression or in
+// any column, so no definition read there can bind it. Such a key cannot be
+// accepted; dropping it is the remedy.
+func functionalPartSupported(flavor Flavor, functional bool) error {
+	if functional && flavor != FlavorVanilla {
+		return fmt.Errorf("%w: a functional key part on %s compares under a hidden column's collation that the server "+
+			"does not expose", ir.ErrUniqueKeyDefinitionUnsupported, flavor)
+	}
+	return nil
+}
+
 // uniqueKeyStatistics renders the key's information_schema.STATISTICS rows,
-// in part order, and returns its plain parts' columns and whether it has a
-// functional part. A non-unique index of the name is an error.
-func (r *SchemaReader) uniqueKeyStatistics(ctx context.Context, table, key string) (lines, plain []string, functional bool, err error) {
+// in part order, and returns the database and table as the server reports
+// them, its plain parts' columns and whether it has a functional part. A
+// non-unique index of the name is an error.
+func (r *SchemaReader) uniqueKeyStatistics(ctx context.Context, table, key string) (where string, lines, plain []string, functional bool, err error) {
 	expr := `IFNULL(expression, '')`
 	if r.flavor == FlavorMariaDB {
 		expr = `''`
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT seq_in_index, IFNULL(column_name, ''), `+expr+`, IFNULL(sub_part, 0), IFNULL(collation, ''),
-		       non_unique, IFNULL(index_type, '')
+		SELECT table_schema, table_name, seq_in_index, IFNULL(column_name, ''), `+expr+`, IFNULL(sub_part, 0),
+		       IFNULL(collation, ''), non_unique, IFNULL(index_type, '')
 		FROM   information_schema.statistics
 		WHERE  table_schema = ? AND table_name = ? AND index_name = ?
 		ORDER  BY seq_in_index`, r.schema, table, key)
 	if err != nil {
-		return nil, nil, false, err
+		return "", nil, nil, false, err
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var seq, nonUnique int
 		var subPart int64
-		var column, expression, collation, indexType string
-		if err := rows.Scan(&seq, &column, &expression, &subPart, &collation, &nonUnique, &indexType); err != nil {
-			return nil, nil, false, err
+		var schema, tableName, column, expression, collation, indexType string
+		if err := rows.Scan(&schema, &tableName, &seq, &column, &expression, &subPart, &collation, &nonUnique, &indexType); err != nil {
+			return "", nil, nil, false, err
 		}
 		if nonUnique != 0 {
-			return nil, nil, false, errors.New("index is not unique")
+			return "", nil, nil, false, errors.New("index is not unique")
 		}
+		where = joinDefinitionFields("table", schema, tableName)
 		if column == "" {
 			functional = true
 		} else {
@@ -119,7 +145,7 @@ func (r *SchemaReader) uniqueKeyStatistics(ctx context.Context, table, key strin
 		lines = append(lines, joinDefinitionFields("part", fmt.Sprint(seq), column, expression, fmt.Sprint(subPart),
 			collation, indexType))
 	}
-	return lines, plain, functional, rows.Err()
+	return where, lines, plain, functional, rows.Err()
 }
 
 // uniqueKeyDefinitionColumns renders the columns a key depends on: the

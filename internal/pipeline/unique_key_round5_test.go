@@ -138,8 +138,18 @@ func TestUniqueKeyDoor_DefinitionReadFailsClosed(t *testing.T) {
 	err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, nil, "s1", true)
 	var refusal *ir.SourceUniqueKeyAbsentError
 	if !errors.As(err, &refusal) || refusal.Keys[0].DefinitionUnreadable == "" || refusal.Keys[0].Fingerprint != "" ||
-		!strings.Contains(err.Error(), "cannot be accepted") {
-		t.Fatalf("a target with no definition surface: %v, want the key refused as unacceptable", err)
+		!strings.Contains(err.Error(), "cannot be accepted") || !strings.Contains(err.Error(), "drop the key on the target") {
+		t.Fatalf("a target with no definition surface: %v, want the key refused as unacceptable, naming the remedy", err)
+	}
+
+	// An empty definition with no error (round-8 review LOW-2) hashes to one
+	// fingerprint for every key: it is refused, never honoured — even for an
+	// acceptance carrying exactly that fingerprint.
+	empty := func(context.Context, string, string) (string, error) { return "", nil }
+	accepted := acceptedUniqueKey{table: "kd", key: "uk", fingerprint: definitionFingerprint("")}
+	k, err := judgeUncoveredKey(ctx, empty, "kd", keyed, keyed.Indexes[0], nil, &accepted)
+	if err != nil || k == nil || k.DefinitionUnreadable == "" || k.Fingerprint != "" {
+		t.Fatalf("an empty definition: key %+v, err %v; want it refused as unreadable", k, err)
 	}
 }
 
@@ -468,6 +478,12 @@ func TestUniqueKeyDoor_TargetQualifiedAcceptance(t *testing.T) {
 	if err := refuseAddTableTargetOnlyUniqueKeys(src, target, nil, nil, []string{value}, "", "tgt"); err != nil {
 		t.Errorf("add-table refused the value sync start printed: %v", err)
 	}
+	// The namespace compares exactly (round-8 review LOW-4b): under MySQL's
+	// lower_case_table_names=0 `TGT` and `tgt` are two databases.
+	folded := "TGT.kd.uk=" + keyFingerprint(keyed.Indexes[0], keyed)
+	if err := refuseAddTableTargetOnlyUniqueKeys(src, target, nil, nil, []string{folded}, "", "tgt"); err == nil {
+		t.Error("add-table accepted a value naming the namespace in another case")
+	}
 	other := "other.kd.uk=" + keyFingerprint(keyed.Indexes[0], keyed)
 	if err := refuseAddTableTargetOnlyUniqueKeys(src, target, nil, nil, []string{other}, "", "tgt"); err == nil {
 		t.Error("add-table accepted a value naming another namespace")
@@ -475,5 +491,12 @@ func TestUniqueKeyDoor_TargetQualifiedAcceptance(t *testing.T) {
 	s.AcceptTargetOnlyUniqueKeys = []string{other}
 	if s.uniqueKeyChecksFor().acceptedTable("", "kd") {
 		t.Error("the boundary gate honoured a value naming another namespace")
+	}
+	s.AcceptTargetOnlyUniqueKeys = []string{folded}
+	if s.uniqueKeyChecksFor().acceptedTable("", "kd") {
+		t.Error("the boundary gate honoured a value naming the namespace in another case")
+	}
+	if err := s.phaseRefuseTargetOnlyUniqueKeys(ctx, nil, "s1", true); err == nil {
+		t.Error("the open door accepted a value naming the namespace in another case")
 	}
 }

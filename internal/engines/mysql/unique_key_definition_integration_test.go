@@ -83,6 +83,28 @@ func TestUniqueKeyDefinition_EveryDimension(t *testing.T) {
 			}
 		})
 	}
+	// The identical key in another database defines differently (round-8
+	// review LOW-4): a fingerprint minted in one database of a
+	// multi-database stream cannot accept the other's key.
+	dsn2, cleanup2 := newSharedDB(t, "ukdef_db2")
+	defer cleanup2()
+	const same = "CREATE TABLE t_same (id INT PRIMARY KEY, k VARCHAR(20), UNIQUE KEY uk_same (k))"
+	applyMySQLApplier(t, dsn, same)
+	applyMySQLApplier(t, dsn2, same)
+	one := define("t_same", "uk_same")
+	sr2, err := Engine{}.OpenSchemaReader(ctx, dsn2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sr2.(interface{ Close() error }).Close() }()
+	two, err := sr2.(ir.UniqueKeyDefinitionReader).UniqueKeyDefinition(ctx, "t_same", "uk_same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one == two || !strings.Contains(one, "ukdef_db\x1ft_same") || !strings.Contains(two, "ukdef_db2\x1ft_same") {
+		t.Fatalf("the identical key in two databases is not told apart by database:\n%s\n---\n%s", one, two)
+	}
+
 	sr, err := Engine{}.OpenSchemaReader(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
