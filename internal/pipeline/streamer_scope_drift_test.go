@@ -285,6 +285,13 @@ func TestScopeDriftDoor_PublicationConviction(t *testing.T) {
 	src := newScopeDriftEngine("kd", "nt")
 	src.published, src.allTables = []string{"kd"}, true
 	requireNoDrift(t, driftStreamer(t, src, nonScoperEngine{}, "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, recorded([]string{"kd", "nt"}), "st"))
+	// The negative a mutation run found missing: established and still a
+	// member of a FOR TABLE publication, shared or not, passes.
+	for _, shared := range []bool{false, true} {
+		src := newScopeDriftEngine("kd", "nt")
+		src.published, src.shared = []string{"kd", "nt"}, shared
+		requireNoDrift(t, driftStreamer(t, src, nonScoperEngine{}, "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, recorded([]string{"kd", "nt"}), "st"))
+	}
 }
 
 // TestScopeDriftDoor_BinlogSource: with no publication, a never-established
