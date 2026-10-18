@@ -6,6 +6,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 
@@ -13,13 +14,16 @@ import (
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
-// scopeDriftApplier serves the add-table pending record and the live-added
-// tables the door reads.
+// scopeDriftApplier serves the records the door reads: the add-table pending
+// set, the established set (nil = not recorded), and the live-added tables.
 type scopeDriftApplier struct {
 	ir.ChangeApplier
-	pending   []string
-	pendErr   error
-	liveAdded []string
+	pending     []string
+	pendErr     error
+	established []string
+	recorded    bool
+	rewritten   [][]string
+	liveAdded   []string
 }
 
 func (a *scopeDriftApplier) RecordPendingAddedTable(context.Context, string, string) error {
@@ -34,27 +38,46 @@ func (a *scopeDriftApplier) ReadPendingAddedTables(context.Context, string) ([]s
 	return a.pending, a.pendErr
 }
 
+func (a *scopeDriftApplier) ReadEstablishedTables(context.Context, string) (tables []string, recorded bool, err error) {
+	return a.established, a.recorded, nil
+}
+
+func (a *scopeDriftApplier) RecordEstablishedTables(_ context.Context, _ string, tables []string) error {
+	a.rewritten = append(a.rewritten, append([]string(nil), tables...))
+	return nil
+}
+
+func (a *scopeDriftApplier) AddEstablishedTable(context.Context, string, string) error {
+	return errors.New("not used")
+}
+
 func (a *scopeDriftApplier) ReadLiveAddedTables(context.Context, string) ([]string, error) {
 	return a.liveAdded, nil
 }
 
-// scopeDriftEngine is a publication source: it serves a schema and reports
-// which tables its publication delivers.
+// established returns an applier whose stream recorded tables as established.
+func established(tables ...string) *scopeDriftApplier {
+	return &scopeDriftApplier{established: tables, recorded: true}
+}
+
+// scopeDriftEngine serves a schema and, as a publication source, which
+// tables its publication delivers.
 type scopeDriftEngine struct {
 	*ukDoorEngine
 	publication string   // "" = no publication exists
 	published   []string // the tables it delivers
+	shared      bool     // another sluice slot exists
 	pubErr      error
 	asked       [][]string
 }
 
-func (e *scopeDriftEngine) UnpublishedTables(_ context.Context, _ string, tables []string) (missing []string, publication string, err error) {
+func (e *scopeDriftEngine) UnpublishedTables(_ context.Context, _ string, tables []string) (missing []string, publication string, shared bool, err error) {
 	e.asked = append(e.asked, append([]string(nil), tables...))
 	if e.pubErr != nil {
-		return nil, "", e.pubErr
+		return nil, "", false, e.pubErr
 	}
 	if e.publication == "" {
-		return nil, "", nil
+		return nil, "", false, nil
 	}
 	have := map[string]bool{}
 	for _, t := range e.published {
@@ -65,7 +88,7 @@ func (e *scopeDriftEngine) UnpublishedTables(_ context.Context, _ string, tables
 			missing = append(missing, t)
 		}
 	}
-	return missing, e.publication, nil
+	return missing, e.publication, e.shared, nil
 }
 
 func newScopeDriftEngine(tables ...string) *scopeDriftEngine {
@@ -82,163 +105,204 @@ func newScopeDriftEngine(tables ...string) *scopeDriftEngine {
 	}
 }
 
-func scopeDriftFilter(t *testing.T, include ...string) migcore.TableFilter {
+func scopeDriftStreamer(t *testing.T, src *scopeDriftEngine, include ...string) *Streamer {
 	t.Helper()
 	f, err := migcore.NewTableFilter(include, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return f
+	return &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", Filter: f}
 }
 
-// TestScopeDriftDoor_PendingArm is the add-table pending record's half, which
-// every source reaches: a pending table refuses only while it is in scope —
-// by the filter or as a live-added table — and a failed read is a restartable
-// failure, never the marker.
+func requireDrift(t *testing.T, err error, want ...string) {
+	t.Helper()
+	if !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
+		t.Fatalf("want INCLUDE-TABLE-SCOPE-DRIFT, got %v", err)
+	}
+	for _, w := range want {
+		if !strings.Contains(err.Error(), w) {
+			t.Fatalf("the refusal does not contain %q: %v", w, err)
+		}
+	}
+}
+
+// TestScopeDriftDoor_EstablishedArm is the primary evidence on every source:
+// only a table an --include-table entry names literally refuses; a glob or an
+// unfiltered stream keeps ADR-0021's "new tables stay out" with a WARN.
+func TestScopeDriftDoor_EstablishedArm(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name    string
+		include []string
+		refuses bool
+	}{
+		{name: "a literal include of an unestablished table refuses", include: []string{"kd", "nt"}, refuses: true},
+		{name: "a glob admitting it does not", include: []string{"kd", "n*"}},
+		{name: "an unfiltered stream does not (the L1 regression)"},
+		{name: "a literal include of established tables only passes", include: []string{"kd"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := newScopeDriftEngine("kd", "nt")
+			src.published = []string{"kd", "nt"} // a shared publication delivering it must not matter
+			err := scopeDriftStreamer(t, src, tc.include...).phaseRefuseIncludeTableScopeDrift(ctx, established("kd"), "st")
+			if tc.refuses {
+				requireDrift(t, err, "nt (named by --include-table and never copied by this stream")
+				return
+			}
+			if err != nil {
+				t.Fatalf("want no refusal, got %v", err)
+			}
+			if len(src.asked) != 0 {
+				t.Fatalf("a recorded stream asked the publication: %v", src.asked)
+			}
+		})
+	}
+
+	t.Run("a narrowed scope passes and narrows the record", func(t *testing.T) {
+		app := established("kd", "nt", "gone")
+		if err := scopeDriftStreamer(t, newScopeDriftEngine("kd", "nt"), "kd").phaseRefuseIncludeTableScopeDrift(ctx, app, "st"); err != nil {
+			t.Fatalf("want no refusal, got %v", err)
+		}
+		if len(app.rewritten) != 1 || strings.Join(app.rewritten[0], ",") != "kd" {
+			t.Fatalf("record rewritten to %v, want [kd] (out of scope and gone from the source both leave)", app.rewritten)
+		}
+	})
+
+	t.Run("an unchanged scope rewrites nothing", func(t *testing.T) {
+		app := established("kd", "nt")
+		if err := scopeDriftStreamer(t, newScopeDriftEngine("kd", "nt"), "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, app, "st"); err != nil {
+			t.Fatalf("want no refusal, got %v", err)
+		}
+		if len(app.rewritten) != 0 {
+			t.Fatalf("rewrote an unchanged record: %v", app.rewritten)
+		}
+	})
+
+	t.Run("once per process", func(t *testing.T) {
+		s := scopeDriftStreamer(t, newScopeDriftEngine("kd", "nt"), "kd", "nt")
+		s.scopeDriftDoorDone = true
+		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, established("kd"), "st"); err != nil {
+			t.Fatalf("a retry in the same Run re-ran the door: %v", err)
+		}
+	})
+}
+
+// TestScopeDriftDoor_PendingArm: a pending add-table refuses whatever admits
+// its table; a pending name the source no longer has is ignored (L2); a
+// failed read is a restartable failure, never the marker.
 func TestScopeDriftDoor_PendingArm(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
 		name      string
 		include   []string
+		tables    []string
 		pending   []string
 		liveAdded []string
 		refuses   bool
 	}{
-		{name: "pending and in the filter", include: []string{"kd", "nt"}, pending: []string{"nt"}, refuses: true},
-		{name: "pending and out of scope", include: []string{"kd"}, pending: []string{"nt"}},
-		{name: "pending and live-added", include: []string{"kd"}, pending: []string{"nt"}, liveAdded: []string{"nt"}, refuses: true},
-		{name: "pending under an empty filter", pending: []string{"nt"}, refuses: true},
-		{name: "nothing pending", include: []string{"kd", "nt"}},
+		{name: "pending and literally included", include: []string{"kd", "nt"}, tables: []string{"kd", "nt"}, pending: []string{"nt"}, refuses: true},
+		{name: "pending under an unfiltered stream", tables: []string{"kd", "nt"}, pending: []string{"nt"}, refuses: true},
+		{name: "pending and live-added", include: []string{"kd"}, tables: []string{"kd", "nt"}, pending: []string{"nt"}, liveAdded: []string{"nt"}, refuses: true},
+		{name: "pending and out of scope", include: []string{"kd"}, tables: []string{"kd", "nt"}, pending: []string{"nt"}},
+		{name: "pending and gone from the source", tables: []string{"kd"}, pending: []string{"nt"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &Streamer{Source: nonScoperEngine{}, Target: nonScoperEngine{}, Filter: scopeDriftFilter(t, tc.include...)}
-			err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{pending: tc.pending, liveAdded: tc.liveAdded}, "st")
-			if !tc.refuses {
-				if err != nil {
-					t.Fatalf("want no refusal, got %v", err)
-				}
+			app := established(tc.tables...)
+			app.pending, app.liveAdded = tc.pending, tc.liveAdded
+			err := scopeDriftStreamer(t, newScopeDriftEngine(tc.tables...), tc.include...).phaseRefuseIncludeTableScopeDrift(ctx, app, "st")
+			if tc.refuses {
+				requireDrift(t, err, "nt (its `sluice schema add-table` started and did not complete", "wait for it to finish")
 				return
 			}
-			if !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
-				t.Fatalf("want INCLUDE-TABLE-SCOPE-DRIFT, got %v", err)
-			}
-			if !strings.Contains(err.Error(), "nt (its `sluice schema add-table` started and did not complete") {
-				t.Fatalf("the refusal does not name nt with its reason: %v", err)
+			if err != nil {
+				t.Fatalf("want no refusal, got %v", err)
 			}
 		})
 	}
 
 	t.Run("a failed read is restartable, not the marker", func(t *testing.T) {
-		s := &Streamer{Source: nonScoperEngine{}, Target: nonScoperEngine{}}
-		err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{pendErr: errors.New("connection reset by peer")}, "st")
-		if err == nil || errors.Is(err, ir.ErrIncludeTableScopeDrift) {
-			t.Fatalf("want a non-marker failure, got %v", err)
-		}
+		app := established("kd")
+		app.pendErr = errors.New("connection reset by peer")
+		err := scopeDriftStreamer(t, newScopeDriftEngine("kd")).phaseRefuseIncludeTableScopeDrift(ctx, app, "st")
 		var cp *connectPhaseError
-		if !errors.As(err, &cp) {
-			t.Fatalf("want the control-read failure marked restartable, got %T %v", err, err)
+		if err == nil || errors.Is(err, ir.ErrIncludeTableScopeDrift) || !errors.As(err, &cp) {
+			t.Fatalf("want a restartable non-marker failure, got %T %v", err, err)
 		}
 	})
 }
 
-// TestScopeDriftDoor_PublicationArm is the pgoutput half: the in-scope
-// source tables — the cold start's own prunes, filter and ORM skip — against
-// the tables the publication delivers.
-func TestScopeDriftDoor_PublicationArm(t *testing.T) {
+// TestScopeDriftDoor_LegacyPublicationFallback: a stream with no established
+// record falls back to its publication, for literal includes, and only when
+// no other sluice slot exists (S1: a shared publication is every stream's
+// union and proves nothing about this one).
+func TestScopeDriftDoor_LegacyPublicationFallback(t *testing.T) {
 	ctx := context.Background()
+	legacy := func() *scopeDriftApplier { return &scopeDriftApplier{} }
 
-	t.Run("a widened table the publication does not deliver refuses", func(t *testing.T) {
+	t.Run("unshared, literal, unpublished: refuses", func(t *testing.T) {
 		src := newScopeDriftEngine("kd", "nt", "other")
 		src.published = []string{"kd"}
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", Filter: scopeDriftFilter(t, "kd", "nt")}
-		err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st")
-		if !errors.Is(err, ir.ErrIncludeTableScopeDrift) || !strings.Contains(err.Error(), `nt (not in publication "sluice_pub"`) {
-			t.Fatalf("want nt refused as unpublished, got %v", err)
-		}
+		err := scopeDriftStreamer(t, src, "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, legacy(), "st")
+		requireDrift(t, err, `nt (named by --include-table and not in publication "sluice_pub"`)
 		if strings.Contains(err.Error(), "other") {
 			t.Fatalf("an out-of-scope table was judged: %v", err)
 		}
-		if len(src.asked) != 1 || strings.Join(src.asked[0], ",") != "kd,nt" {
-			t.Fatalf("asked the publication about %v, want exactly the in-scope [kd nt]", src.asked)
+		got := append([]string(nil), src.asked[0]...)
+		sort.Strings(got)
+		if strings.Join(got, ",") != "kd,nt" {
+			t.Fatalf("asked the publication about %v, want the in-scope [kd nt]", src.asked)
 		}
 	})
-
-	t.Run("an unchanged scope passes", func(t *testing.T) {
+	t.Run("unshared, unfiltered: no refusal", func(t *testing.T) {
 		src := newScopeDriftEngine("kd", "nt")
-		src.published = []string{"kd", "nt"}
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", Filter: scopeDriftFilter(t, "kd", "nt")}
-		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st"); err != nil {
+		src.published = []string{"kd"}
+		if err := scopeDriftStreamer(t, src).phaseRefuseIncludeTableScopeDrift(ctx, legacy(), "st"); err != nil {
 			t.Fatalf("want no refusal, got %v", err)
 		}
 	})
-
-	t.Run("a narrowed scope passes", func(t *testing.T) {
+	t.Run("shared: no evidence, no refusal", func(t *testing.T) {
 		src := newScopeDriftEngine("kd", "nt")
-		src.published = []string{"kd", "nt"}
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", Filter: scopeDriftFilter(t, "kd")}
-		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st"); err != nil {
+		src.published, src.shared = []string{"kd"}, true
+		if err := scopeDriftStreamer(t, src, "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, legacy(), "st"); err != nil {
 			t.Fatalf("want no refusal, got %v", err)
 		}
 	})
-
-	t.Run("no publication is no evidence", func(t *testing.T) {
+	t.Run("no publication: no evidence, no refusal", func(t *testing.T) {
 		src := newScopeDriftEngine("kd", "nt")
 		src.publication = ""
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", Filter: scopeDriftFilter(t, "kd", "nt")}
-		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st"); err != nil {
+		if err := scopeDriftStreamer(t, src, "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, legacy(), "st"); err != nil {
 			t.Fatalf("want no refusal, got %v", err)
 		}
 	})
-
-	// The ORM prune must agree with the cold start's, or every warm resume
-	// of a stream with no filter would refuse the bookkeeping table the cold
-	// start skipped (and never published).
-	t.Run("the ORM table the stream skips is not judged", func(t *testing.T) {
-		src := newScopeDriftEngine("kd", "__diesel_schema_migrations")
-		src.published = []string{"kd"}
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", SkipORMTables: true}
-		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st"); err != nil {
-			t.Fatalf("want no refusal, got %v", err)
-		}
-		s.SkipORMTables = false
-		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st"); !errors.Is(err, ir.ErrIncludeTableScopeDrift) {
-			t.Fatalf("with the ORM skip off the table is in scope and unpublished; want the refusal, got %v", err)
-		}
-	})
-
-	t.Run("both reasons on one table are one entry", func(t *testing.T) {
-		src := newScopeDriftEngine("kd", "nt")
-		src.published = []string{"kd"}
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", Filter: scopeDriftFilter(t, "kd", "nt")}
-		err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{pending: []string{"nt"}}, "st")
-		if !errors.Is(err, ir.ErrIncludeTableScopeDrift) || !strings.Contains(err.Error(), "1 table(s)") ||
-			!strings.Contains(err.Error(), "so the source never sends its changes; its `sluice schema add-table` started") {
-			t.Fatalf("want one entry carrying both reasons, got %v", err)
-		}
-	})
-
-	t.Run("a multi-database stream does not ask the publication", func(t *testing.T) {
-		src := newScopeDriftEngine("kd", "nt")
-		src.published = []string{"kd"}
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", AllDatabases: true}
-		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st"); err != nil {
-			t.Fatalf("want no refusal, got %v", err)
-		}
-		if len(src.asked) != 0 {
-			t.Fatalf("asked the publication on a multi-database stream: %v", src.asked)
-		}
-	})
-
 	t.Run("a failed membership read is not the marker", func(t *testing.T) {
 		src := newScopeDriftEngine("kd", "nt")
 		src.pubErr = errors.New("connection refused")
-		s := &Streamer{Source: src, Target: nonScoperEngine{}, SourceDSN: "src-dsn", Filter: scopeDriftFilter(t, "kd", "nt")}
-		err := s.phaseRefuseIncludeTableScopeDrift(ctx, &scopeDriftApplier{}, "st")
+		err := scopeDriftStreamer(t, src, "kd", "nt").phaseRefuseIncludeTableScopeDrift(ctx, legacy(), "st")
 		if err == nil || errors.Is(err, ir.ErrIncludeTableScopeDrift) {
 			t.Fatalf("want a non-marker failure, got %v", err)
 		}
 	})
+	t.Run("no record is never seeded", func(t *testing.T) {
+		app := legacy()
+		src := newScopeDriftEngine("kd")
+		src.published = []string{"kd"}
+		if err := scopeDriftStreamer(t, src, "kd").phaseRefuseIncludeTableScopeDrift(ctx, app, "st"); err != nil {
+			t.Fatal(err)
+		}
+		if len(app.rewritten) != 0 {
+			t.Fatalf("a legacy resume wrote an established record %v; seeding would bless never-copied tables", app.rewritten)
+		}
+	})
+}
+
+// TestEstablishedKeys pins the record's entry shape on both stream kinds.
+func TestEstablishedKeys(t *testing.T) {
+	got := establishedKeysOf([]*ir.Table{{Name: "t"}, {Schema: "app", Name: "t"}})
+	if got[0] != "t" || got[1] != "app\x00t" || bareTableOfKey(got[1]) != "t" || bareTableOfKey(got[0]) != "t" {
+		t.Fatalf("keys %q", got)
+	}
 }
 
 // addTableUndoSource records the publication drop add-table's failure path

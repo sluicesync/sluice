@@ -112,9 +112,10 @@ import (
 //     accept-target-only-unique-key, a standing key). Its catalog-read
 //     failure is NOT the marker and stays restartable.
 //   - INCLUDE-TABLE-SCOPE-DRIFT (every source's warm resume, codeless; Bug
-//     321): listed. It reads the source's publication membership and the
-//     add-table pending record on the target's control row, and a restart
-//     changes neither, so it refuses again until the operator runs
+//     321): listed. It reads the stream's established-table and add-table
+//     pending records on the target's control row (and, for a stream with
+//     no record, the source's publication), and a restart changes none of
+//     them, so it refuses again until the operator runs
 //     `sluice schema add-table` for the named table, takes it out of scope,
 //     or re-copies with --restart-from-scratch. Its catalog and control-row
 //     read failures are NOT the marker and stay restartable.

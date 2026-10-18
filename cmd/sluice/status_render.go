@@ -92,7 +92,46 @@ func runStatusOnce(ctx context.Context, applier ir.ChangeApplier, lister ir.Migr
 		}
 		coldStarts = filterColdStarts(coldStarts, opts.StreamID)
 	}
-	return renderStatus(out, streams, leases, skips, coldStarts, opts, time.Now())
+	if err := renderStatus(out, streams, leases, skips, coldStarts, opts, time.Now()); err != nil {
+		return err
+	}
+	return writePendingAddedTablesText(ctx, out, applier, streams, opts)
+}
+
+// writePendingAddedTablesText appends, in the text format, every stream
+// whose `sluice schema add-table` started and did not complete (Bug 321): a
+// running stream may be applying changes onto that table's partial copy, and
+// nothing else in the status shows it. The JSON format does not carry it yet
+// (`sync health --format json` does).
+func writePendingAddedTablesText(ctx context.Context, out io.Writer, applier ir.ChangeApplier, streams []ir.StreamStatus, opts statusRenderOpts) error {
+	store, ok := applier.(ir.PendingAddedTablesStore)
+	if !ok || opts.Format == "json" {
+		return nil
+	}
+	header := false
+	for _, st := range streams {
+		pending, err := store.ReadPendingAddedTables(ctx, st.StreamID)
+		if err != nil {
+			return fmt.Errorf("read pending add-table record: %w", err)
+		}
+		if len(pending) == 0 {
+			continue
+		}
+		if !header {
+			if _, err := fmt.Fprintln(out, "\nINCOMPLETE ADD-TABLE (INCLUDE-TABLE-SCOPE-DRIFT; the target copy may be partial):"); err != nil {
+				return err
+			}
+			header = true
+		}
+		if _, err := fmt.Fprintf(out, "  %s: %s\n", st.StreamID, strings.Join(pending, ", ")); err != nil {
+			return err
+		}
+	}
+	if header {
+		_, err := fmt.Fprintf(out, "remedy: %s\n", pendingAddedTablesRemedy)
+		return err
+	}
+	return nil
 }
 
 // openMigrationStateStoreForStatus opens the target's migrate-state

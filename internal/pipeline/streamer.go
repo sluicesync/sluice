@@ -1593,6 +1593,15 @@ type Streamer struct {
 	// error sink, surfaced like whereFilterErr. uniqueKeyRecheckEvery
 	// overrides the re-check period (tests); zero is
 	// [uniqueKeyRecheckInterval].
+	// scopeDriftDoorDone is set once a change stream has opened in this Run
+	// (cold or warm), so the INCLUDE-TABLE-SCOPE-DRIFT door runs once per
+	// process: the scope cannot change within one, and a retry must not trip
+	// over an add-table that a live stream is legitimately waiting on
+	// (streamer_scope_drift.go). coldStartEstablished is the set a cold-start
+	// lane copied, recorded when its branch of phaseOpenChangeStream returns.
+	scopeDriftDoorDone   bool
+	coldStartEstablished []string
+
 	uniqueKeyDoor         *uniqueKeyDoorState
 	uniqueKeyRecheckErr   atomic.Pointer[error]
 	uniqueKeyRecheckEvery time.Duration
@@ -1795,6 +1804,8 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// GC-32: an operator restart re-baselines the unforwarded-schema-change
 	// door; retries inside this Run carry it.
 	s.unforwardedBaselineFrom = nil
+	// INCLUDE-TABLE-SCOPE-DRIFT runs at this Run's first stream open only.
+	s.scopeDriftDoorDone = false
 
 	// Driver/host mismatch pre-flight — runs once here (the DSNs can't
 	// change between retry attempts) and before any reader/writer is

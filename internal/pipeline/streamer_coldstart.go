@@ -350,10 +350,10 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	// the snapshot stream when Run unwinds.
 	changes, stop, err = s.coldStartBeginCDC(ctx, stream, applier, streamID)
 	if err == nil {
-		// Every in-scope table is now copied under this anchor, so an
-		// add-table that had failed on one of them is remedied (a
-		// --restart-from-scratch keeps the control row that carries it).
-		s.clearPendingAddedTablesAfterColdStart(ctx, applier, streamID, snapshotTables)
+		// Every in-scope table is now copied under this anchor: the
+		// stream's established set (INCLUDE-TABLE-SCOPE-DRIFT), recorded by
+		// phaseOpenChangeStream once the branch returns.
+		s.coldStartEstablished = snapshotTables
 	}
 	return changes, stop, err
 }

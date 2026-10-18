@@ -452,23 +452,38 @@ func (e Engine) AddPublicationTables(ctx context.Context, dsn string, tables []s
 // this engine value's publication does not deliver, for the pipeline's
 // INCLUDE-TABLE-SCOPE-DRIFT door (Bug 321), with the publication's name for
 // the refusal. The name is empty when the publication does not exist: no
-// evidence either way. Read-only. Discovered by the pipeline via structural
-// interface (publicationMembershipChecker).
-func (e Engine) UnpublishedTables(ctx context.Context, dsn string, tables []string) (missing []string, publication string, err error) {
+// evidence either way.
+//
+// shared reports whether any OTHER sluice replication slot exists on the
+// source (ADR-0175's [otherSluiceSlots], existence not activity). A
+// publication another stream may read through is the union of their scopes —
+// and [guardPublicationNarrowing] refuses to narrow it while that slot
+// exists — so its membership says nothing about what THIS stream copied: the
+// caller must not treat a member as established. Read-only. Discovered by
+// the pipeline via structural interface (publicationMembershipChecker).
+func (e Engine) UnpublishedTables(ctx context.Context, dsn string, tables []string) (missing []string, publication string, shared bool, err error) {
 	cfg, err := e.parseDSN(dsn)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	db, err := openDB(ctx, cfg)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	defer func() { _ = db.Close() }()
 	missing, checked, err := unpublishedTables(ctx, db, e.publicationName(), cfg.schema, tables)
 	if err != nil || !checked {
-		return nil, "", err
+		return nil, "", false, err
 	}
-	return missing, e.publicationName(), nil
+	own := e.ownSlot
+	if own == "" {
+		own = defaultSlot
+	}
+	others, err := otherSluiceSlots(ctx, db, own)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return missing, e.publicationName(), len(others) > 0, nil
 }
 
 // DropPublicationTables removes tables from this engine value's publication

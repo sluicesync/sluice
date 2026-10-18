@@ -451,6 +451,9 @@ func (s *Streamer) resumeStoppedColdStartFromVerifiedState(
 			slog.String("stream_id", streamID))
 	}
 	markComplete(ctx, rc, state)
+	// The stopped run's copy of every table in schema is now this stream's
+	// established set (INCLUDE-TABLE-SCOPE-DRIFT), recorded once CDC opens.
+	s.coldStartEstablished = migcore.TableNamesForPublication(schema)
 
 	// Enter CDC through the ORDINARY warm-resume path. Nothing about
 	// this stream is special any more: the target holds the copy, the

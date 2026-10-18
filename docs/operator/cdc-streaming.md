@@ -748,24 +748,33 @@ What this does not catch, stated so it is not read as broader:
 
 ## `sync`: a table the stream never brought in refuses a warm resume (`INCLUDE-TABLE-SCOPE-DRIFT`)
 
-A warm resume copies nothing: it continues the change stream from the persisted position. So a table that joins the stream's scope on a restart, by a widened `--include-table` or a narrowed `--exclude-table`, is never copied, and on a Postgres pgoutput source it is not streamed either, because only the cold start scopes the publication. Through v0.162.0 the stream came back green and the table stayed empty or absent on the target (Bug 321). A table joins a running stream through `sluice schema add-table`, never through the flags of a restart.
+A warm resume copies nothing: it continues the change stream from the persisted position. So a table that joins the stream's scope on a restart is never copied. On a Postgres pgoutput source it is not streamed either, because only the cold start scopes the publication; on a MySQL-family, VStream or trigger-CDC source it is streamed from the persisted position, so a target table pre-created for it gets the later rows and never the earlier ones. Through v0.162.0 the stream came back green either way (Bug 321). A table joins a running stream through `sluice schema add-table`, never through the flags of a restart.
 
-Every warm `sync start` (and `sync run` leg start) therefore checks, before the reader opens, each table in its current scope against two pieces of evidence:
+Each stream keeps two records on its `sluice_cdc_state` row:
 
-- **pgoutput, single-namespace streams:** the publication the stream reads through, as the server expands it (`pg_publication_tables`). A table in scope that the publication does not deliver was never copied by this stream and cannot be streamed by it. This also catches a table created on the source since the cold start of a stream with no filter.
-- **Every source:** `schema add-table` records its table as pending on the stream's `sluice_cdc_state` row before it changes anything, and clears it only after the copy and the hand-off succeed. A failed or interrupted add leaves the record, and on a Postgres source also takes the table back out of the publication, so a live stream stops streaming into the partial copy.
+- **`established_tables`:** the tables its cold start copied (every lane; each namespace of a multi-database stream; `--restart-from-scratch` rewrites it), plus every `schema add-table` that completed. A restart whose scope drops a table removes it from the record, because that table's changes are discarded from then on.
+- **`pending_added_tables`:** `schema add-table` records its table before it changes anything and clears it only after the copy and the hand-off succeed. A failed add leaves it, and on a Postgres source also takes back the publication add it made, so a live stream stops streaming into the partial copy. `sync health` exits 1 naming it, and the text `sync status` lists it.
 
-A table either one convicts is named in a codeless exit-1 refusal containing `INCLUDE-TABLE-SCOPE-DRIFT`; nothing has been applied. Every restart repeats it and `sync run` does not restart the leg. Remedies, per named table:
+At the first stream open of each process, before the reader opens, a warm resume refuses with a codeless exit-1 error containing `INCLUDE-TABLE-SCOPE-DRIFT`, naming each table, for:
+
+- a table an `--include-table` entry names **literally** (no `*`, `?` or `[`) that the established record does not hold;
+- any in-scope table whose add-table is pending.
+
+Nothing has been applied. Every restart repeats it and `sync run` does not restart the leg. A table admitted by a glob or by an unfiltered stream does not refuse: a table created on the source after the cold start stays out until `schema add-table` brings it in, as it always has, and every resume names such tables in an `INCLUDE-TABLE-NOT-ESTABLISHED` WARN. That WARN is the whole cost of the rule: those tables are not replicated until you add them. A pending add for a table since dropped or renamed on the source is ignored with a WARN, and a cold start clears the pending record. Remedies, per named table:
 
 1. With the stream stopped, run `sluice schema add-table <table>` with the stream's `--source-driver`, `--source`, `--target-driver`, `--target` and `--stream-id`, then the same `sync start` again. add-table refuses a target table that already holds rows, so empty a partial copy first.
 2. Take the table out of scope (`--include-table` / `--exclude-table`).
-3. Re-copy every table with `--restart-from-scratch`. On a Postgres source that run first refuses because the stream's replication slot exists; drop it with `sluice slot drop`, then re-run. The re-copy clears the pending record.
+3. Re-copy every table with `--restart-from-scratch`. On a Postgres source that run first refuses because the stream's replication slot exists; drop it with `sluice slot drop`, then re-run. The re-copy rewrites the established record and clears the pending one.
 
-Narrowing the scope is not refused: the table stops being applied, and the rows already on the target stay as they were. What the check cannot see, because the stream keeps no record of the tables it established:
+Narrowing the scope is not refused: the table stops being applied, and the rows already on the target stay as they were. Coming back to it later refuses, because the record no longer holds it.
 
-- a MySQL-family binlog, VStream or trigger-CDC source streams every table, so a widened table whose target counterpart was pre-created is streamed from the persisted position and rows written before it never arrive (INCLUDE-TABLE-SCOPE-DRIFT-STREAMED); with no target table its changes are skipped loudly, as before (`sluice_cdc_skipped_tables`, `sync health`);
-- a pgoutput stream re-widened to a table it had narrowed away: the table stayed in the publication while the narrowed run dropped its changes (INCLUDE-TABLE-RE-WIDEN);
-- a FOR ALL TABLES publication, a publication dropped since the cold start, and an add-table that failed under a binary older than this check.
+**A stream cold-started by an earlier release** has no established record until its next cold start; sluice does not seed one from the current scope, which would record a never-copied table as copied. Until then the check falls back to the stream's publication on a pgoutput source, for literal includes, and only when no other sluice replication slot exists (a publication other streams read through is the union of their scopes and says nothing about this one). Otherwise every resume logs `INCLUDE-TABLE-SCOPE-UNRECORDED` and there is no evidence. A cold start that cannot add the `established_tables` column (a role that cannot ALTER a pre-created control table) logs the same marker and runs without the record.
+
+What the check still cannot see:
+
+- a process killed in the middle of `schema add-table` cannot take back its publication add, so a running stream keeps applying into the partial copy until `sync health` shows the pending record or the stream restarts and refuses;
+- `schema add-table` on a multi-database stream does not extend its record, so a literal include of that table refuses until a `--restart-from-scratch`;
+- an in-scope table with no capture trigger on a trigger-CDC source captures nothing, at cold start as well, which is a separate class.
 
 ## `sync`: a schema change the stream did not see is checked against the target (`RESUME-SCHEMA-DIVERGENCE`)
 

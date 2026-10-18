@@ -424,8 +424,8 @@ func (s *Streamer) coldStartMultiDatabase(
 			slog.String("stream_id", streamID),
 		)
 	}
-	// Every selected namespace's tables are copied under that anchor (bare names, as add-table records them).
-	s.clearPendingAddedTablesAfterColdStart(ctx, applier, streamID, migcore.TableNamesForPublication(&ir.Schema{Tables: readerSeed}))
+	// Every selected namespace's tables are copied under that anchor: the established set.
+	s.coldStartEstablished = establishedKeysOf(readerSeed)
 
 	// ---- 6. Wire the CDC phase. ----
 	// (a) Scope the server-wide binlog to the selected database set. The

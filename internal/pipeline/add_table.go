@@ -511,7 +511,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := a.bringInTable(ctx, applier, preflight, scoped, sw, rw); err != nil {
 		return a.undoFailedAdd(ctx, applier, err)
 	}
-	if err := a.clearPendingAdd(ctx, applier); err != nil {
+	if err := a.recordCompletedAdd(ctx, applier); err != nil {
 		return err
 	}
 
@@ -645,11 +645,23 @@ func (a *AddTable) recordPendingAdd(ctx context.Context, applier ir.ChangeApplie
 	return nil
 }
 
-// clearPendingAdd clears the pending record once the table is fully brought
-// in. A failure here is reported, not swallowed: the table IS copied, but the
-// record it leaves makes the next warm resume refuse with
-// INCLUDE-TABLE-SCOPE-DRIFT, and the operator should know why.
-func (a *AddTable) clearPendingAdd(ctx context.Context, applier ir.ChangeApplier) error {
+// recordCompletedAdd records the table in the stream's established set
+// ([ir.EstablishedTablesStore] — a no-op for a stream with no record yet) and
+// then clears its pending record, once the table is fully brought in. A
+// failure here is reported, not swallowed: the table IS copied, but a missing
+// established entry or a pending record left behind makes the next warm
+// resume refuse with INCLUDE-TABLE-SCOPE-DRIFT, and the operator should know
+// why.
+func (a *AddTable) recordCompletedAdd(ctx context.Context, applier ir.ChangeApplier) error {
+	if est, ok := applier.(ir.EstablishedTablesStore); ok {
+		if err := est.AddEstablishedTable(ctx, a.StreamID, a.TableName); err != nil {
+			return migcore.WrapWithHint(migcore.PhaseSchemaApply, fmt.Errorf(
+				"pipeline: add-table: %q was copied and handed to the stream, but recording it as established failed, "+
+					"so a `sync start` that names it in --include-table will refuse INCLUDE-TABLE-SCOPE-DRIFT until a "+
+					"--restart-from-scratch records the stream's tables again: %w", a.TableName, err,
+			))
+		}
+	}
 	store, ok := applier.(ir.PendingAddedTablesStore)
 	if !ok {
 		return nil
@@ -675,7 +687,7 @@ func (a *AddTable) notePublicationAdd(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	missing, publication, err := checker.UnpublishedTables(ctx, a.SourceDSN, []string{a.TableName})
+	missing, publication, _, err := checker.UnpublishedTables(ctx, a.SourceDSN, []string{a.TableName})
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read publication membership: %w", err))
 	}

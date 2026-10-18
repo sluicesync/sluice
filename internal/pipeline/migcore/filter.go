@@ -623,6 +623,21 @@ func dropSequencesOwnedByFilteredTables(ctx context.Context, schema *ir.Schema, 
 // under [path.Match]. Errors from path.Match (only possible from
 // malformed character classes that NewTableFilter would already
 // have rejected) are silently treated as non-match.
+// NamesLiterally reports whether an --include-table entry names table
+// literally — an entry with no glob metacharacter that matches it — as
+// opposed to a glob or the absence of any include list. The
+// INCLUDE-TABLE-SCOPE-DRIFT door refuses only the tables the operator named
+// this way: a glob or an unfiltered stream admitting a table created on the
+// source keeps ADR-0021's "new tables stay out" behaviour.
+func (f TableFilter) NamesLiterally(table string) bool {
+	for _, p := range f.Include {
+		if !strings.ContainsAny(p, `*?[\`) && matchesAny([]string{p}, table) {
+			return true
+		}
+	}
+	return false
+}
+
 func matchesAny(patterns []string, name string) bool {
 	for _, p := range patterns {
 		ok, err := path.Match(p, name)

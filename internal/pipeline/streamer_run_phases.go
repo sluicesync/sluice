@@ -707,6 +707,15 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 	// un-copied COPY tail one row at a time (~10 rows/sec, the silent
 	// degrade this fixes). A cursor-less persisted position (completed
 	// cold-start) leaves this zero and stays on the fast warmResume path.
+	// Set by whichever cold-start lane copies (coldStart, the fan-out, the
+	// stopped-cold-start resume) and recorded below once the branch returns.
+	s.coldStartEstablished = nil
+	defer func() {
+		if err == nil && changes != nil {
+			s.scopeDriftDoorDone = true
+			s.recordColdStartEstablished(ctx, applier, streamID)
+		}
+	}()
 	var resumeCopyFrom ir.Position
 	if found && !s.ResetTargetData && !s.RestartFromScratch {
 		if resumer, ok := s.Source.(ir.SnapshotStreamResumer); ok && resumer.PositionCarriesCopyCursor(persisted) {

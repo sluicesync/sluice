@@ -272,7 +272,7 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		// Built by the real constructor the warm-resume scope door returns
 		// (streamer_scope_drift.go).
 		"INCLUDE-TABLE-SCOPE-DRIFT": (&Streamer{Source: nonScoperEngine{}, Target: nonScoperEngine{}}).
-			includeTableScopeDriftError("st", "sluice_pub", []scopeDriftTable{{name: "nt", unpublished: true}}),
+			includeTableScopeDriftError("st", "", []scopeDriftTable{{name: "nt", notEstablished: true}}),
 	}
 
 	if len(cases) != len(refusalsARestartRepeats) {

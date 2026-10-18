@@ -111,6 +111,14 @@ type HealthResult struct {
 	SkippedTables        []SkippedTableHealth `json:"skipped_tables,omitempty"`
 	SkippedEventsTotal   int64                `json:"skipped_events_total,omitempty"`
 	SkippedTablesTripped bool                 `json:"skipped_tables_tripped,omitempty"`
+
+	// PendingAddedTables are the tables whose `sluice schema add-table`
+	// started and did not complete (Bug 321, INCLUDE-TABLE-SCOPE-DRIFT). A
+	// non-empty list TRIPS the check (exit 1): an add killed between its
+	// publication add and the end of its copy leaves a running stream
+	// applying changes onto a partial copy, and nothing else shows that until
+	// the stream restarts and refuses.
+	PendingAddedTables []string `json:"pending_added_tables,omitempty"`
 }
 
 // SkippedTableHealth is one C-11 skip-ledger row in the health output.
@@ -173,6 +181,14 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 			return operationalError{err: fmt.Errorf("list skipped tables: %w", err)}
 		}
 		applySkippedTablesHealth(&result, records, s.StreamID)
+	}
+	if store, ok := applier.(ir.PendingAddedTablesStore); ok {
+		pending, err := store.ReadPendingAddedTables(ctx, s.StreamID)
+		if err != nil {
+			runErr = err
+			return operationalError{err: fmt.Errorf("read pending add-table record: %w", err)}
+		}
+		result.PendingAddedTables = pending
 	}
 
 	// Optional source-side probe (v0.15.0, fixed in v0.15.1 / Bug 32).
@@ -241,9 +257,30 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 		return staleStreamError{streamID: s.StreamID, lagBytes: result.LagBytes, lagThreshold: s.MaxLagBytes}
 	case result.SkippedTablesTripped:
 		return skippedTablesError{streamID: s.StreamID, result: result}
+	case len(result.PendingAddedTables) > 0:
+		return pendingAddedTablesError{streamID: s.StreamID, tables: result.PendingAddedTables}
 	}
 	return nil
 }
+
+// pendingAddedTablesError signals "an add-table on this stream did not
+// complete" with exit code 1, the skipped-tables alerting class.
+type pendingAddedTablesError struct {
+	streamID string
+	tables   []string
+}
+
+func (pendingAddedTablesError) ExitCode() int { return 1 }
+
+func (e pendingAddedTablesError) Error() string {
+	return fmt.Sprintf("stream %q has an incomplete `sluice schema add-table` for: %s — unless that add-table is still "+
+		"running, the table's target copy may be partial while the stream applies its changes (INCLUDE-TABLE-SCOPE-DRIFT); %s",
+		e.streamID, strings.Join(e.tables, ", "), pendingAddedTablesRemedy)
+}
+
+// pendingAddedTablesRemedy is shared by `sync health` and `sync status`.
+const pendingAddedTablesRemedy = "stop the stream, empty the target table, and add it again with `sluice schema add-table`, " +
+	"or re-copy with `sync start --restart-from-scratch`"
 
 // applySkippedTablesHealth folds the C-11 skip ledger into the health
 // result: the stream's rows, the total, and the trip flag (nonzero
@@ -482,6 +519,8 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		state = fmt.Sprintf("STALE (lag %d bytes, threshold %d)", r.LagBytes, r.LagThreshold)
 	case r.SkippedTablesTripped:
 		state = fmt.Sprintf("SKIPPING (%d event(s) skipped for %d table(s) the target lacks)", r.SkippedEventsTotal, len(r.SkippedTables))
+	case len(r.PendingAddedTables) > 0:
+		state = fmt.Sprintf("ADD-TABLE INCOMPLETE (%d table(s))", len(r.PendingAddedTables))
 	}
 	if _, err := fmt.Fprintf(w,
 		"stream: %s\nfound: true\nstate: %s\nposition: %s\nupdated_at: %s\nseconds_since_last_apply: %d\n",
@@ -528,6 +567,16 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 	}
 	if r.SkippedTablesTripped {
 		if _, err := fmt.Fprintf(w, "skipped_tables_remedy: %s\n", ir.SkippedTableRemedy); err != nil {
+			return err
+		}
+	}
+	for _, t := range r.PendingAddedTables {
+		if _, err := fmt.Fprintf(w, "pending_added_table: %s\n", t); err != nil {
+			return err
+		}
+	}
+	if len(r.PendingAddedTables) > 0 {
+		if _, err := fmt.Fprintf(w, "pending_added_tables_remedy: %s\n", pendingAddedTablesRemedy); err != nil {
 			return err
 		}
 	}
