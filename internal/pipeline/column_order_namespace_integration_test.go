@@ -59,14 +59,25 @@ func rsfRunCrossNamespaceCell(t *testing.T, cell twfbCell, srcExec func(ns, sql 
 		}
 	}
 	cell.waitStreaming(t, run)
+	// The records are written when the apply phase starts, after the anchor
+	// and the cold start's record writes: wait for them, not a fixed settle
+	// (a multi-database MySQL cold start ran past waitStreaming's 2s, the
+	// stop cancelled the catalog read, and nothing was recorded).
+	countB := fmt.Sprintf("SELECT count(*) FROM sluice_cdc_column_order WHERE schema_name = '%s'", nsB)
+	recorded := func() bool {
+		got := tgt.scalar(t, countB)
+		return got != "0" && !strings.HasPrefix(got, "<")
+	}
+	for deadline := time.Now().Add(60 * time.Second); !recorded() && !run.exited() && time.Now().Before(deadline); {
+		time.Sleep(250 * time.Millisecond)
+	}
 	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("the clean stop returned %v", err)
 	}
 
 	// B as a stream started before the records existed: none for B.
-	countB := fmt.Sprintf("SELECT count(*) FROM sluice_cdc_column_order WHERE schema_name = '%s'", nsB)
-	if got := tgt.scalar(t, countB); got == "0" || strings.HasPrefix(got, "<") {
-		t.Fatalf("the cold start recorded no column order for %s (count %s) — the cell would not test the lookup", nsB, got)
+	if !recorded() {
+		t.Fatalf("the cold start recorded no column order for %s (count %s) — the cell would not test the lookup", nsB, tgt.scalar(t, countB))
 	}
 	tgt.exec(t, fmt.Sprintf("DELETE FROM sluice_cdc_column_order WHERE schema_name = '%s'", nsB))
 	if got := tgt.scalar(t, countB); got != "0" {

@@ -732,7 +732,11 @@ func TestPhase2e_PG_StreamerHarness_RestartResumeAfterBoundary(t *testing.T) {
 	// Phase C — clean shutdown of shard_a.
 	cancelA()
 	select {
-	case <-runErrA:
+	case err := <-runErrA:
+		// Logged, not judged: an attempt that ends owing an added-column
+		// backfill returns (and records) ADD-COLUMN-BACKFILL-INCOMPLETE, which
+		// a phase D failure must be read against.
+		t.Logf("phase C: shard_a's Run returned %v; control row: %s", err, phase2eControlRow(t, h.targetDSN, phase2eStreamID(0)))
 	case <-time.After(15 * time.Second):
 		t.Fatal("phase C: shard_a's Run did not return after cancel")
 	}
