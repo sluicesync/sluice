@@ -445,8 +445,14 @@ func (s *Streamer) resumeStoppedColdStartFromVerifiedState(
 	// landing on this write must not be the reason the durability record
 	// is missing — that is the wedge this whole file exists to undo.
 	if pw, ok := applier.(ir.PositionWriter); ok {
+		// The ids the identity gate verified, re-read after the index and
+		// constraint phases (which can take hours): a table re-created in
+		// that window refuses rather than being certified (coldstart_copy_identity.go).
 		copied := migcore.TableNamesForPublication(schema)
-		ids := s.establishedIDs(ctx, copied)
+		ids, idErr := s.anchorTableIDs(ctx, copied)
+		if idErr != nil {
+			return nil, nil, true, idErr
+		}
 		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
 		writeErr := writeColdStartAnchor(anchorCtx, pw, streamID, anchor, copied, ids)
 		anchorCancel()

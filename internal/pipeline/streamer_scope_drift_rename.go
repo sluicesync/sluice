@@ -300,6 +300,27 @@ func (a *AddTable) tableIdentity(ctx context.Context) string {
 	return ids[a.TableName]
 }
 
+// verifiedTableIdentity is the id the add records for its table: on a
+// source whose ids are proof, the id its copy started with, re-read now, and
+// refused if it moved — the table was re-created between its copy and this
+// record, so the target holds the old table's rows
+// (coldstart_copy_identity.go). On any other source a fresh read, as
+// before.
+func (a *AddTable) verifiedTableIdentity(ctx context.Context) (string, error) {
+	now := a.tableIdentity(ctx)
+	reader, ok := a.Source.(ir.TableIdentityReader)
+	if !ok || !reader.TableIdentitySurvivesRebuild() {
+		return now, nil
+	}
+	if a.copyTimeID != "" && now != "" && now != a.copyTimeID {
+		return "", fmt.Errorf("pipeline: add-table: %s: %q is no longer the table this add copied (copied as id %s, now id %s): "+
+			"dropped and re-created under the same name (or swapped) during the add, so the target holds the old table's "+
+			"rows. The add is not recorded complete. Empty the target table and run `sluice schema add-table` for it again", // remedy-partial: the operator's own add-table invocation carries their DSNs and flags
+			TableIdentityChangedMarker, a.TableName, a.copyTimeID, now)
+	}
+	return a.copyTimeID, nil
+}
+
 // checkRenamedOnTarget sorts each matched rename by whether the target was
 // renamed too: it holds the new name AND no longer holds the old one — what
 // the runbook's rename of both sides leaves. A target holding the new name

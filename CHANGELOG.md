@@ -4,6 +4,15 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stopped cold start's resume, and every cold start's CDC anchor, now prove each table is the one the copy made (RESUMED-COLD-START-CERTIFIES-RECREATED-TABLE, HIGH, silent; measured; present since v0.149.0).** On a Postgres source, a table dropped and re-created under the same name while a stopped cold start waited was treated as already copied by the re-run (`COLD-START-RESUMED`). Under a `FOR ALL TABLES` publication the target kept the old table's rows, missed the new one's, and took its later changes onto the old copy, at exit 0, and nothing refused afterwards. The same held for a table re-created between any cold start's copy and its CDC anchor, which recorded the new table's id. Each table's `pg_class.oid` is now read when its copy starts, carried in the recorded copy and checked at the resume and at the anchor; a difference refuses with `TABLE-IDENTITY-CHANGED` naming the table and both ids. `schema add-table` checks its table the same way before recording the add complete. `VACUUM FULL`, `CLUSTER`, `TRUNCATE` and rewriting `ALTER`s keep the oid and do not refuse.
+
+### Compatibility
+
+- **A stopped cold start recorded by v0.163.0 or earlier does not resume on this release.** Its recorded copy carries no table ids, so the re-run cannot prove the tables are the ones copied; it refuses on the existing slot instead, as before v0.149.0, and needs a re-copy.
+- **Downgrading loses the check.** A cold start stopped under this release and re-run on v0.163.0 or earlier resumes without comparing table ids (the older binary ignores them), with the silent outcome above for a table re-created while stopped. Re-run a stopped cold start on this release or later.
+
 ## [0.163.0] - 2026-10-19
 
 ### Fixed

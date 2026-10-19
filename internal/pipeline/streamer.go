@@ -1616,6 +1616,9 @@ type Streamer struct {
 	// lane copied, recorded when its branch of phaseOpenChangeStream returns.
 	scopeDriftDoorDone   bool
 	coldStartEstablished []string
+	// coldStartIDs are the table ids a cold-start lane's copy started with
+	// and the ids its anchor verified against them (coldstart_copy_identity.go).
+	coldStartIDs coldStartIdentities
 	// scopeDriftGone: the established tables the current door found gone
 	// from the source, for the refusal's rename hint.
 	scopeDriftGone []string

@@ -292,6 +292,8 @@ type AddTable struct {
 	// pendingToken identifies this run's pending entry; every later write to
 	// it compares-and-sets on it ([ir.PendingAddedTablesStore]).
 	pendingToken string
+	// copyTimeID is the table's engine id when its copy started.
+	copyTimeID string
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -586,6 +588,9 @@ func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, p
 	if err != nil {
 		return err
 	}
+	// The table's id as its copy starts, verified when the add is recorded
+	// complete (coldstart_copy_identity.go).
+	a.copyTimeID = a.tableIdentity(ctx)
 	defer func() {
 		_ = stream.Close()
 		if tempSlot != "" {

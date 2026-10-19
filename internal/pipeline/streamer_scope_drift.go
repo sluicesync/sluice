@@ -1017,7 +1017,7 @@ func (s *Streamer) recordColdStartEstablished(ctx context.Context, applier ir.Ch
 		return
 	}
 	if store, ok := applier.(ir.EstablishedTablesStore); ok {
-		if err := recordEstablishedAfterCopy(ctx, store, streamID, keys, s.establishedIDs(ctx, keys), s.sourceTableKeys); err != nil {
+		if err := recordEstablishedAfterCopy(ctx, store, streamID, keys, s.recordedTableIDs(ctx, keys), s.sourceTableKeys); err != nil {
 			if rec, rerr := store.ReadEstablishedRecord(ctx, streamID); rerr == nil && !rec.Recorded {
 				// A first cold start on a control table this role cannot
 				// ALTER: there never was a record, and there still is none.

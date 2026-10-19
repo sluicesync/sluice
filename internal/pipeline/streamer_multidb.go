@@ -169,7 +169,13 @@ func (s *Streamer) persistMultiDatabaseAnchor(ctx context.Context, applier ir.Ch
 		)
 		return nil
 	}
-	if err := writeColdStartAnchor(ctx, pw, streamID, pos, copied, s.establishedIDs(ctx, copied)); err != nil {
+	// A MySQL-family fan-out: its ids are not proof, so this records a fresh
+	// read, as before (coldstart_copy_identity.go).
+	ids, err := s.anchorTableIDs(ctx, copied)
+	if err != nil {
+		return err
+	}
+	if err := writeColdStartAnchor(ctx, pw, streamID, pos, copied, ids); err != nil {
 		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: persist multi-database cold-start CDC anchor position: %w", err))
 	}
 	slog.DebugContext(

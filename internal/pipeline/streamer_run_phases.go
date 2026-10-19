@@ -713,6 +713,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 	// Set by whichever cold-start lane copies (coldStart, the fan-out, the
 	// stopped-cold-start resume) and recorded below once the branch returns.
 	s.coldStartEstablished = nil
+	s.coldStartIDs = coldStartIdentities{}
 	defer func() {
 		if err == nil && changes != nil {
 			s.scopeDriftDoorDone = true

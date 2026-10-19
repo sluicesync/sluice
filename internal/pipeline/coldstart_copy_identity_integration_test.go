@@ -47,6 +47,106 @@ func TestResumeTableIdentity_PgoutputRecreatedWhileStoppedRefuses(t *testing.T) 
 	}
 }
 
+// recreateBeforeTheAnchor re-creates kx on the source from the window
+// between a cold start's copy and its anchor's id re-read, once.
+func recreateBeforeTheAnchor(t *testing.T, r anchorRig) {
+	t.Helper()
+	fired := false
+	coldStartBeforeAnchorIDsForTest = func() {
+		if fired {
+			return
+		}
+		fired = true
+		r.applySrc(`DROP TABLE kx; CREATE TABLE kx (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO kx VALUES (7, 'new7');
+			DROP PUBLICATION IF EXISTS sluice_pub; CREATE PUBLICATION sluice_pub FOR ALL TABLES`)
+	}
+	t.Cleanup(func() { coldStartBeforeAnchorIDsForTest = nil })
+}
+
+// requireRefusedNotCertified requires err to be the anchor's
+// TABLE-IDENTITY-CHANGED refusal naming kx, and the record not to carry
+// kx's new id.
+func requireRefusedNotCertified(t *testing.T, r anchorRig, err error) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "TABLE-IDENTITY-CHANGED") || !strings.Contains(err.Error(), "kx (copied as id") {
+		t.Fatalf("a table re-created between the copy and the anchor: %v; want TABLE-IDENTITY-CHANGED naming kx", err)
+	}
+	now := pgQueryOne[string](t, r.src, "SELECT 'kx'::regclass::oid::text")
+	if rec := r.record(); rec.IDs["kx"] == now {
+		t.Fatalf("the record certified the re-created kx's id %s: %+v", now, rec)
+	}
+}
+
+// TestCopyIdentity_PgoutputRecreatedBeforeTheAnchorRefuses: the fresh cold
+// start re-reads its tables' ids at the anchor (FOR ALL TABLES, the shape
+// that would stream the new table onto the old copy).
+func TestCopyIdentity_PgoutputRecreatedBeforeTheAnchorRefuses(t *testing.T) {
+	r := pgAnchorRig(t)
+	recreateBeforeTheAnchor(t, r)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	requireRefusedNotCertified(t, r, r.run("k*").Run(ctx))
+}
+
+// TestCopyIdentity_PgoutputRecreatedBeforeTheResumeAnchorRefuses: the
+// resume's anchor runs after its index and constraint phases, hours after
+// the identity gate on a large table; a table re-created in between refuses.
+func TestCopyIdentity_PgoutputRecreatedBeforeTheResumeAnchorRefuses(t *testing.T) {
+	r := pgAnchorRig(t)
+	r.stopInIndexBuildAfterCopies(r.run("k*"), 2)
+	recreateBeforeTheAnchor(t, r)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	requireRefusedNotCertified(t, r, r.run("k*").Run(ctx))
+}
+
+// TestResumeTableIdentity_PgoutputRenameSwapWhileStoppedRefuses: kx and kd
+// swapped names (through a temporary one) while stopped; each name now holds
+// the other table's id, and the resume refuses naming both.
+func TestResumeTableIdentity_PgoutputRenameSwapWhileStoppedRefuses(t *testing.T) {
+	r := pgAnchorRig(t)
+	r.stopInIndexBuildAfterCopies(r.run("k*"), 2)
+	r.applySrc(`ALTER TABLE kx RENAME TO ktmp; ALTER TABLE kd RENAME TO kx; ALTER TABLE ktmp RENAME TO kd`)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	err := r.run("k*").Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "TABLE-IDENTITY-CHANGED") ||
+		!strings.Contains(err.Error(), "kd (copied as id") || !strings.Contains(err.Error(), "kx (copied as id") {
+		t.Fatalf("a rename swap while stopped: %v; want TABLE-IDENTITY-CHANGED naming kd and kx", err)
+	}
+}
+
+// TestResumeTableIdentity_PgoutputTruncateWhileStoppedConverges: a source
+// TRUNCATE keeps the oid, so the resume proceeds, and the TRUNCATE itself
+// is on the slot after the anchor, so the target converges to the source.
+func TestResumeTableIdentity_PgoutputTruncateWhileStoppedConverges(t *testing.T) {
+	r := pgAnchorRig(t)
+	r.stopInIndexBuildAfterCopies(r.run("k*"), 2)
+	r.applySrc(`TRUNCATE kx; INSERT INTO kx VALUES (3, 'after')`)
+	logs := captureSlog(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.run("k*").Run(ctx) }()
+	deadline := time.Now().Add(2 * time.Minute)
+	got := ""
+	for time.Now().Before(deadline) {
+		if got = pgQueryOne[string](t, r.tgt, "SELECT coalesce(string_agg(id||':'||e, ',' ORDER BY id), '') FROM kx"); got == "3:after" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("the resumed run after a source TRUNCATE: %v", err)
+	}
+	if !strings.Contains(logs.String(), coldStartResumedMarker) {
+		t.Fatal("a resume after a source TRUNCATE did not resume")
+	}
+	if got != "3:after" {
+		t.Fatalf("after a source TRUNCATE while stopped the target kx is %q; want the source's 3:after", got)
+	}
+}
+
 // TestResumeTableIdentity_PgoutputVacuumFullWhileStoppedResumes is the
 // no-false-refusal half: VACUUM FULL rewrites the table (a new relfilenode)
 // and keeps its oid, so the resume still proves kx is the table it copied.

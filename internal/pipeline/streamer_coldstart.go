@@ -218,6 +218,9 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	if err != nil {
 		return nil, stop, err
 	}
+	// The ids of the tables this copy is about to make, carried into the
+	// recorded copy and the anchor (coldstart_copy_identity.go).
+	s.captureCopyIdentities(ctx, snapshotTables)
 
 	// Roadmap item 115: register this stream in the SOURCE's change-log
 	// consumer registry NOW — before the bulk copy, not after it. The CDC
@@ -1315,7 +1318,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 		// (A0909-STOP-1).
 		anchorRec = ir.SnapshotAnchorRecord{
 			Anchor:    stream.Position.Token,
-			CopyShape: s.withCopyTableIDs(ctx, coldStartCopyShape(s, schema), schema),
+			CopyShape: s.withCopyTableIDs(coldStartCopyShape(s, schema), schema),
 		}
 	}
 	rc, closeRecording := s.openColdStartRecording(ctx, streamID, anchorRec)
@@ -1535,9 +1538,14 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// [coldStartAnchorWriteTimeout] for why that is the whole point of
 	// this write and not a detail.
 	if pw, ok := applier.(ir.PositionWriter); ok {
-		// The copy's table ids ride the anchor's record (R9c), read before
-		// the uncancellable write; best-effort, like the full record's.
-		anchorIDs := s.establishedIDs(ctx, s.coldStartEstablished)
+		// The copy's table ids ride the anchor's record (R9c): the ids the
+		// copy started with, re-read here, and a table whose id moved since
+		// refuses (coldstart_copy_identity.go). Before the uncancellable write.
+		anchorIDs, idErr := s.anchorTableIDs(ctx, s.coldStartEstablished)
+		if idErr != nil {
+			_ = stream.Abandon()
+			return nil, stop, idErr
+		}
 		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
 		err := writeColdStartAnchor(anchorCtx, pw, streamID, stream.Position, s.coldStartEstablished, anchorIDs)
 		anchorCancel()
