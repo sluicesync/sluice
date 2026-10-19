@@ -432,6 +432,34 @@ func waitForPersistedPositions(t *testing.T, dsn string, streamIDs []string, tim
 	return false
 }
 
+// waitForPhase2eBackfillSettled waits until the target holds wantRows users
+// rows and streamID's control row carries no unforwarded_refusal — the
+// added-column ledger's write-ahead record cleared, which it is only once
+// every backfill it covered is proven durable. The row count is what makes
+// an empty record mean "cleared" rather than "not yet written".
+func waitForPhase2eBackfillSettled(t *testing.T, dsn, streamID string, wantRows int, timeout time.Duration) bool {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = db.Close() }()
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
+		if pollRowCount(dsn, "users") < wantRows {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var refusal sql.NullString
+		err := db.QueryRowContext(ctx,
+			`SELECT unforwarded_refusal FROM "public"."sluice_cdc_state" WHERE stream_id = $1`, streamID).Scan(&refusal)
+		cancel()
+		if err == nil && refusal.String == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // phase2eControlRow renders a stream's control row — its persisted
 // position and any recorded refusal — for a failure message. Diagnostic
 // only: a read error is rendered, never fatal.
@@ -727,6 +755,23 @@ func TestPhase2e_PG_StreamerHarness_RestartResumeAfterBoundary(t *testing.T) {
 		cancelA()
 		<-runErrA
 		t.Fatal("phase B: lease not applied before restart — precondition failed")
+	}
+
+	// The shutdown below is meant to come AFTER the boundary, and the waits
+	// above do not prove shard_a got there: the column and a persisted
+	// position can both come from shard_b (when it holds the lease), with
+	// shard_a still behind its own boundary. A cancel in shard_a's
+	// backfill ends the attempt ADD-COLUMN-BACKFILL-INCOMPLETE, recorded,
+	// and every restart refuses (CI -race run 39301942256). So wait until
+	// shard_a's backfill is provably durable: its post-DDL trigger row is on
+	// the target (it follows the backfill in shard_a's channel), and its
+	// ledger has cleared the write-ahead record (cleared only once the
+	// applier's persisted position is past the backfill).
+	if !waitForPhase2eBackfillSettled(t, h.targetDSN, phase2eStreamID(0), 4, 60*time.Second) {
+		cancelA()
+		<-runErrA
+		t.Fatalf("phase B: shard_a's backfill never settled (target rows %d; shard_a control row: %s)",
+			pollRowCount(h.targetDSN, "users"), phase2eControlRow(t, h.targetDSN, phase2eStreamID(0)))
 	}
 
 	// Phase C — clean shutdown of shard_a.
