@@ -1535,8 +1535,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// [coldStartAnchorWriteTimeout] for why that is the whole point of
 	// this write and not a detail.
 	if pw, ok := applier.(ir.PositionWriter); ok {
+		// The copy's table ids ride the anchor's record (R9c), read before
+		// the uncancellable write; best-effort, like the full record's.
+		anchorIDs := s.establishedIDs(ctx, s.coldStartEstablished)
 		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
-		err := writeColdStartAnchor(anchorCtx, pw, streamID, stream.Position, s.coldStartEstablished)
+		err := writeColdStartAnchor(anchorCtx, pw, streamID, stream.Position, s.coldStartEstablished, anchorIDs)
 		anchorCancel()
 		if err != nil {
 			_ = stream.Abandon()

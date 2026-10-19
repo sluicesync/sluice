@@ -419,16 +419,20 @@ func ColdStartAnchor(ctx context.Context, t *testing.T, store Store) {
 	if rec := readOf("anchor-plain"); rec.Recorded {
 		t.Fatalf("a plain position write marked the record: %+v", rec)
 	}
-	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"kd", "kx"}); err != nil {
+	// R9c: the copy's ids ride the anchor, a multi-database entry included.
+	copied := []string{"kd", "kx", "app\x00orders"}
+	ids := map[string]string{"kd": "16391", "app\x00orders": "4294967295"}
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, copied, ids); err != nil {
 		t.Fatal(err)
 	}
-	if rec := readOf("anchor-new"); !rec.Recorded || rec.ColdStartInProgress || !reflect.DeepEqual(rec.Established, []string{"kd", "kx"}) {
-		t.Fatalf("a first cold start's anchor left the record %+v; want established [kd kx]", rec)
+	if rec := readOf("anchor-new"); !rec.Recorded || rec.ColdStartInProgress ||
+		!reflect.DeepEqual(rec.Established, []string{"app\x00orders", "kd", "kx"}) || !reflect.DeepEqual(rec.IDs, ids) {
+		t.Fatalf("a first cold start's anchor left the record %+v; want established %q with ids %v", rec, copied, ids)
 	}
 	if err := store.RecordEstablishedTables(ctx, "anchor-new", []string{"kd"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"zz"}); err != nil {
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"zz"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if rec := readOf("anchor-new"); !reflect.DeepEqual(rec.Established, []string{"kd"}) {
@@ -437,11 +441,21 @@ func ColdStartAnchor(ctx context.Context, t *testing.T, store Store) {
 	if err := store.BeginColdStartRecord(ctx, "anchor-new"); err != nil {
 		t.Fatal(err)
 	}
-	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"zz"}); err != nil {
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"zz"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if rec := readOf("anchor-new"); !rec.ColdStartInProgress {
 		t.Fatalf("an anchor over a later cold start's in-progress mark replaced it: %+v", rec)
+	}
+	// An empty copy is a recorded fact: established nothing.
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-empty", pos, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if rec := readOf("anchor-empty"); !rec.Recorded || len(rec.Established) != 0 || rec.ColdStartInProgress {
+		t.Fatalf("an empty copy's anchor left the record %+v; want recorded, established nothing", rec)
+	}
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-bad-id", pos, []string{"kd"}, map[string]string{"kd": "1x"}); err == nil {
+		t.Fatal("a non-decimal id rode the anchor")
 	}
 }
 

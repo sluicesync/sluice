@@ -438,12 +438,17 @@ func (s *Streamer) resumeStoppedColdStartFromVerifiedState(
 	// landing on this write must not be the reason the durability record
 	// is missing — that is the wedge this whole file exists to undo.
 	if pw, ok := applier.(ir.PositionWriter); ok {
+		copied := migcore.TableNamesForPublication(schema)
+		ids := s.establishedIDs(ctx, copied)
 		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
-		writeErr := writeColdStartAnchor(anchorCtx, pw, streamID, anchor, migcore.TableNamesForPublication(schema))
+		writeErr := writeColdStartAnchor(anchorCtx, pw, streamID, anchor, copied, ids)
 		anchorCancel()
 		if writeErr != nil {
 			return nil, nil, true, migcore.WrapWithHint(migcore.PhaseCDC,
 				fmt.Errorf("pipeline: persist resumed cold-start CDC anchor position: %w", writeErr))
+		}
+		if coldStartAnchorWrittenForTest != nil {
+			coldStartAnchorWrittenForTest()
 		}
 	} else {
 		slog.WarnContext(ctx, "applier does not implement ir.PositionWriter; the resumed cold start's CDC "+

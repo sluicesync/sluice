@@ -110,9 +110,19 @@ type TableIdentityReader interface {
 // with no record — judged like one an older release cold-started, which the
 // scope door convicts almost nothing on. A row that already has a record is
 // left alone. An applier without it gets a plain [PositionWriter] write.
+//
+// ids holds each copied entry's engine-stable table id where the source has
+// one (R9c): a warm resume after a stop at the anchor never reaches the full
+// record write, and a record without ids leaves the identity check
+// (TABLE-IDENTITY-CHANGED) nothing to compare.
 type ColdStartAnchorWriter interface {
-	WriteColdStartAnchor(ctx context.Context, streamID string, pos Position, copied []string) error
+	WriteColdStartAnchor(ctx context.Context, streamID string, pos Position, copied []string, ids map[string]string) error
 }
+
+// ColdStartAnchorUnrecordedMarker is the WARN a cold start's anchor logs when
+// the record's columns cannot be added, so the anchor is written without the
+// record of its copy (R9c).
+const ColdStartAnchorUnrecordedMarker = "COLD-START-ANCHOR-UNRECORDED"
 
 // LiveAddedTableRetirer is the optional applier surface the running
 // stream's LIVE-ADDED-TABLE-EXCLUDED refusal writes through (Bug 321 R8):

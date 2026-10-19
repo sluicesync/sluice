@@ -1153,14 +1153,20 @@ var _ ir.ColdStartAnchorWriter = (*ChangeApplier)(nil)
 // record of a row that has none yet (Bug 321 R9b; see the Postgres
 // applier's for the window it closes). Where the record's columns cannot be
 // added, the anchor is written alone.
-func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position, copied []string) error {
-	if a.ensureTableSetColumns(ctx, streamID) != nil {
+func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position, copied []string, ids map[string]string) error {
+	if err := appliershared.ValidateTableIDs(ids); err != nil {
+		return fmt.Errorf("mysql: applier: record the cold start's copy with its anchor: %w", err)
+	}
+	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
+		slog.WarnContext(ctx, ir.ColdStartAnchorUnrecordedMarker+": the record's columns could not be added, so the cold "+
+			"start's anchor is written without the record of its copy; until a cold start records one, the stream is "+
+			"judged as having no record", slog.String("stream_id", streamID), slog.String("error", err.Error()))
 		return a.writePositionWith(ctx, streamID, pos, nil)
 	}
 	record := "UPDATE " + controlTableRef(a.controlKeyspace, controlTableName) + " SET " + appliershared.EstablishedTablesColumn +
 		" = ? WHERE stream_id = ? AND " + appliershared.EstablishedTablesColumn + " IS NULL"
 	return a.writePositionWith(ctx, streamID, pos, func(ctx context.Context, tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, record, appliershared.EncodeTableSet(copied), streamID); err != nil {
+		if _, err := tx.ExecContext(ctx, record, appliershared.EncodeTableSetIDs(copied, ids), streamID); err != nil {
 			return fmt.Errorf("mysql: applier: record the cold start's copy with its anchor: %w", err)
 		}
 		return nil

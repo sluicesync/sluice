@@ -156,6 +156,33 @@ func (s *Streamer) resolveStreamDatabases(ctx context.Context) (selected []strin
 	return selected, inScope, nil
 }
 
+// persistMultiDatabaseAnchor is the multi-database cold start's step 5: the
+// stream's one CDC anchor, written BEFORE the first CDC batch (GitHub #15)
+// and carrying every selected namespace's copied tables — NUL-namespaced
+// keys, with their ids — as the established record (Bug 321 R9b/R9c).
+func (s *Streamer) persistMultiDatabaseAnchor(ctx context.Context, applier ir.ChangeApplier, streamID string, pos ir.Position, copied []string) error {
+	pw, ok := applier.(ir.PositionWriter)
+	if !ok {
+		slog.WarnContext(
+			ctx, "applier does not implement ir.PositionWriter; multi-database cold-start CDC anchor cannot be persisted — GitHub issue #15 wedge risk",
+			slog.String("stream_id", streamID),
+		)
+		return nil
+	}
+	if err := writeColdStartAnchor(ctx, pw, streamID, pos, copied, s.establishedIDs(ctx, copied)); err != nil {
+		return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: persist multi-database cold-start CDC anchor position: %w", err))
+	}
+	slog.DebugContext(
+		ctx, "multi-database cold-start CDC anchor persisted",
+		slog.String("stream_id", streamID),
+		slog.String("position_token", pos.Token),
+	)
+	if coldStartAnchorWrittenForTest != nil {
+		coldStartAnchorWrittenForTest()
+	}
+	return nil
+}
+
 // coldStartMultiDatabase is the ADR-0074 Phase 1b.2 multi-database
 // cold-start. Shape:
 //
@@ -408,21 +435,9 @@ func (s *Streamer) coldStartMultiDatabase(
 	// BEFORE the first CDC batch so a crash in the handoff window can
 	// warm-resume rather than wedge). One position for the whole stream —
 	// the binlog coordinate is server-wide. ----
-	if pw, ok := applier.(ir.PositionWriter); ok {
-		if err := writeColdStartAnchor(ctx, pw, streamID, stream.Position, establishedKeysOf(readerSeed)); err != nil {
-			abandonStream()
-			return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: persist multi-database cold-start CDC anchor position: %w", err))
-		}
-		slog.DebugContext(
-			ctx, "multi-database cold-start CDC anchor persisted",
-			slog.String("stream_id", streamID),
-			slog.String("position_token", stream.Position.Token),
-		)
-	} else {
-		slog.WarnContext(
-			ctx, "applier does not implement ir.PositionWriter; multi-database cold-start CDC anchor cannot be persisted — GitHub issue #15 wedge risk",
-			slog.String("stream_id", streamID),
-		)
+	if err := s.persistMultiDatabaseAnchor(ctx, applier, streamID, stream.Position, establishedKeysOf(readerSeed)); err != nil {
+		abandonStream()
+		return nil, stop, err
 	}
 	// Every selected namespace's tables are copied under that anchor: the established set.
 	s.coldStartEstablished = establishedKeysOf(readerSeed)

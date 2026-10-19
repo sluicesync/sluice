@@ -1264,14 +1264,20 @@ var _ ir.ColdStartAnchorWriter = (*ChangeApplier)(nil)
 // cold start, marked in progress before its copy) is left alone. Where the
 // record's columns cannot be added (a role that cannot ALTER the control
 // table), the anchor is written alone, as before.
-func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position, copied []string) error {
-	if a.ensureTableSetColumns(ctx, streamID) != nil {
+func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position, copied []string, ids map[string]string) error {
+	if err := appliershared.ValidateTableIDs(ids); err != nil {
+		return fmt.Errorf("postgres: applier: record the cold start's copy with its anchor: %w", err)
+	}
+	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
+		slog.WarnContext(ctx, ir.ColdStartAnchorUnrecordedMarker+": the record's columns could not be added, so the cold "+
+			"start's anchor is written without the record of its copy; until a cold start records one, the stream is "+
+			"judged as having no record", slog.String("stream_id", streamID), slog.String("error", err.Error()))
 		return a.writePositionWith(ctx, streamID, pos, nil)
 	}
 	record := "UPDATE " + controlTableRef(a.controlSchema) + " SET " + appliershared.EstablishedTablesColumn +
 		" = $1 WHERE stream_id = $2 AND " + appliershared.EstablishedTablesColumn + " IS NULL"
 	return a.writePositionWith(ctx, streamID, pos, func(ctx context.Context, tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, record, appliershared.EncodeTableSet(copied), streamID); err != nil {
+		if _, err := tx.ExecContext(ctx, record, appliershared.EncodeTableSetIDs(copied, ids), streamID); err != nil {
 			return fmt.Errorf("postgres: applier: record the cold start's copy with its anchor: %w", err)
 		}
 		return nil

@@ -980,9 +980,9 @@ func beginColdStartRecord(ctx context.Context, applier ir.ChangeApplier, streamI
 // full record (ids, the dropped set) follows in recordColdStartEstablished.
 // The three anchor sites — the cold start, the stopped-cold-start resume and
 // the multi-database fan-out — all write through here.
-func writeColdStartAnchor(ctx context.Context, pw ir.PositionWriter, streamID string, pos ir.Position, copied []string) error {
+func writeColdStartAnchor(ctx context.Context, pw ir.PositionWriter, streamID string, pos ir.Position, copied []string, ids map[string]string) error {
 	if aw, ok := pw.(ir.ColdStartAnchorWriter); ok {
-		return aw.WriteColdStartAnchor(ctx, streamID, pos, copied)
+		return aw.WriteColdStartAnchor(ctx, streamID, pos, copied, ids)
 	}
 	return pw.WritePosition(ctx, streamID, pos)
 }
