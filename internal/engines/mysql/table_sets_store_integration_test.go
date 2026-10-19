@@ -353,3 +353,22 @@ func TestTableIdentities_SurviveRename(t *testing.T) {
 		t.Fatalf("an INSTANT ADD COLUMN changed TABLE_ID %s → %s", prev, got["t8b"])
 	}
 }
+
+// TestColdStartAnchor_MarksAFirstColdStart runs [tablesetstest.ColdStartAnchor]
+// (Bug 321 R9b) on a control table the applier creates itself.
+func TestColdStartAnchor_MarksAFirstColdStart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, cleanup := startMySQLForApplier(t)
+	t.Cleanup(cleanup)
+	applyMySQLApplier(t, dsn, "DROP TABLE IF EXISTS `sluice_cdc_state`")
+	for _, st := range (Engine{Flavor: FlavorVanilla}).ControlTableDDL() {
+		applyMySQLApplier(t, dsn, st.DDL)
+	}
+	applier, err := Engine{Flavor: FlavorVanilla}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = applier.(interface{ Close() error }).Close() }()
+	tablesetstest.ColdStartAnchor(ctx, t, applier.(tablesetstest.Store))
+}

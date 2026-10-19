@@ -240,6 +240,25 @@ func TestTableSetsStore_NarrowingOnAControlTableThisRoleCannotAlter(t *testing.T
 	}
 }
 
+// TestColdStartAnchor_MarksAFirstColdStart runs [tablesetstest.ColdStartAnchor]
+// (Bug 321 R9b) on a control table the applier creates itself.
+func TestColdStartAnchor_MarksAFirstColdStart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, cleanup := startPostgresForApplier(t)
+	t.Cleanup(cleanup)
+	applyPGApplier(t, dsn, `DROP TABLE IF EXISTS "public"."sluice_cdc_state"`)
+	for _, st := range (Engine{}).ControlTableDDL() {
+		applyPGApplier(t, dsn, st.DDL)
+	}
+	applier, err := Engine{}.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = applier.(interface{ Close() error }).Close() }()
+	tablesetstest.ColdStartAnchor(ctx, t, applier.(tablesetstest.Store))
+}
+
 // TestTableIdentities_SurviveRename is Bug 321 R6's premise on a real
 // server: pg_class.oid survives ALTER TABLE … RENAME, and a table dropped and
 // re-created under the new name gets a different one.

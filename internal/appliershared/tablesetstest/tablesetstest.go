@@ -392,6 +392,50 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	retireLiveAdded(ctx, t, store, read, recordPending, complete)
 }
 
+// ColdStartAnchor is Bug 321 R9b: a cold start's anchor write marks a stream
+// with no record cold-start-in-progress in its own transaction (a first
+// cold start has no row to mark before it), leaves an existing record
+// alone, and a plain position write (broker, migrate checkpoint) marks
+// nothing.
+func ColdStartAnchor(ctx context.Context, t *testing.T, store Store) {
+	t.Helper()
+	aw, ok := store.(ir.ColdStartAnchorWriter)
+	pw, pok := store.(ir.PositionWriter)
+	if !ok || !pok {
+		t.Fatal("the store does not write cold-start anchors (ir.ColdStartAnchorWriter / ir.PositionWriter)")
+	}
+	pos := ir.Position{Token: `{"anchor":1}`}
+	readOf := func(stream string) ir.EstablishedRecord {
+		t.Helper()
+		rec, err := store.ReadEstablishedRecord(ctx, stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rec
+	}
+	if err := pw.WritePosition(ctx, "anchor-plain", pos); err != nil {
+		t.Fatal(err)
+	}
+	if rec := readOf("anchor-plain"); rec.Recorded {
+		t.Fatalf("a plain position write marked the record: %+v", rec)
+	}
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos); err != nil {
+		t.Fatal(err)
+	}
+	if rec := readOf("anchor-new"); !rec.ColdStartInProgress {
+		t.Fatalf("a first cold start's anchor left the record %+v; want cold start in progress", rec)
+	}
+	if err := store.RecordEstablishedTables(ctx, "anchor-new", []string{"kd"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos); err != nil {
+		t.Fatal(err)
+	}
+	if rec := readOf("anchor-new"); rec.ColdStartInProgress || !reflect.DeepEqual(rec.Established, []string{"kd"}) {
+		t.Fatalf("an anchor over an existing record changed it: %+v", rec)
+	}
+}
+
 // retireStore is a [Store] that also keeps the live-added set and retires
 // from it ([ir.LiveAddedTableRetirer]) — both shipping appliers.
 type retireStore interface {
