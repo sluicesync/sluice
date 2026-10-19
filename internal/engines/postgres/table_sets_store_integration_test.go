@@ -9,10 +9,13 @@ import (
 	"context"
 	"database/sql"
 	"net/url"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/appliershared/tablesetstest"
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -132,6 +135,65 @@ func TestTableSetsStore_RefusesANarrowColumn(t *testing.T) {
 	err = applier.(tablesetstest.Store).RecordEstablishedTables(ctx, "s1", []string{"orders"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "ALTER COLUMN established_tables TYPE TEXT") {
 		t.Fatalf("a VARCHAR(40) established_tables: %v; want the refusal naming the ALTER", err)
+	}
+}
+
+// TestLiveAddedTables_RawRoundTripAndNarrowColumn is Bug 321 R9 on a real
+// server: Postgres's live_added_tables (the table-set codec) round-trips
+// names a comma list could not hold — a comma, a TAB, a NUL, a newline,
+// unicode, edge spaces — checked against the raw column read with the test's
+// own SQL; and a pre-existing narrow live_added_tables is refused, naming the
+// ALTER (S-4).
+func TestLiveAddedTables_RawRoundTripAndNarrowColumn(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dsn, applier := tableSetsStoreFixture(ctx, t)
+	ca := applier.(*ChangeApplier)
+	names := []string{"a,b", "tab\there", "nul\x00byte", "line\nbreak", "naïve_表😀", " padded "}
+	for _, n := range names {
+		if err := ca.RecordLiveAddedTable(ctx, "s1", n); err != nil {
+			t.Fatalf("record %q: %v", n, err)
+		}
+	}
+	got, err := ca.ReadLiveAddedTables(ctx, "s1")
+	want := append([]string(nil), names...)
+	sort.Strings(want)
+	sort.Strings(got)
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("live-added read back as %q, %v; want %q", got, err, want)
+	}
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var raw string
+	if err := db.QueryRowContext(ctx, `SELECT live_added_tables FROM sluice_cdc_state WHERE stream_id = 's1'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw != appliershared.EncodeTableSet(names) {
+		t.Fatalf("raw column %q; want the table-set encoding %q", raw, appliershared.EncodeTableSet(names))
+	}
+
+	dsn2, cleanup := startPostgresForApplier(t)
+	t.Cleanup(cleanup)
+	applyPGApplier(t, dsn2, `
+		DROP TABLE IF EXISTS "public"."sluice_cdc_state";
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id VARCHAR(255) NOT NULL, source_position TEXT NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, live_added_tables VARCHAR(16),
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state" (stream_id, source_position) VALUES ('s1', 'tok');
+	`)
+	narrow, err := Engine{}.OpenChangeApplier(ctx, dsn2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = narrow.(interface{ Close() error }).Close() }()
+	err = narrow.(*ChangeApplier).RecordLiveAddedTable(ctx, "s1", "orders")
+	if err == nil || !strings.Contains(err.Error(), "ALTER COLUMN live_added_tables TYPE TEXT") {
+		t.Fatalf("a VARCHAR(16) live_added_tables: %v; want the refusal naming the ALTER", err)
 	}
 }
 

@@ -168,6 +168,10 @@ var (
 	_ liveAddedTablesReader  = (*postgres.ChangeApplier)(nil)
 	_ liveAddedTablesWriter  = (*postgres.ChangeApplier)(nil)
 	_ liveAddedTablesRemover = (*postgres.ChangeApplier)(nil)
+	// Bug 321 R9 L-1: a name MySQL's comma-list set cannot hold refuses at
+	// add-table's preflight; a rename would move the refusal back after the
+	// copy.
+	_ liveAddedTableNameChecker = (*mysql.ChangeApplier)(nil)
 	// INCLUDE-TABLE-SCOPE-DRIFT (Bug 321): the warm-resume door's publication
 	// evidence. A rename would make the assertion miss and the door's pgoutput
 	// arm a no-op — the widened table streaming nothing at exit 0 again.

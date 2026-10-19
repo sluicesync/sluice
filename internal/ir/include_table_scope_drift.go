@@ -302,7 +302,9 @@ type PendingAddedTablesStore interface {
 
 	// ReadPendingAddedTables returns streamID's entries and the server's now:
 	// none when there is no row, no control table, or no column. A stored
-	// value that does not decode is an error.
+	// line that does not decode is not an error: it comes back as an entry
+	// whose [PendingAddedTable.Malformed] holds its text (never empty), so
+	// callers report it rather than fail.
 	ReadPendingAddedTables(ctx context.Context, streamID string) ([]PendingAddedTable, time.Time, error)
 }
 

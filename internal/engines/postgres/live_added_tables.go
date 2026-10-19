@@ -84,7 +84,9 @@ func (a *ChangeApplier) ensureLiveAddedColumn(ctx context.Context, streamID stri
 	if err := cdcStateTable(a.controlSchema).ensureColumns(ctx, a.db, []controlColumn{tableSetColumn(liveAddedTablesColumn)}); err != nil {
 		return fmt.Errorf("postgres: applier: record live-added table: %w", err)
 	}
-	return nil
+	// A pre-existing column of a shorter type is refused like the record's
+	// columns (R9 S-4).
+	return a.verifyTableSetColumnTypes(ctx)
 }
 
 var _ ir.LiveAddedTableRetirer = (*ChangeApplier)(nil)

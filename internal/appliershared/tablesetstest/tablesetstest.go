@@ -412,6 +412,22 @@ func retireLiveAdded(ctx context.Context, t *testing.T, store Store, read func()
 	if !ok {
 		t.Fatal("the store does not retire live-added tables (ir.LiveAddedTableRetirer)")
 	}
+	// R9 L-2: a completion that carries no id deletes the name's recorded
+	// one rather than keeping an earlier copy's.
+	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a", "st"}, map[string]string{"a": "7", "st": "99"}); err != nil {
+		t.Fatal(err)
+	}
+	recordPending("st", "tok-st")
+	if err := store.CompletePendingAddedTable(ctx, "s1", "st", "tok-st", ""); err != nil {
+		t.Fatal(err)
+	}
+	if rec := read(); rec.IDs["st"] != "" || rec.IDs["a"] != "7" {
+		t.Fatalf("after an id-less completion: ids %v; want st's stale id gone, a's kept", rec.IDs)
+	}
+	if err := store.CompletePendingAddedTable(ctx, "s1", "st", "tok-st", "1x"); err == nil {
+		t.Fatal("a non-decimal id was accepted (R9 L-4)")
+	}
+
 	if err := store.RecordEstablishedTables(ctx, "s1", []string{"a"}, map[string]string{"a": "7"}); err != nil {
 		t.Fatal(err)
 	}

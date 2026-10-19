@@ -437,6 +437,13 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 		migcore.CloseIf(sr)
 		return nil, nil, err
 	}
+	if len(s.startLiveAdded) > 0 {
+		liveAdded, present := toSet(s.startLiveAdded), map[string]bool{}
+		for _, t := range schema.Tables {
+			present[t.Name] = true
+		}
+		warnLiveAddedNotInCatalog(ctx, s.StreamID, liveAdded, present)
+	}
 	if err := migcore.PreflightTableReads(sr, schema); err != nil {
 		migcore.CloseIf(sr)
 		return nil, nil, err

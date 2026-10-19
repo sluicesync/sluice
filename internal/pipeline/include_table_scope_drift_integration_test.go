@@ -1274,6 +1274,33 @@ func TestIncludeTableScopeDrift_BinlogResetDiscardsTheAddedTable(t *testing.T) {
 	resetDiscardsTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt), nil)
 }
 
+// TestIncludeTableScopeDrift_BinlogUnholdableNameRefusesBeforeTheCopy is
+// Bug 321 R9 S-1/L-1: on a MySQL target the live-added set is a comma list
+// trimmed on read, so " t" would read back as "t" and "a,b" as two tables.
+// `schema add-table` refuses such a name at its preflight, naming the glob
+// route, before it creates, copies or records anything (it used to refuse
+// only after the copy, and to trim " t" to "t" silently).
+func TestIncludeTableScopeDrift_BinlogUnholdableNameRefusesBeforeTheCopy(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "mysql", src, tgt)
+	r.establishKD("kd")
+	r.exec(r.src, "CREATE TABLE ` t` (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO ` t` VALUES (1, 'x');"+
+		"CREATE TABLE `a,b` (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO `a,b` VALUES (1, 'x')")
+	for _, name := range []string{" t", "a,b"} {
+		code, out := r.addTable(name)
+		if code == 0 || !strings.Contains(out, "glob") {
+			t.Fatalf("schema add-table %q: exit %d, want a refusal naming the glob route\n%s", name, code, out)
+		}
+		if got := r.rows(r.tgt, "`"+name+"`", "e"); got != "<absent>" {
+			t.Fatalf("target %q = %q after the refusal; want no table — nothing changed", name, got)
+		}
+	}
+	if got, _ := r.waitScalar(r.tgt, "SELECT COALESCE(pending_added_tables, '') FROM sluice_cdc_state WHERE stream_id = 'itsd'", "", 0); got != "" {
+		t.Fatalf("pending_added_tables = %q after the refusals; want nothing recorded", got)
+	}
+}
+
 // TestIncludeTableScopeDrift_BinlogDrainedAddedTableStaysInScope is R6 A on a
 // MySQL binlog source with the drained add (no --no-drain), which never
 // recorded the live-added set before R6.

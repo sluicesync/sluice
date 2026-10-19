@@ -73,6 +73,15 @@ type liveAddedTablesWriter interface {
 	RecordLiveAddedTable(ctx context.Context, streamID, tableName string) error
 }
 
+// liveAddedTableNameChecker refuses a table name the target's live-added
+// set cannot hold faithfully (MySQL's comma list: a comma, edge whitespace).
+// `schema add-table` asks it before changing anything (Bug 321 R9 L-1).
+// A target without the constraint (Postgres's table-set codec holds any
+// name) does not implement it.
+type liveAddedTableNameChecker interface {
+	CheckLiveAddedTableName(tableName string) error
+}
+
 // liveAddedTablesRemover takes a table out of the live-added set: the
 // `schema add-table --abandon` path (Bug 321 R6 A). MySQL and Postgres
 // implement it.
@@ -559,18 +568,20 @@ func pollLiveAddedTables(pollCtx context.Context, reader liveAddedTablesReader, 
 			)
 			continue
 		}
-		joined := strings.Join(tables, ",")
-		if joined == prev {
+		// Compared as the encoded set (R9 nit): a comma join is ambiguous for
+		// Postgres names that hold a comma, so {"a,b"} and {"a","b"} matched.
+		encoded := appliershared.EncodeTableSet(tables)
+		if encoded == prev {
 			continue
 		}
-		prev = joined
+		prev = encoded
 		if !observeLiveAdded(pollCtx, check, target, tables) {
 			return
 		}
 		slog.InfoContext(
 			pollCtx, "live-added tables observed; merging into dispatch filter (ADR-0034)",
 			slog.String("stream_id", streamID),
-			slog.String("tables", joined),
+			slog.Any("tables", tables),
 		)
 	}
 }

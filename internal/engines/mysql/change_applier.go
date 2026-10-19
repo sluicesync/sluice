@@ -1110,6 +1110,21 @@ func (a *ChangeApplier) RecordLiveAddedTable(ctx context.Context, streamID, tabl
 	return recordLiveAddedTable(ctx, a.db, a.controlKeyspace, streamID, tableName)
 }
 
+// CheckLiveAddedTableName refuses, before `schema add-table` changes
+// anything, a table name this target's live_added_tables cannot hold (Bug
+// 321 R9 L-1): the record runs after the copy on a source without a
+// publication, so refusing only there left a copied table the stream never
+// applies. --include-table splits on commas too, so a glob is the only way
+// to name such a table in a stream's scope.
+func (a *ChangeApplier) CheckLiveAddedTableName(tableName string) error {
+	if err := liveAddedTableNameError(tableName); err != nil {
+		return fmt.Errorf("mysql: %w, so `schema add-table` cannot add it to a running stream on a MySQL target. To "+
+			"stream it, name it in the stream's --include-table with a glob that matches it (`?` for each comma or "+
+			"edge space, e.g. `foo?bar`) and re-copy with --restart-from-scratch, or rename the table", err)
+	}
+	return nil
+}
+
 // RemoveLiveAddedTable takes tableName out of the stream's live-added set:
 // the `--abandon` of a completed add (Bug 321 R6 A).
 func (a *ChangeApplier) RemoveLiveAddedTable(ctx context.Context, streamID, tableName string) error {

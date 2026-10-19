@@ -369,7 +369,7 @@ func controlTableDDL(controlKeyspace string) string {
 	target_schema          VARCHAR(255) NULL,
 	rows_applied           BIGINT       NOT NULL DEFAULT 0,
 	unforwarded_refusal    TEXT         NULL,
-	live_added_tables      TEXT         NULL,
+	live_added_tables      ` + liveAddedTablesColumnDef + `,
 	pending_added_tables   ` + tableSetColumnDef + `,
 	established_tables     ` + tableSetColumnDef + `,
 	dropped_tables         ` + tableSetColumnDef + `,
@@ -896,7 +896,7 @@ func wrapPositionWidenDDLError(err error, tableName, columnName, alter string) e
 // ensureStopRequestedColumn — keeps the migration portable to MySQL
 // 8.0.x versions older than 8.0.29.
 //
-// The column is TEXT NULL holding a comma-separated list of
+// The column ([liveAddedTablesColumnDef]; TEXT before R9 S-4) holds a comma-separated list of
 // unqualified source-table names that have been live-added to this
 // stream's scope. NULL on legacy rows; the orchestrator's
 // add-table --no-drain path UPSERTs the value via
@@ -913,7 +913,7 @@ func ensureLiveAddedTablesColumn(ctx context.Context, db *sql.DB, controlKeyspac
 	if n > 0 {
 		return nil
 	}
-	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN live_added_tables TEXT NULL"
+	alter := "ALTER TABLE " + controlTableRef(controlKeyspace, controlTableName) + " ADD COLUMN live_added_tables " + liveAddedTablesColumnDef
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("mysql: ensure control table: add live_added_tables: %w", wrapControlTableBootstrapError(err, alter))
 	}
@@ -1248,16 +1248,8 @@ func readLiveAddedTables(ctx context.Context, db *sql.DB, controlKeyspace, strea
 // row vanishes between preflight and write (rare; operator
 // concurrently ran sync stop --wait + delete).
 func recordLiveAddedTable(ctx context.Context, db *sql.DB, controlKeyspace, streamID, tableName string) error {
-	tableName = strings.TrimSpace(tableName)
-	if tableName == "" {
-		return errors.New("mysql: record live-added table: tableName is empty")
-	}
-	// The column is a comma list, so a name holding a comma cannot be
-	// recorded faithfully: it would read back as two other tables. Refuse
-	// rather than admit the wrong ones.
-	if strings.Contains(tableName, ",") {
-		return fmt.Errorf("mysql: record live-added table: %q contains a comma, which live_added_tables cannot hold; "+
-			"rename the table, or re-copy the stream with it named in --include-table", tableName)
+	if err := liveAddedTableNameError(tableName); err != nil {
+		return fmt.Errorf("mysql: record live-added table: %w", err)
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1360,6 +1352,31 @@ func parseLiveAddedTables(raw string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// liveAddedTableNameError refuses a table name live_added_tables cannot hold
+// faithfully. The column is a comma list read back by
+// [parseLiveAddedTables], which splits on commas and trims each piece: a
+// name with a comma would read back as two other tables, and one with
+// leading or trailing whitespace as a different, trimmed name — the
+// dispatch filter would then admit that other table and drop this one's
+// changes, silently (Bug 321 R9 S-1). The trim on read stays, for values
+// written by hand; no sluice release wrote a padded name (they trimmed at
+// record time, which is what made " t" become "t"). Engine-neutral callers
+// reach this through [ChangeApplier.CheckLiveAddedTableName], before
+// `schema add-table` changes anything.
+func liveAddedTableNameError(name string) error {
+	switch {
+	case name == "":
+		return errors.New("the table name is empty")
+	case strings.Contains(name, ","):
+		return fmt.Errorf("table %q contains a comma, which a MySQL target's live_added_tables (a comma list) "+
+			"cannot hold", name)
+	case strings.TrimSpace(name) != name:
+		return fmt.Errorf("table %q begins or ends with whitespace, which a MySQL target's live_added_tables "+
+			"(trimmed on read) cannot hold", name)
+	}
+	return nil
 }
 
 // mergeLiveAddedTables returns a sorted, deduplicated union of

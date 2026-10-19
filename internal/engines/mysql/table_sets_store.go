@@ -68,13 +68,25 @@ func (a *ChangeApplier) pendingAddQueries() appliershared.PendingAddQueries {
 	}
 }
 
-// tableSetColumnsDDL is the statement that adds all three columns, named in
-// every refusal for a missing one.
+// liveAddedTablesColumnDef is live_added_tables' declaration (R9 S-4). The
+// set is a comma list of raw table names, not the ASCII table-set codec, so
+// unlike the record's columns its character set matters: utf8mb4, or a name
+// outside latin1 / the BMP is mangled. LONGTEXT for the same reason as the
+// record's columns. v0.27.0 through v0.162.0 created it as TEXT in the
+// table's default character set.
+const liveAddedTablesColumnDef = "LONGTEXT CHARACTER SET utf8mb4 NULL"
+
+// tableSetColumnsDDL is the statement that adds the three table-set columns
+// and live_added_tables, named in every refusal for a missing one: a drained
+// add-table on a source without a publication writes live_added_tables
+// after its copy, so a control table this binary cannot ALTER must have
+// all four before anything starts (R9 addendum).
 func (a *ChangeApplier) tableSetColumnsDDL() string {
-	adds := make([]string, len(tableSetColumnNames))
-	for i, c := range tableSetColumnNames {
-		adds[i] = "ADD COLUMN `" + c + "` " + tableSetColumnDef
+	adds := make([]string, 0, len(tableSetColumnNames)+1)
+	for _, c := range tableSetColumnNames {
+		adds = append(adds, "ADD COLUMN `"+c+"` "+tableSetColumnDef)
 	}
+	adds = append(adds, "ADD COLUMN `live_added_tables` "+liveAddedTablesColumnDef)
 	return "ALTER TABLE " + controlTableRef(a.controlKeyspace, controlTableName) + " " + strings.Join(adds, ", ")
 }
 
@@ -85,14 +97,23 @@ func (a *ChangeApplier) tableSetColumnsDDL() string {
 // keeps running as before, and only the write that needs the columns fails,
 // loudly, naming the one statement that adds all three. Then their type is
 // verified.
+//
+// live_added_tables is ensured with them (R9 addendum): `schema add-table`'s
+// first write is its pending entry, before it changes anything, and on a
+// source without a publication its live_added_tables write comes after the
+// copy — so a control table missing only that column failed there, with the
+// table already copied. Ensured here, it refuses at the pending write.
 func (a *ChangeApplier) ensureTableSetColumns(ctx context.Context, streamID string) error {
 	if streamID == "" {
 		return errors.New("mysql: applier: table sets: streamID is empty")
 	}
 	for _, col := range tableSetColumnNames {
 		if err := ensureCrossEngineParityColumn(ctx, a.db, a.controlKeyspace, col, tableSetColumnDef); err != nil {
-			return fmt.Errorf("%w (the three table-set columns are added together; to add them by hand: %s)", err, a.tableSetColumnsDDL())
+			return fmt.Errorf("%w (the table-set columns and live_added_tables are added together; to add them by hand: %s)", err, a.tableSetColumnsDDL())
 		}
+	}
+	if err := ensureLiveAddedTablesColumn(ctx, a.db, a.controlKeyspace); err != nil {
+		return fmt.Errorf("%w (the table-set columns and live_added_tables are added together; to add them by hand: %s)", err, a.tableSetColumnsDDL())
 	}
 	return a.verifyTableSetColumnTypes(ctx)
 }
@@ -106,34 +127,79 @@ func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
 	if a.tableSetColumnsVerified.Load() {
 		return nil
 	}
+	cols, err := a.readTableSetColumnShapes(ctx)
+	if err != nil {
+		return err
+	}
+	ref := controlTableRef(a.controlKeyspace, controlTableName)
+	found := 0
+	for _, c := range cols {
+		if c.name == "live_added_tables" {
+			if err := a.widenLiveAddedTablesColumn(ctx, c.typ, c.charset); err != nil {
+				return err
+			}
+			continue
+		}
+		found++
+		if !strings.EqualFold(c.typ, "longtext") {
+			return fmt.Errorf("mysql: applier: control-table column %s is %s, not LONGTEXT, so a long record is refused "+
+				"or, under a relaxed sql_mode, cut short where the record cannot tell; change it with: ALTER TABLE %s "+
+				"MODIFY COLUMN `%s` %s", c.name, c.typ, ref, c.name, tableSetColumnDef)
+		}
+	}
+	if found == len(tableSetColumnNames) {
+		a.tableSetColumnsVerified.Store(true)
+	}
+	return nil
+}
+
+// tableSetColumnShape is one control-table column's type and character set.
+type tableSetColumnShape struct{ name, typ, charset string }
+
+// readTableSetColumnShapes reads the shape of the three record columns and
+// live_added_tables that exist.
+func (a *ChangeApplier) readTableSetColumnShapes(ctx context.Context) ([]tableSetColumnShape, error) {
 	schemaRHS, schemaArgs := controlSchemaPredicate(a.controlKeyspace)
-	q := "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " + schemaRHS +
-		" AND TABLE_NAME = ? AND COLUMN_NAME IN (?, ?, ?)"
+	q := "SELECT COLUMN_NAME, DATA_TYPE, COALESCE(CHARACTER_SET_NAME, '') FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = " +
+		schemaRHS + " AND TABLE_NAME = ? AND COLUMN_NAME IN (?, ?, ?, 'live_added_tables')"
 	args := append(append([]any{}, schemaArgs...), controlTableName,
 		tableSetColumnNames[0], tableSetColumnNames[1], tableSetColumnNames[2])
 	rows, err := a.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
+		return nil, fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	found := 0
+	var cols []tableSetColumnShape
 	for rows.Next() {
-		var name, typ string
-		if err := rows.Scan(&name, &typ); err != nil {
-			return fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
+		var c tableSetColumnShape
+		if err := rows.Scan(&c.name, &c.typ, &c.charset); err != nil {
+			return nil, fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
 		}
-		found++
-		if !strings.EqualFold(typ, "longtext") {
-			return fmt.Errorf("mysql: applier: control-table column %s is %s, not LONGTEXT, so a long record is refused "+
-				"or, under a relaxed sql_mode, cut short where the record cannot tell; change it with: ALTER TABLE %s "+
-				"MODIFY COLUMN `%s` %s", name, typ, controlTableRef(a.controlKeyspace, controlTableName), name, tableSetColumnDef)
-		}
+		cols = append(cols, c)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
+		return nil, fmt.Errorf("mysql: applier: read the table-set column types: %w", err)
 	}
-	if found == len(tableSetColumnNames) {
-		a.tableSetColumnsVerified.Store(true)
+	return cols, nil
+}
+
+// widenLiveAddedTablesColumn brings an existing live_added_tables to
+// [liveAddedTablesColumnDef] (R9 S-4): every control table v0.27.0 through
+// v0.162.0 created holds it as TEXT in the table's default character set —
+// 64 KB, and, under latin1 or utf8mb3, a name outside it mangled. It widens
+// in place (a metadata-light MODIFY), and where this binary cannot ALTER (a
+// PlanetScale safe-migrations branch, a role without the privilege) refuses
+// naming the statement, rather than writing names the column cannot hold.
+func (a *ChangeApplier) widenLiveAddedTablesColumn(ctx context.Context, typ, charset string) error {
+	if strings.EqualFold(typ, "longtext") && strings.EqualFold(charset, "utf8mb4") {
+		return nil
+	}
+	alter := "ALTER TABLE " + controlTableRef(a.controlKeyspace, controlTableName) +
+		" MODIFY COLUMN `live_added_tables` " + liveAddedTablesColumnDef
+	if _, err := a.db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("mysql: applier: control-table column live_added_tables is %s (character set %q), which "+
+			"cannot hold every table name, and widening it failed (%w); ship this statement and start again: %s",
+			typ, charset, wrapControlTableBootstrapError(err, alter), alter)
 	}
 	return nil
 }

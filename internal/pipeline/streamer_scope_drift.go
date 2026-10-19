@@ -253,6 +253,11 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 	if err != nil {
 		return err
 	}
+	present := map[string]bool{}
+	for _, t := range scope.tables {
+		present[t.name] = true
+	}
+	warnLiveAddedNotInCatalog(ctx, streamID, liveAdded, present)
 
 	drift := map[string]*scopeDriftTable{}
 	entry := func(t scopeTable) *scopeDriftTable {
@@ -301,6 +306,30 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 	}
 	clearAbandonedAdds(ctx, applier, streamID, clearable)
 	return nil
+}
+
+// warnLiveAddedNotInCatalog WARNs about live-added entries the source catalog
+// does not hold (Bug 321 R9 S-2). The ordinary cause is a table dropped on
+// the source. The one that matters: a MySQL target's comma-list set holding
+// a name an older release recorded with a comma in it, which now reads back
+// as several names — the real table is admitted by none of them, and one of
+// the pieces may admit an unrelated table. sluice cannot tell the two apart,
+// so it names the entries and the remedy.
+func warnLiveAddedNotInCatalog(ctx context.Context, streamID string, liveAdded, present map[string]bool) {
+	var missing []string
+	for t := range liveAdded {
+		if !present[t] {
+			missing = append(missing, t)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	sort.Strings(missing)
+	slog.WarnContext(ctx, "live-added tables the source catalog does not hold: dropped on the source, or — on a MySQL "+
+		"target — pieces of a table name an older release recorded with a comma in it, which no longer admit that table. "+
+		"Check each, and `sluice schema add-table <table> --abandon --yes` (with the stream's flags) any entry that "+
+		"should not be there", slog.String("stream_id", streamID), slog.String("entries", strings.Join(missing, ", ")))
 }
 
 // clearAbandonedAdds removes abandoned pending entries a passing door found

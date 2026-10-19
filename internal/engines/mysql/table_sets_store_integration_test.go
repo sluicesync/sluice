@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -235,6 +236,64 @@ func TestTableSetsStore_LargeSetAndNarrowColumn(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "MODIFY COLUMN `established_tables` LONGTEXT") {
 		t.Fatalf("a TEXT established_tables: %v; want the refusal naming the MODIFY", err)
 	}
+}
+
+// TestLiveAddedTables_LegacyValueAndColumnShape is Bug 321 R9 on a real
+// server: a live_added_tables value an older binary or a hand edit wrote
+// with padding and duplicates ("x, y ,x") is read and retired by this one;
+// the TEXT latin1 column v0.27.0–v0.162.0 created is widened to LONGTEXT
+// utf8mb4 on the first table-set write (S-4), after which a non-latin1 name
+// round-trips; and a name the comma list cannot hold is refused (S-1).
+func TestLiveAddedTables_LegacyValueAndColumnShape(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	dsn, applier := tableSetsStoreFixture(ctx, t)
+	applyMySQLApplier(t, dsn, "ALTER TABLE `sluice_cdc_state` ADD COLUMN live_added_tables TEXT CHARACTER SET latin1 NULL")
+	applyMySQLApplier(t, dsn, "UPDATE `sluice_cdc_state` SET live_added_tables = 'x, y ,x' WHERE stream_id = 's1'")
+	ca := applier.(*ChangeApplier)
+	got, err := ca.ReadLiveAddedTables(ctx, "s1")
+	if err != nil || !reflect.DeepEqual(got, []string{"x", "y"}) {
+		t.Fatalf("legacy value read as %v, %v; want [x y]", got, err)
+	}
+	if unrecorded, err := ca.RetireLiveAddedTables(ctx, "s1", []string{"x"}); err != nil {
+		t.Fatalf("retire on a legacy value: %q, %v", unrecorded, err)
+	}
+	if got, err := ca.ReadLiveAddedTables(ctx, "s1"); err != nil || !reflect.DeepEqual(got, []string{"y"}) {
+		t.Fatalf("after the retire: %v, %v; want [y]", got, err)
+	}
+	var typ, charset string
+	if err := withMySQL(t, dsn).QueryRowContext(ctx, "SELECT DATA_TYPE, CHARACTER_SET_NAME FROM information_schema.COLUMNS "+
+		"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sluice_cdc_state' AND COLUMN_NAME = 'live_added_tables'").Scan(&typ, &charset); err != nil {
+		t.Fatal(err)
+	}
+	if typ != "longtext" || charset != "utf8mb4" {
+		t.Fatalf("live_added_tables is %s %s after a table-set write; want longtext utf8mb4 (widened)", typ, charset)
+	}
+	if err := ca.RecordLiveAddedTable(ctx, "s1", "naïve_表"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ca.ReadLiveAddedTables(ctx, "s1"); err != nil || !reflect.DeepEqual(got, []string{"naïve_表", "y"}) {
+		t.Fatalf("a non-latin1 name came back as %v, %v", got, err)
+	}
+	for _, bad := range []string{" t", "t ", "a,b"} {
+		if err := ca.RecordLiveAddedTable(ctx, "s1", bad); err == nil {
+			t.Errorf("RecordLiveAddedTable(%q) accepted a name the comma list cannot hold", bad)
+		}
+		if err := ca.CheckLiveAddedTableName(bad); err == nil || !strings.Contains(err.Error(), "glob") {
+			t.Errorf("CheckLiveAddedTableName(%q) = %v; want the refusal naming the glob route", bad, err)
+		}
+	}
+}
+
+// withMySQL opens dsn for the test's own queries.
+func withMySQL(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }
 
 // TestTableIdentities_SurviveRename is Bug 321 R6's premise on a real

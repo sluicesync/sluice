@@ -98,7 +98,7 @@ func (a *ChangeApplier) ensureTableSetColumns(ctx context.Context, streamID stri
 }
 
 // verifyTableSetColumnTypes refuses a table-set column of any type but TEXT
-// (L2): a DBA-created VARCHAR(n) would cut a set at a length the codec
+// (L2), live_added_tables included (R9 S-4): a DBA-created VARCHAR(n) would cut a set at a length the codec
 // cannot see. A column that does not exist yet is not judged. Verified once
 // per applier.
 func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
@@ -114,7 +114,7 @@ func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
 	}
 	defer func() { _ = rows.Close() }()
 	want := map[string]bool{}
-	for _, c := range tableSetColumnNames {
+	for _, c := range append(append([]string(nil), tableSetColumnNames...), liveAddedTablesColumn) {
 		want[c] = true
 	}
 	found := 0
@@ -136,7 +136,7 @@ func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("postgres: applier: read the table-set column types: %w", err)
 	}
-	if found == len(tableSetColumnNames) {
+	if found >= len(tableSetColumnNames) {
 		a.tableSetColumnsVerified.Store(true)
 	}
 	return nil

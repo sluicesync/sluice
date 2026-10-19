@@ -343,6 +343,15 @@ func (a *AddTable) Run(ctx context.Context) error {
 	}
 	defer migcore.CloseIf(applier)
 
+	// A name the target's live-added set cannot hold refuses here, before
+	// anything changes (Bug 321 R9 L-1): the set is written after the copy on
+	// a source without a publication.
+	if checker, ok := applier.(liveAddedTableNameChecker); ok {
+		if err := checker.CheckLiveAddedTableName(a.TableName); err != nil {
+			return fmt.Errorf("pipeline: add-table: %w", err)
+		}
+	}
+
 	preflight, err := a.preflightStream(ctx, applier)
 	if err != nil {
 		return err

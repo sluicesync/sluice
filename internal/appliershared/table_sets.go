@@ -124,6 +124,20 @@ func DecodeTableSetIDs(stored string) (entries []string, ids map[string]string, 
 	return out, ids, nil
 }
 
+// ValidateTableIDs refuses an id [EncodeTableSetIDs] could not write so that
+// [DecodeTableSetIDs] reads it back: anything but decimal digits (R9 L-4). A
+// TAB or newline in one would split the line, and a non-digit would make the
+// whole record undecodable on its next read — refused at the write instead.
+// Ids are compared as strings, so any length round-trips.
+func ValidateTableIDs(ids map[string]string) error {
+	for table, id := range ids {
+		if id != "" && !isDecimalID(id) {
+			return fmt.Errorf("table %q: id %q is not decimal digits", table, id)
+		}
+	}
+	return nil
+}
+
 func isDecimalID(s string) bool {
 	if s == "" {
 		return false
@@ -263,22 +277,71 @@ func ReadPendingEntries(ctx context.Context, db *sql.DB, cfg *ControlTableConfig
 // malformed entry for each line that is not a quoted string (Table "") and
 // for each entry that does not decode (Table is the name before its first
 // NUL).
+//
+// Malformed is never empty for a malformed entry (R9 S-3): an empty line — a
+// trailing newline, two in a row — or an entry that unquotes to nothing used
+// to come back as Malformed "", which every reader takes for a well-formed
+// entry. Such text is reported as its quoted form, `""`.
 func DecodePendingSet(stored string) []ir.PendingAddedTable {
 	var out []ir.PendingAddedTable
 	for _, line := range strings.Split(stored, "\n") {
 		entry, err := strconv.Unquote(line)
 		if err != nil {
-			out = append(out, ir.PendingAddedTable{Malformed: line})
+			out = append(out, ir.PendingAddedTable{Malformed: malformedText(line)})
 			continue
 		}
 		p, err := DecodePendingEntry(entry)
 		if err != nil {
-			out = append(out, ir.PendingAddedTable{Table: pendingEntryTable(entry), Malformed: entry})
+			out = append(out, ir.PendingAddedTable{Table: pendingEntryTable(entry), Malformed: malformedText(entry)})
 			continue
 		}
 		out = append(out, p)
 	}
 	return out
+}
+
+// malformedText is a malformed pending entry's reported text: itself, or
+// `""` when it is empty, so it can never read as "not malformed".
+func malformedText(s string) string {
+	if s == "" {
+		return `""`
+	}
+	return s
+}
+
+// decodePendingColumn is the tolerant decode a pending-column write uses (R9
+// L-3): the lines that unquote, as an entry set the edits work on, and the
+// lines that do not, kept verbatim so the write puts them back — a malformed
+// line stays reported (`sync health`, the door) until --abandon or the SQL
+// its recovery names clears it, rather than failing the write or vanishing.
+func decodePendingColumn(stored string) (entries map[string]struct{}, unreadable []string) {
+	entries = map[string]struct{}{}
+	if stored == "" {
+		return entries, nil
+	}
+	for _, line := range strings.Split(stored, "\n") {
+		if entry, err := strconv.Unquote(line); err == nil {
+			entries[entry] = struct{}{}
+		} else {
+			unreadable = append(unreadable, line)
+		}
+	}
+	return entries, unreadable
+}
+
+// encodePendingColumn is [decodePendingColumn]'s inverse for the write: the
+// entries encoded, then the unreadable lines as they were. NULL when both are
+// empty.
+func encodePendingColumn(entries map[string]struct{}, unreadable []string) any {
+	if len(entries) == 0 && len(unreadable) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, 2)
+	if len(entries) > 0 {
+		lines = append(lines, EncodeTableSet(entriesOf(entries)))
+	}
+	lines = append(lines, unreadable...)
+	return strings.Join(lines, "\n")
 }
 
 // pendingEntryTable is the table name of a pending entry, well-formed or
@@ -347,6 +410,9 @@ type TableSetEdit struct {
 // error wrapping cfg.ErrStreamNotFound (a writer that must not silently
 // record nothing); false makes a missing row, table or column nothing to do.
 func UpdateTableSet(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q TableSetQueries, streamID string, requireRow bool, edit TableSetEdit) (err error) {
+	if err := ValidateTableIDs(edit.IDs); err != nil {
+		return fmt.Errorf("%s: update %s: %w", cfg.EngineName, q.Column, err)
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("%s: update %s: begin: %w", cfg.EngineName, q.Column, err)
@@ -558,6 +624,9 @@ type PendingAddQueries struct {
 // `<namespace>\x00<table>` — a bare entry would be junk no scope matches).
 // The caller has ensured all three columns exist.
 func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q PendingAddQueries, streamID, table, token, id string) (err error) {
+	if id != "" && !isDecimalID(id) {
+		return fmt.Errorf("%s: complete pending add-table %q: table id %q is not decimal digits", cfg.EngineName, table, id)
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("%s: complete pending add-table: begin: %w", cfg.EngineName, err)
@@ -574,20 +643,15 @@ func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig
 	case serr != nil:
 		return fmt.Errorf("%s: complete pending add-table: %w", cfg.EngineName, serr)
 	}
-	pending, err := DecodeTableSet(pendingCol.String)
-	if err != nil {
-		return fmt.Errorf("%s: complete pending add-table: %w", cfg.EngineName, undecodable(PendingAddedTablesColumn, pendingCol.String, err))
-	}
-	pset := toEntrySet(pending)
+	// Tolerant (R9 L-3): another entry's malformed line must not fail this
+	// add's completion; it is written back as it was.
+	pset, unreadable := decodePendingColumn(pendingCol.String)
 	entry, _, ok := ownPendingEntry(pset, table, token)
 	if !ok {
 		return fmt.Errorf("%s: complete pending add-table %q: %w", cfg.EngineName, table, ir.ErrPendingAddSuperseded)
 	}
 	delete(pset, entry)
-	var pendingNext any
-	if len(pset) > 0 {
-		pendingNext = encodeNext(pset)
-	}
+	pendingNext := encodePendingColumn(pset, unreadable)
 
 	establishedNext, droppedNext := nullableString(establishedCol), nullableString(droppedCol)
 	if establishedCol.Valid {
@@ -598,11 +662,16 @@ func CompletePendingAdd(ctx context.Context, db *sql.DB, cfg *ControlTableConfig
 		if !inProgressOrMultiDatabase(est) {
 			eset := toEntrySet(est)
 			eset[table] = struct{}{}
+			// The copy's id replaces any recorded one; no id deletes it (R9
+			// L-2): an id kept from an earlier copy of the name would let the
+			// identity door take a different relation for this one.
 			if id != "" {
 				if ids == nil {
 					ids = map[string]string{}
 				}
 				ids[table] = id
+			} else {
+				delete(ids, table)
 			}
 			establishedNext = encodeNextIDs(eset, ids)
 			if droppedCol.Valid {
@@ -691,6 +760,9 @@ type RecordQueries struct {
 // same transaction. No row, no record, or a cold start in progress: nothing
 // is written. The caller has ensured both columns exist.
 func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RecordQueries, streamID string, n ir.RecordNarrowing) (leaving []string, err error) {
+	if err := ValidateTableIDs(n.IDs); err != nil {
+		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, err)
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: begin: %w", cfg.EngineName, err)
@@ -721,11 +793,17 @@ func NarrowEstablished(ctx context.Context, db *sql.DB, cfg *ControlTableConfig,
 	if err != nil {
 		return nil, fmt.Errorf("%s: narrow established-table record: %w", cfg.EngineName, undecodable(DroppedTablesColumn, droppedCol.String, err))
 	}
+	wasEstablished := toEntrySet(est)
 	nextEst, nextDrop, leaving := NarrowRecord(est, drop, n.InScope, n.Gone, n.Renames)
 	// A renamed entry keeps its id under its new name; an entry the door
-	// found rebuilt takes its new id.
+	// found rebuilt takes its new id. A rename NarrowRecord skipped (the new
+	// name was already established) moves no id: the established entry keeps
+	// its own (R9 nit).
 	kept := toEntrySet(nextEst)
 	for old, renamed := range n.Renames {
+		if _, skipped := wasEstablished[renamed]; skipped {
+			continue
+		}
 		if id, ok := ids[old]; ok {
 			if _, isKept := kept[renamed]; isKept {
 				delete(ids, old)
@@ -809,17 +887,14 @@ func RetireLiveAddedTables(ctx context.Context, db *sql.DB, cfg *ControlTableCon
 
 	pendingNext := nullableString(pendingCol)
 	if pendingCol.Valid {
-		pending, err := DecodeTableSet(pendingCol.String)
-		if err != nil {
-			return "", fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(PendingAddedTablesColumn, pendingCol.String, err))
-		}
-		pset := toEntrySet(pending)
+		// Tolerant (R9 L-3), malformed lines kept verbatim.
+		pset, unreadable := decodePendingColumn(pendingCol.String)
 		for _, t := range tables {
 			if next, changed := PendingAbandon(t).Apply(pset, true, time.Time{}); changed {
 				pset = next
 			}
 		}
-		pendingNext = encodeNext(pset)
+		pendingNext = encodePendingColumn(pset, unreadable)
 	}
 
 	establishedNext, droppedNext := nullableString(establishedCol), nullableString(droppedCol)

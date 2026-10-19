@@ -6,6 +6,7 @@ package appliershared
 import (
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -226,5 +227,72 @@ func TestUnrecordedReason(t *testing.T) {
 		if got := unrecordedReason(c.recorded, c.established); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+// TestTableSetIDsAnyLength is R9's id round-trip: ids are compared as
+// strings, so values past int32, uint64 and any length come back exact; a
+// non-decimal id is refused at the write (L-4) rather than written into a
+// record its next read cannot decode.
+func TestTableSetIDsAnyLength(t *testing.T) {
+	ids := map[string]string{"a": "4294967295", "b": "18446744073709551615", "c": "1234567890123456789012345"}
+	got, gotIDs, err := DecodeTableSetIDs(EncodeTableSetIDs([]string{"a", "b", "c"}, ids))
+	if err != nil || !reflect.DeepEqual(got, []string{"a", "b", "c"}) || !reflect.DeepEqual(gotIDs, ids) {
+		t.Fatalf("round trip: %v %v %v", got, gotIDs, err)
+	}
+	if err := ValidateTableIDs(ids); err != nil {
+		t.Fatalf("decimal ids refused: %v", err)
+	}
+	for _, bad := range []string{"12a", "1\t2", "1\n2", "-1", " 7"} {
+		if ValidateTableIDs(map[string]string{"t": bad}) == nil {
+			t.Errorf("id %q accepted", bad)
+		}
+	}
+}
+
+// TestDecodePendingSet_EmptyLinesAreMalformed is R9 S-3: an empty line — a
+// trailing newline, or two in a row — used to decode as an entry whose
+// Malformed text was "", which every reader takes for well-formed. It is
+// malformed, and its text says so.
+func TestDecodePendingSet_EmptyLinesAreMalformed(t *testing.T) {
+	x := strconv.Quote(EncodePendingEntry(ir.PendingAddedTable{Table: "x", Token: "t1", StartedAt: time.Unix(1, 0).UTC(), HeartbeatAt: time.Unix(2, 0).UTC()}))
+	y := strconv.Quote(EncodePendingEntry(ir.PendingAddedTable{Table: "y", Token: "t2", StartedAt: time.Unix(1, 0).UTC(), HeartbeatAt: time.Unix(2, 0).UTC()}))
+	for _, c := range []struct {
+		stored        string
+		wantMalformed int
+		wantTables    []string
+	}{
+		{x + "\n", 1, []string{"x"}},
+		{x + "\n\n" + y, 1, []string{"x", "y"}},
+		{x + "\n" + y, 0, []string{"x", "y"}},
+		{`""`, 1, nil},
+	} {
+		malformed, tables := 0, []string(nil)
+		for _, p := range DecodePendingSet(c.stored) {
+			if p.Malformed != "" {
+				malformed++
+				continue
+			}
+			tables = append(tables, p.Table)
+		}
+		if malformed != c.wantMalformed || !reflect.DeepEqual(tables, c.wantTables) {
+			t.Errorf("%q: %d malformed, tables %v; want %d malformed, tables %v", c.stored, malformed, tables, c.wantMalformed, c.wantTables)
+		}
+	}
+}
+
+// TestPendingColumnKeepsUnreadableLines is R9 L-3: a pending-column write
+// edits the lines that decode and puts the others back as they were.
+func TestPendingColumnKeepsUnreadableLines(t *testing.T) {
+	entries, unreadable := decodePendingColumn("\"a\"\ngarbage\n\"b\"")
+	if len(entries) != 2 || !reflect.DeepEqual(unreadable, []string{"garbage"}) {
+		t.Fatalf("decode: %v %v", entries, unreadable)
+	}
+	delete(entries, "a")
+	if got := encodePendingColumn(entries, unreadable); got != "\"b\"\ngarbage" {
+		t.Fatalf("encode: %q", got)
+	}
+	if got := encodePendingColumn(map[string]struct{}{}, nil); got != nil {
+		t.Fatalf("empty: %v, want NULL", got)
 	}
 }
