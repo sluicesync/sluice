@@ -76,18 +76,69 @@ func (a *ChangeApplier) pendingAddQueries() appliershared.PendingAddQueries {
 // table's default character set.
 const liveAddedTablesColumnDef = "LONGTEXT CHARACTER SET utf8mb4 NULL"
 
-// tableSetColumnsDDL is the statement that adds the three table-set columns
-// and live_added_tables, named in every refusal for a missing one: a drained
-// add-table on a source without a publication writes live_added_tables
-// after its copy, so a control table this binary cannot ALTER must have
-// all four before anything starts (R9 addendum).
-func (a *ChangeApplier) tableSetColumnsDDL() string {
-	adds := make([]string, 0, len(tableSetColumnNames)+1)
-	for _, c := range tableSetColumnNames {
-		adds = append(adds, "ADD COLUMN `"+c+"` "+tableSetColumnDef)
+// tableSetColumnsDDL is the statement that brings the three table-set
+// columns and live_added_tables to their declarations, named in every
+// refusal for a missing or mistyped one: a drained add-table on a source
+// without a publication writes live_added_tables after its copy, so a
+// control table this binary cannot ALTER must have all four before anything
+// starts (R9 addendum). It is built from the columns the table has (R9e): a
+// fixed ADD of all four failed with 1060 (duplicate column) on every control
+// table v0.27.0 through v0.162.0 created, since each already holds
+// live_added_tables. A table whose columns cannot be read is given the
+// statement for a table that has none of them.
+func (a *ChangeApplier) tableSetColumnsDDL(ctx context.Context) string {
+	shapes, err := a.readTableSetColumnShapes(ctx)
+	if err != nil {
+		shapes = nil
 	}
-	adds = append(adds, "ADD COLUMN `live_added_tables` "+liveAddedTablesColumnDef)
-	return "ALTER TABLE " + controlTableRef(a.controlKeyspace, controlTableName) + " " + strings.Join(adds, ", ")
+	return tableSetColumnsStatement(controlTableRef(a.controlKeyspace, controlTableName), shapes)
+}
+
+// tableSetColumnsStatement renders [ChangeApplier.tableSetColumnsDDL] for a
+// table holding shapes: ADD each missing column, MODIFY each existing one
+// whose type or character set refuses. Empty when nothing needs changing.
+func tableSetColumnsStatement(ref string, shapes []tableSetColumnShape) string {
+	have := make(map[string]tableSetColumnShape, len(shapes))
+	for _, s := range shapes {
+		have[s.name] = s
+	}
+	var clauses []string
+	for _, c := range tableSetColumnNames {
+		s, ok := have[c]
+		switch {
+		case !ok:
+			clauses = append(clauses, "ADD COLUMN `"+c+"` "+tableSetColumnDef)
+		case !strings.EqualFold(s.typ, "longtext"):
+			clauses = append(clauses, "MODIFY COLUMN `"+c+"` "+tableSetColumnDef)
+		}
+	}
+	s, ok := have["live_added_tables"]
+	switch {
+	case !ok:
+		clauses = append(clauses, "ADD COLUMN `live_added_tables` "+liveAddedTablesColumnDef)
+	case !liveAddedTablesWide(s.typ, s.charset):
+		clauses = append(clauses, "MODIFY COLUMN `live_added_tables` "+liveAddedTablesColumnDef)
+	}
+	if len(clauses) == 0 {
+		return ""
+	}
+	return "ALTER TABLE " + ref + " " + strings.Join(clauses, ", ")
+}
+
+// liveAddedTablesWide reports whether live_added_tables already has
+// [liveAddedTablesColumnDef]'s type and character set.
+func liveAddedTablesWide(typ, charset string) bool {
+	return strings.EqualFold(typ, "longtext") && strings.EqualFold(charset, "utf8mb4")
+}
+
+// byHand is the remedy a table-set refusal names: the statement that brings
+// this table's columns up to date.
+func (a *ChangeApplier) byHand(ctx context.Context) string {
+	stmt := a.tableSetColumnsDDL(ctx)
+	if stmt == "" {
+		return "the table-set columns and live_added_tables are added together; they all read as present now, so start again"
+	}
+	return "the table-set columns and live_added_tables are added together; to add them by hand: " + stmt
 }
 
 // ensureTableSetColumns adds the three table-set columns on first write
@@ -109,11 +160,11 @@ func (a *ChangeApplier) ensureTableSetColumns(ctx context.Context, streamID stri
 	}
 	for _, col := range tableSetColumnNames {
 		if err := ensureCrossEngineParityColumn(ctx, a.db, a.controlKeyspace, col, tableSetColumnDef); err != nil {
-			return fmt.Errorf("%w (the table-set columns and live_added_tables are added together; to add them by hand: %s)", err, a.tableSetColumnsDDL())
+			return fmt.Errorf("%w (%s)", err, a.byHand(ctx))
 		}
 	}
 	if err := ensureLiveAddedTablesColumn(ctx, a.db, a.controlKeyspace); err != nil {
-		return fmt.Errorf("%w (the table-set columns and live_added_tables are added together; to add them by hand: %s)", err, a.tableSetColumnsDDL())
+		return fmt.Errorf("%w (%s)", err, a.byHand(ctx))
 	}
 	return a.verifyTableSetColumnTypes(ctx)
 }
@@ -191,7 +242,7 @@ func (a *ChangeApplier) readTableSetColumnShapes(ctx context.Context) ([]tableSe
 // PlanetScale safe-migrations branch, a role without the privilege) refuses
 // naming the statement, rather than writing names the column cannot hold.
 func (a *ChangeApplier) widenLiveAddedTablesColumn(ctx context.Context, typ, charset string) error {
-	if strings.EqualFold(typ, "longtext") && strings.EqualFold(charset, "utf8mb4") {
+	if liveAddedTablesWide(typ, charset) {
 		return nil
 	}
 	alter := "ALTER TABLE " + controlTableRef(a.controlKeyspace, controlTableName) +

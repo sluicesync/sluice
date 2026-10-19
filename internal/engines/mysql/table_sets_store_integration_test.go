@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -282,6 +283,81 @@ func TestLiveAddedTables_LegacyValueAndColumnShape(t *testing.T) {
 		if err := ca.CheckLiveAddedTableName(bad); err == nil || !strings.Contains(err.Error(), "glob") {
 			t.Errorf("CheckLiveAddedTableName(%q) = %v; want the refusal naming the glob route", bad, err)
 		}
+	}
+}
+
+// TestTableSetColumnsDDL_RunsOnEveryReleasedShape is R9e on a real server:
+// the statement a table-set refusal names is EXECUTED against the two
+// shapes an upgrade meets — (a) the v0.27.0–v0.162.0 table (live_added_tables
+// TEXT latin1, no record columns), and (b) an older one without
+// live_added_tables — and afterwards nothing is left to change and the
+// ensure check passes. The fixed ADD-all form failed (a) with 1060. On (a) a
+// non-ASCII latin1 value ("café") is carried through the MODIFY. On both, a
+// 4-byte name round-trips, read back with this test's own SQL as well as
+// the applier's.
+func TestTableSetColumnsDDL_RunsOnEveryReleasedShape(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		setup      []string
+		liveClause string
+		legacy     []string
+	}{
+		{
+			name: "v0.27.0-v0.162.0 shape",
+			setup: []string{
+				"ALTER TABLE `sluice_cdc_state` ADD COLUMN live_added_tables TEXT CHARACTER SET latin1 NULL",
+				"UPDATE `sluice_cdc_state` SET live_added_tables = 'café' WHERE stream_id = 's1'",
+			},
+			liveClause: "MODIFY COLUMN `live_added_tables`",
+			legacy:     []string{"café"},
+		},
+		{name: "no live_added_tables", liveClause: "ADD COLUMN `live_added_tables`"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			dsn, applier := tableSetsStoreFixture(ctx, t)
+			for _, q := range tc.setup {
+				applyMySQLApplier(t, dsn, q)
+			}
+			ca := applier.(*ChangeApplier)
+			stmt := ca.tableSetColumnsDDL(ctx)
+			if !strings.Contains(stmt, tc.liveClause) {
+				t.Fatalf("the statement for this shape is %q; want it to carry %s", stmt, tc.liveClause)
+			}
+			db := withMySQL(t, dsn)
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				t.Fatalf("the statement a refusal names does not run on this shape: %v\n%s", err, stmt)
+			}
+			if left := ca.tableSetColumnsDDL(ctx); left != "" {
+				t.Fatalf("after the statement ran, the table still needs: %s", left)
+			}
+			if err := ca.ensureTableSetColumns(ctx, "s1"); err != nil {
+				t.Fatalf("the ensure check after the statement: %v", err)
+			}
+			raw := func() string {
+				var v sql.NullString
+				if err := db.QueryRowContext(ctx, "SELECT live_added_tables FROM sluice_cdc_state WHERE stream_id = 's1'").Scan(&v); err != nil {
+					t.Fatal(err)
+				}
+				return v.String
+			}
+			if got := raw(); got != strings.Join(tc.legacy, ",") {
+				t.Fatalf("live_added_tables reads %q after the statement; want %q carried through", got, strings.Join(tc.legacy, ","))
+			}
+			const emoji = "t_\U0001F600"
+			if err := ca.RecordLiveAddedTable(ctx, "s1", emoji); err != nil {
+				t.Fatal(err)
+			}
+			if got := raw(); !strings.Contains(got, emoji) {
+				t.Fatalf("live_added_tables reads %q; want the 4-byte name %q stored intact", got, emoji)
+			}
+			want := append(append([]string(nil), tc.legacy...), emoji)
+			sort.Strings(want)
+			if got, err := ca.ReadLiveAddedTables(ctx, "s1"); err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("the applier reads %q, %v; want %q", got, err, want)
+			}
+		})
 	}
 }
 

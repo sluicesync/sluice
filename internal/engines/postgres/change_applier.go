@@ -1269,7 +1269,8 @@ func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID strin
 		return fmt.Errorf("postgres: applier: record the cold start's copy with its anchor: %w", err)
 	}
 	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
-		slog.WarnContext(ctx, ir.ColdStartAnchorUnrecordedMarker+": the record's columns could not be added, so the cold "+
+		slog.WarnContext(ctx, ir.ColdStartAnchorUnrecordedMarker+": the record's columns are missing or of a type that cannot hold it, and "+
+			"could not be brought up to date (the error says which), so the cold "+
 			"start's anchor is written without the record of its copy; until a cold start records one, the stream is "+
 			"judged as having no record", slog.String("stream_id", streamID), slog.String("error", err.Error()))
 		return a.writePositionWith(ctx, streamID, pos, nil)

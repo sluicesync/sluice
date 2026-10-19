@@ -308,6 +308,10 @@ func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applie
 	return nil
 }
 
+// LiveAddedTableNotInCatalogMarker is the grep-stable marker of
+// [warnLiveAddedNotInCatalog]'s WARN.
+const LiveAddedTableNotInCatalogMarker = "LIVE-ADDED-TABLE-NOT-IN-CATALOG"
+
 // warnLiveAddedNotInCatalog WARNs about live-added entries the source catalog
 // does not hold (Bug 321 R9 S-2). The ordinary cause is a table dropped on
 // the source. The one that matters: a MySQL target's comma-list set holding
@@ -326,7 +330,7 @@ func warnLiveAddedNotInCatalog(ctx context.Context, streamID string, liveAdded, 
 		return
 	}
 	sort.Strings(missing)
-	slog.WarnContext(ctx, "live-added tables the source catalog does not hold: dropped on the source, or — on a MySQL "+
+	slog.WarnContext(ctx, LiveAddedTableNotInCatalogMarker+": live-added tables the source catalog does not hold: dropped on the source, or — on a MySQL "+
 		"target — pieces of a table name an older release recorded with a comma in it, which no longer admit that table. "+
 		"Check each, and `sluice schema add-table <table> --abandon --yes` (with the stream's flags) any entry that "+
 		"should not be there", slog.String("stream_id", streamID), slog.String("entries", strings.Join(missing, ", ")))
@@ -971,13 +975,13 @@ func beginColdStartRecord(ctx context.Context, applier ir.ChangeApplier, streamI
 // writeColdStartAnchor writes a cold start's CDC anchor, through
 // [ir.ColdStartAnchorWriter] where the applier has it (Bug 321 R9b): with
 // the anchor it records copied — the record entries the anchor's copy
-// covered — on a row that has no record yet, so a stop before
+// covered, with their ids (R9c) — on a row that has no record yet, so a stop before
 // [Streamer.recordColdStartEstablished] leaves the stream judged on the copy
 // it made instead of on no record at all. A stream's first cold start has no
 // row until this write, so [beginColdStartRecord] could not mark it, and a
 // mark would be wrong here anyway: the copy has finished, and the warm
-// resume this anchor exists for (GitHub #15) is the correct next step. The
-// full record (ids, the dropped set) follows in recordColdStartEstablished.
+// resume this anchor exists for (GitHub #15) is the correct next step. Only
+// the dropped set follows, in recordColdStartEstablished.
 // The three anchor sites — the cold start, the stopped-cold-start resume and
 // the multi-database fan-out — all write through here.
 func writeColdStartAnchor(ctx context.Context, pw ir.PositionWriter, streamID string, pos ir.Position, copied []string, ids map[string]string) error {

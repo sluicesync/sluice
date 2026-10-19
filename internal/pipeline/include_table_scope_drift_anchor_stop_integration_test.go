@@ -190,6 +190,27 @@ func TestIncludeTableScopeDrift_BinlogStopAtTheAnchorRefuses(t *testing.T) {
 	r.narrowThenRewidenRefuses()
 }
 
+// TestIncludeTableScopeDrift_BinlogResetStopAtTheAnchorRecordsTheCopy is
+// R9e (f): --reset-target-data deletes the control row, its in-progress mark
+// with it, so a stop at its anchor must leave the copy on record — like a
+// first cold start's — not an in-progress mark or no record. The narrowed
+// reset scope (kd) is what is recorded, not the earlier k* copy.
+func TestIncludeTableScopeDrift_BinlogResetStopAtTheAnchorRecordsTheCopy(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	t.Cleanup(cleanup)
+	applyDDLMySQL(t, src, anchorFixture)
+	r := newAnchorRig(t, "mysql", src, tgt, func(q string) { applyDDLMySQL(t, src, q) })
+	stopAfterTheAnchor(t, r.run("k*"))
+	r.requireTheCopyWithIDs([]string{"kd", "kx"})
+	reset := r.run("kd")
+	reset.ResetTargetData = true
+	stopAfterTheAnchor(t, reset)
+	if rec := r.record(); rec.ColdStartInProgress {
+		t.Fatalf("a --reset-target-data cold start stopped at its anchor left the in-progress mark: %+v", rec)
+	}
+	r.requireTheCopyWithIDs([]string{"kd"})
+}
+
 // TestIncludeTableScopeDrift_PgoutputStopAtTheAnchorThenRecreateRefuses is
 // R9c: without the ids on the anchor's record, a table dropped and
 // re-created under the same name while the stream was stopped passed the

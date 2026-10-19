@@ -117,7 +117,7 @@ func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
 	for _, c := range append(append([]string(nil), tableSetColumnNames...), liveAddedTablesColumn) {
 		want[c] = true
 	}
-	found := 0
+	found := map[string]bool{}
 	for rows.Next() {
 		var name, typ string
 		if err := rows.Scan(&name, &typ); err != nil {
@@ -126,7 +126,7 @@ func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
 		if !want[name] {
 			continue
 		}
-		found++
+		found[name] = true
 		if typ != "text" {
 			return fmt.Errorf("postgres: applier: control-table column %s is %s, not text, and a value longer than it "+
 				"holds would be cut where the record cannot tell; change it with: ALTER TABLE %s ALTER COLUMN %s TYPE TEXT",
@@ -136,10 +136,23 @@ func (a *ChangeApplier) verifyTableSetColumnTypes(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("postgres: applier: read the table-set column types: %w", err)
 	}
-	if found >= len(tableSetColumnNames) {
+	if recordColumnsPresent(found) {
 		a.tableSetColumnsVerified.Store(true)
 	}
 	return nil
+}
+
+// recordColumnsPresent reports whether every record column is among found,
+// by name (R9e): a count let live_added_tables stand in for a missing record
+// column, so the check was cached as passed with that column absent and
+// never run again for this applier.
+func recordColumnsPresent(found map[string]bool) bool {
+	for _, c := range tableSetColumnNames {
+		if !found[c] {
+			return false
+		}
+	}
+	return true
 }
 
 // updateTableSet runs edit against col: ensuring all three columns first

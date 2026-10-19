@@ -120,8 +120,9 @@ type ColdStartAnchorWriter interface {
 }
 
 // ColdStartAnchorUnrecordedMarker is the WARN a cold start's anchor logs when
-// the record's columns cannot be added, so the anchor is written without the
-// record of its copy (R9c).
+// the record's columns are missing or mistyped and cannot be brought up to
+// date (a role or branch that cannot ALTER the control table), so the anchor
+// is written without the record of its copy (R9c).
 const ColdStartAnchorUnrecordedMarker = "COLD-START-ANCHOR-UNRECORDED"
 
 // LiveAddedTableRetirer is the optional applier surface the running
