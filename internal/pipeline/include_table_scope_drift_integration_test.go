@@ -633,8 +633,24 @@ func (r *scopeDriftRig) establishTwo(second, tables string, extra ...string) {
 	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a", 30*time.Second); !ok {
 		r.t.Fatalf("cold start: target kd = %q%s", got, run.logTail())
 	}
+	// Stop only once the cold start recorded what it copied: the copied rows
+	// are visible before the record write, and a stop in between leaves the
+	// in-progress mark (R9b), which the next start refuses. Before R9b a stop
+	// there left no record at all — the CI failure this wait came from.
+	r.waitRecorded(run)
 	run.end()
 	time.Sleep(2 * time.Second)
+}
+
+// waitRecorded waits until the stream's established-table record is
+// written and not a cold start in progress.
+func (r *scopeDriftRig) waitRecorded(run *straddleBinaryRun) {
+	r.t.Helper()
+	q := "SELECT CASE WHEN established_tables IS NOT NULL AND established_tables NOT LIKE '%cold-start-in-progress%' " +
+		"THEN 'recorded' ELSE 'no' END FROM sluice_cdc_state WHERE stream_id = '" + r.streamID + "'"
+	if got, ok := r.waitScalar(r.tgt, q, "recorded", 60*time.Second); !ok {
+		r.t.Fatalf("the cold start never recorded its copy (%s)%s", got, run.logTail())
+	}
 }
 
 // narrowThenChange restarts with a narrower scope (proved streaming by a kd

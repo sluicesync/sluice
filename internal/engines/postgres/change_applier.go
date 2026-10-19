@@ -1247,6 +1247,40 @@ func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error 
 // the v0.20.0 Phase 4.5 design), so the same writePositionTx call
 // works without a schema change.
 func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos ir.Position) error {
+	return a.writePositionWith(ctx, streamID, pos, nil)
+}
+
+var _ ir.ColdStartAnchorWriter = (*ChangeApplier)(nil)
+
+// WriteColdStartAnchor implements [ir.ColdStartAnchorWriter]: the cold
+// start's CDC anchor and, in the same transaction, the record's
+// cold-start-in-progress mark on a row that has no record yet (Bug 321
+// R9b). A stream's first cold start has no control row until this write,
+// so its in-progress mark could not be set before the copy; a stop between
+// the anchor and the record left a row with a position and no record — a
+// stream the scope door judges as one cold-started by an older release,
+// which convicts almost nothing. Written together, a stop there leaves the
+// mark, which refuses COLD-START-INCOMPLETE until a cold start records its
+// copy. Where the record's columns cannot be added (a role that cannot
+// ALTER the control table), the anchor is written alone, as before.
+func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position) error {
+	if a.ensureTableSetColumns(ctx, streamID) != nil {
+		return a.writePositionWith(ctx, streamID, pos, nil)
+	}
+	mark := "UPDATE " + controlTableRef(a.controlSchema) + " SET " + appliershared.EstablishedTablesColumn +
+		" = $1 WHERE stream_id = $2 AND " + appliershared.EstablishedTablesColumn + " IS NULL"
+	return a.writePositionWith(ctx, streamID, pos, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, mark, appliershared.EncodeTableSet([]string{appliershared.ColdStartInProgressEntry}), streamID)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: mark the cold start in progress with its anchor: %w", err)
+		}
+		return nil
+	})
+}
+
+// writePositionWith is WritePosition's body; also, when non-nil, runs inTx in
+// the same transaction after the position write.
+func (a *ChangeApplier) writePositionWith(ctx context.Context, streamID string, pos ir.Position, inTx func(context.Context, *sql.Tx) error) error {
 	if streamID == "" {
 		return errors.New("postgres: applier: WritePosition: streamID is empty")
 	}
@@ -1266,6 +1300,9 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
 	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0)
+	if err == nil && inTx != nil {
+		err = inTx(posCtx, tx)
+	}
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()

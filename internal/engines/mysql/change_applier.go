@@ -1143,6 +1143,34 @@ func (a *ChangeApplier) RemoveLiveAddedTable(ctx context.Context, streamID, tabl
 // Wraps the same writePositionTx helper the Apply path uses, so the
 // row shape and idempotency contract are identical.
 func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos ir.Position) error {
+	return a.writePositionWith(ctx, streamID, pos, nil)
+}
+
+var _ ir.ColdStartAnchorWriter = (*ChangeApplier)(nil)
+
+// WriteColdStartAnchor implements [ir.ColdStartAnchorWriter]: the cold
+// start's CDC anchor and, in the same transaction, the record's
+// cold-start-in-progress mark on a row that has no record yet (Bug 321
+// R9b; see the Postgres applier's for the window it closes). Where the
+// record's columns cannot be added, the anchor is written alone.
+func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position) error {
+	if a.ensureTableSetColumns(ctx, streamID) != nil {
+		return a.writePositionWith(ctx, streamID, pos, nil)
+	}
+	mark := "UPDATE " + controlTableRef(a.controlKeyspace, controlTableName) + " SET " + appliershared.EstablishedTablesColumn +
+		" = ? WHERE stream_id = ? AND " + appliershared.EstablishedTablesColumn + " IS NULL"
+	return a.writePositionWith(ctx, streamID, pos, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, mark, appliershared.EncodeTableSet([]string{appliershared.ColdStartInProgressEntry}), streamID)
+		if err != nil {
+			return fmt.Errorf("mysql: applier: mark the cold start in progress with its anchor: %w", err)
+		}
+		return nil
+	})
+}
+
+// writePositionWith is WritePosition's body; also, when non-nil, runs inTx in
+// the same transaction after the position write.
+func (a *ChangeApplier) writePositionWith(ctx context.Context, streamID string, pos ir.Position, inTx func(context.Context, *sql.Tx) error) error {
 	if streamID == "" {
 		return errors.New("mysql: applier: WritePosition: streamID is empty")
 	}
@@ -1155,6 +1183,9 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
 	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0, a.upsert)
+	if err == nil && inTx != nil {
+		err = inTx(posCtx, tx)
+	}
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()

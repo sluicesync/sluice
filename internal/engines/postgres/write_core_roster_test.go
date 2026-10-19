@@ -79,8 +79,8 @@ var writeCoreClass = map[string]string{
 	"laneApplierAdapter.ApplyBarrierChange":   "lane-barrier",
 	"ChangeApplier.Apply":                     "serial",
 	"ChangeApplier.persistSourceTxCommit":     "serial-tx-commit-position",
-	"ChangeApplier.WritePosition":             "bare-write-position",
-	"ChangeApplier.batchConfig":               "batch", // pipelined AND serial-fallback handles
+	"ChangeApplier.writePositionWith":         "bare-write-position", // WritePosition and WriteColdStartAnchor (Bug 321 R9b) share it
+	"ChangeApplier.batchConfig":               "batch",               // pipelined AND serial-fallback handles
 	"laneApplierAdapter.ApplyLaneBatch":       "lane-batch",
 	"laneApplierAdapter.applyLaneBatchSerial": "lane-batch-serial",
 	"laneApplierAdapter.WriteCheckpoint":      "lane-checkpoint",

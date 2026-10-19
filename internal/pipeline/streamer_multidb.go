@@ -409,7 +409,7 @@ func (s *Streamer) coldStartMultiDatabase(
 	// warm-resume rather than wedge). One position for the whole stream —
 	// the binlog coordinate is server-wide. ----
 	if pw, ok := applier.(ir.PositionWriter); ok {
-		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
+		if err := writeColdStartAnchor(ctx, pw, streamID, stream.Position); err != nil {
 			abandonStream()
 			return nil, stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: persist multi-database cold-start CDC anchor position: %w", err))
 		}

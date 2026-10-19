@@ -968,6 +968,26 @@ func beginColdStartRecord(ctx context.Context, applier ir.ChangeApplier, streamI
 		"changing the target (the target was not changed): %w", err))
 }
 
+// writeColdStartAnchor writes a cold start's CDC anchor, through
+// [ir.ColdStartAnchorWriter] where the applier has it (Bug 321 R9b): with
+// the anchor it marks a record-less row cold-start-in-progress, so a stop
+// before [Streamer.recordColdStartEstablished] refuses COLD-START-INCOMPLETE
+// instead of leaving a stream with no record. [beginColdStartRecord] cannot
+// mark a stream's first cold start: it has no row until this write. The
+// three anchor sites — the cold start, the stopped-cold-start resume and the
+// multi-database fan-out — all write through here.
+func writeColdStartAnchor(ctx context.Context, pw ir.PositionWriter, streamID string, pos ir.Position) error {
+	if aw, ok := pw.(ir.ColdStartAnchorWriter); ok {
+		return aw.WriteColdStartAnchor(ctx, streamID, pos)
+	}
+	return pw.WritePosition(ctx, streamID, pos)
+}
+
+// coldStartAnchorWrittenForTest, when set, runs right after the cold start's
+// anchor write — the window [writeColdStartAnchor] closes — for a test that
+// stops the run there. Nil in production.
+var coldStartAnchorWrittenForTest func()
+
 // recordColdStartEstablished ends a successful cold-start lane's
 // COLD-START-IN-PROGRESS state: the dropped set loses the tables the copy
 // covered (read now, so a drop recorded since is kept), the established set

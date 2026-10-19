@@ -77,7 +77,7 @@ var writeCoreClass = map[string]string{
 	"ChangeApplier.Apply":                    "serial",
 	"ChangeApplier.persistSourceTxCommit":    "serial-tx-commit-position",
 	"laneApplierAdapter.ApplyBarrierChange":  "lane-barrier",
-	"ChangeApplier.WritePosition":            "bare-write-position",
+	"ChangeApplier.writePositionWith":        "bare-write-position", // WritePosition and WriteColdStartAnchor (Bug 321 R9b) share it
 	"ChangeApplier.batchConfig":              "batch",
 	"laneApplierAdapter.ApplyLaneBatch":      "lane-batch",
 	"laneApplierAdapter.WriteCheckpoint":     "lane-checkpoint",

@@ -439,7 +439,7 @@ func (s *Streamer) resumeStoppedColdStartFromVerifiedState(
 	// is missing — that is the wedge this whole file exists to undo.
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
-		writeErr := pw.WritePosition(anchorCtx, streamID, anchor)
+		writeErr := writeColdStartAnchor(anchorCtx, pw, streamID, anchor)
 		anchorCancel()
 		if writeErr != nil {
 			return nil, nil, true, migcore.WrapWithHint(migcore.PhaseCDC,

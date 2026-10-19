@@ -69,9 +69,10 @@ var skipLedgerFlushRoster = map[string]skipFlushEntry{
 		flushesTheLedger,
 		"CDCPOS-2 TxCommit boundary write; flush precedes BeginTx.",
 	},
-	"mysql.ChangeApplier.WritePosition": {
+	"mysql.ChangeApplier.writePositionWith": {
 		flushExempt,
-		"bare anchor write with rowsApplied=0. Its production callers — broker.go cold-start restore, " +
+		"the bare anchor write behind WritePosition and WriteColdStartAnchor (Bug 321 R9b), with " +
+			"rowsApplied=0. Its production callers — broker.go cold-start restore, " +
 			"migrate.go's snapshot→CDC handoff anchor, streamer_coldstart.go and streamer_multidb.go anchors — " +
 			"all run BEFORE any CDC apply on this applier, so the accumulator cannot hold entries. A future " +
 			"caller that writes an anchor mid-apply re-opens the hazard; move it behind a flushing boundary.",
@@ -123,9 +124,10 @@ var skipLedgerFlushRoster = map[string]skipFlushEntry{
 		flushesTheLedger,
 		"the same fold on the serial fall-back's *sql.Tx; the flush precedes the position.",
 	},
-	"postgres.ChangeApplier.WritePosition": {
+	"postgres.ChangeApplier.writePositionWith": {
 		flushExempt,
-		"bare anchor write with rowsApplied=0 — same callers and same pre-apply argument as the MySQL twin.",
+		"the bare anchor write behind WritePosition and WriteColdStartAnchor (Bug 321 R9b), rowsApplied=0 — " +
+			"same callers and same pre-apply argument as the MySQL twin.",
 	},
 }
 

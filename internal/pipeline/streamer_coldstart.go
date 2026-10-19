@@ -1536,7 +1536,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// this write and not a detail.
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
-		err := pw.WritePosition(anchorCtx, streamID, stream.Position)
+		err := writeColdStartAnchor(anchorCtx, pw, streamID, stream.Position)
 		anchorCancel()
 		if err != nil {
 			_ = stream.Abandon()
@@ -1547,6 +1547,9 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 			slog.String("stream_id", streamID),
 			slog.String("position_token", stream.Position.Token),
 		)
+		if coldStartAnchorWrittenForTest != nil {
+			coldStartAnchorWrittenForTest()
+		}
 	} else {
 		// Shipping engines all implement PositionWriter; an engine
 		// that doesn't would have shipped with the issue #15 wedge,

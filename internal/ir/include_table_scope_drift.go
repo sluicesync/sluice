@@ -101,6 +101,19 @@ type TableIdentityReader interface {
 	TableIdentitySurvivesRebuild() bool
 }
 
+// ColdStartAnchorWriter is the optional applier surface a cold start writes
+// its CDC anchor through (Bug 321 R9b): the anchor and, in the same
+// transaction, the established-table record's cold-start-in-progress mark
+// on a row that has no record yet. A stream's first cold start has no
+// control row until its anchor, so the mark could not be set before the
+// copy, and a stop between the anchor and the record write left a stream
+// with no record — judged like one an older release cold-started, which
+// the scope door convicts almost nothing on. An applier without it gets a
+// plain [PositionWriter] write.
+type ColdStartAnchorWriter interface {
+	WriteColdStartAnchor(ctx context.Context, streamID string, pos Position) error
+}
+
 // LiveAddedTableRetirer is the optional applier surface the running
 // stream's LIVE-ADDED-TABLE-EXCLUDED refusal writes through (Bug 321 R8):
 // in one row-locked transaction on the stream's control row, each table's
