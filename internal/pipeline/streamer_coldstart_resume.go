@@ -253,6 +253,13 @@ func (s *Streamer) resumeStoppedColdStart(
 		return nil, nil, refusal != nil, refusal
 	}
 
+	// GATE — every table it skips is the table the stopped run copied
+	// (RESUMED-COLD-START-CERTIFIES-RECREATED-TABLE). See
+	// [Streamer.resumeTableIdentityGate].
+	if ok, refusal := s.resumeTableIdentityGate(ctx, streamID, state, schema); !ok {
+		return nil, nil, refusal != nil, refusal
+	}
+
 	// GATE — the TARGET-side preflights the cold start ran before its
 	// copy, re-run against the target as it is NOW (see
 	// [Streamer.resumeTargetPreflight] for the enumeration and why a

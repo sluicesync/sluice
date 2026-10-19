@@ -141,6 +141,47 @@ func (r anchorRig) narrowThenRewidenRefuses() {
 	}
 }
 
+// stopInIndexBuildAfterCopies stops s, a Postgres fast-path cold start, in
+// its index build once all n table copies have landed (an index build
+// overlaps the other tables' copies, and a stop that cut one leaves nothing
+// the stopped-cold-start resume can skip), and requires it stopped before
+// its anchor.
+func (r anchorRig) stopInIndexBuildAfterCopies(s *Streamer, n int) {
+	r.t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	copied := 0
+	allCopied := make(chan struct{})
+	prevCopied := onTableCopiedObserver
+	onTableCopiedObserver = func(string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if copied++; copied == n {
+			close(allCopied)
+		}
+	}
+	var once sync.Once
+	restore := postgres.SetIndexBuildStartObserverForTest(func(string) {
+		once.Do(func() {
+			select {
+			case <-allCopied:
+			case <-time.After(2 * time.Minute):
+			}
+			cancel()
+		})
+	})
+	err := s.Run(ctx)
+	restore()
+	onTableCopiedObserver = prevCopied
+	if err == nil {
+		r.t.Fatal("the cold start was not stopped in its index build")
+	}
+	if rec := r.record(); rec.Recorded {
+		r.t.Fatalf("a cold start stopped before its anchor has a record already: %+v", rec)
+	}
+}
+
 // anchorTestRows is a table's row count, -1 when it cannot be read.
 func anchorTestRows(t *testing.T, engine, dsn, table string) int {
 	t.Helper()
@@ -239,41 +280,7 @@ func TestIncludeTableScopeDrift_PgoutputStopAtTheAnchorThenRecreateRefuses(t *te
 // narrowed restart and re-widen behave as after a plain cold start.
 func TestIncludeTableScopeDrift_PgoutputStopAtTheResumeAnchorRefuses(t *testing.T) {
 	r := pgAnchorRig(t)
-	// The stop waits in kx's index build until BOTH copies have landed:
-	// kx's index build overlaps kd's copy, and a stop that cut kd's copy
-	// leaves nothing the resume can skip.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var mu sync.Mutex
-	copied := 0
-	bothCopied := make(chan struct{})
-	prevCopied := onTableCopiedObserver
-	onTableCopiedObserver = func(string) {
-		mu.Lock()
-		defer mu.Unlock()
-		if copied++; copied == 2 {
-			close(bothCopied)
-		}
-	}
-	var once sync.Once
-	restore := postgres.SetIndexBuildStartObserverForTest(func(string) {
-		once.Do(func() {
-			select {
-			case <-bothCopied:
-			case <-time.After(2 * time.Minute):
-			}
-			cancel()
-		})
-	})
-	err := r.run("k*").Run(ctx)
-	restore()
-	onTableCopiedObserver = prevCopied
-	if err == nil {
-		t.Fatal("the cold start was not stopped in its index build")
-	}
-	if rec := r.record(); rec.Recorded {
-		t.Fatalf("a cold start stopped before its anchor has a record already: %+v", rec)
-	}
+	r.stopInIndexBuildAfterCopies(r.run("k*"), 2)
 	logs := captureSlog(t)
 	stopAfterTheAnchor(t, r.run("k*"))
 	if !strings.Contains(logs.String(), coldStartResumedMarker) {

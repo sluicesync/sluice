@@ -1315,7 +1315,7 @@ func (s *Streamer) coldStartRunCopy(ctx context.Context, schema, createSchema *i
 		// (A0909-STOP-1).
 		anchorRec = ir.SnapshotAnchorRecord{
 			Anchor:    stream.Position.Token,
-			CopyShape: coldStartCopyShape(s, schema),
+			CopyShape: s.withCopyTableIDs(ctx, coldStartCopyShape(s, schema), schema),
 		}
 	}
 	rc, closeRecording := s.openColdStartRecording(ctx, streamID, anchorRec)
