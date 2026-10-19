@@ -49,6 +49,7 @@ import (
 	"database/sql"
 	"log"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -431,6 +432,27 @@ func waitForPersistedPositions(t *testing.T, dsn string, streamIDs []string, tim
 	return false
 }
 
+// phase2eControlRow renders a stream's control row — its persisted
+// position and any recorded refusal — for a failure message. Diagnostic
+// only: a read error is rendered, never fatal.
+func phase2eControlRow(t *testing.T, dsn, streamID string) string {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return "open: " + err.Error()
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var pos, refusal sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT source_position, unforwarded_refusal FROM "public"."sluice_cdc_state" WHERE stream_id = $1`,
+		streamID).Scan(&pos, &refusal); err != nil {
+		return "read: " + err.Error()
+	}
+	return "source_position=" + strconv.Quote(pos.String) + " unforwarded_refusal=" + strconv.Quote(refusal.String)
+}
+
 // rebuildPhase2eDSN swaps the database name on a PG DSN — used to
 // disambiguate a per-container connection. (Currently the harness uses
 // each container's default DB so this is a thin wrapper; kept around
@@ -724,16 +746,26 @@ func TestPhase2e_PG_StreamerHarness_RestartResumeAfterBoundary(t *testing.T) {
 	// path: no bulk-copy, no DDL re-apply, just CDC from the persisted
 	// position.
 	_, cancelA2, runErrA2 := startPhase2eStreamer(t, 0, h.sourceDSNs[0], h.targetDSN)
+	restartDone := false
 	defer func() {
-		cancelA2()
-		<-runErrA2
+		if !restartDone {
+			cancelA2()
+			<-runErrA2
+		}
 	}()
 
 	// The new shard_a row lands on the target. Total: 2 seed rows
 	// (shard_a + shard_b) + 2 Phase-B trigger inserts (per task
 	// #67) + 1 post-restart shard_a row = 5.
 	if !waitForPhase2eTargetCount(h.targetDSN, 5, 60*time.Second) {
-		t.Fatalf("phase D: post-restart shard_a row never landed — warm-resume CDC didn't fire")
+		// Report what the restarted run did: a start-time refusal returns
+		// at once, while a run that is streaming returns nil on cancel.
+		cancelA2()
+		restartErr := <-runErrA2
+		restartDone = true
+		t.Fatalf("phase D: post-restart shard_a row never landed — warm-resume CDC didn't fire "+
+			"(target rows %d; restarted Run returned: %v; shard_a control row: %s)",
+			pollRowCount(h.targetDSN, "users"), restartErr, phase2eControlRow(t, h.targetDSN, phase2eStreamID(0)))
 	}
 
 	// Phase E — exactly-once-apply still holds across the restart.
