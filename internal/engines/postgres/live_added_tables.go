@@ -91,12 +91,12 @@ var _ ir.LiveAddedTableRetirer = (*ChangeApplier)(nil)
 
 // RetireLiveAddedTables implements [ir.LiveAddedTableRetirer]: the running
 // stream's LIVE-ADDED-TABLE-EXCLUDED write ([appliershared.RetireLiveAddedTables]).
-func (a *ChangeApplier) RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) error {
+func (a *ChangeApplier) RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) (string, error) {
 	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
-		return err
+		return "", err
 	}
 	if err := a.ensureLiveAddedColumn(ctx, streamID); err != nil {
-		return err
+		return "", err
 	}
 	ref := controlTableRef(a.controlSchema)
 	q := appliershared.RetireQueries{
@@ -114,5 +114,6 @@ func (a *ChangeApplier) RetireLiveAddedTables(ctx context.Context, streamID stri
 			return appliershared.EncodeTableSet(tables)
 		},
 	}
-	return classifyApplierError(appliershared.RetireLiveAddedTables(ctx, a.db, controlCfg, q, codec, streamID, tables))
+	unrecorded, err := appliershared.RetireLiveAddedTables(ctx, a.db, controlCfg, q, codec, streamID, tables)
+	return unrecorded, classifyApplierError(err)
 }

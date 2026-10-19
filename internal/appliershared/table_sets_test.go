@@ -206,3 +206,25 @@ func TestTableSetIDCodec(t *testing.T) {
 		t.Fatalf("a rename: established %q dropped %q leaving %q", est, drop, leaving)
 	}
 }
+
+// TestUnrecordedReason pins each branch R8b's retire reports: a legacy
+// stream (no record), a cold start in progress, a multi-database record —
+// none can take a table as dropped — and an ordinary record, which can.
+func TestUnrecordedReason(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		recorded    bool
+		established []string
+		want        string
+	}{
+		{"legacy: no record", false, nil, UnrecordedLegacy},
+		{"cold start in progress", true, []string{ColdStartInProgressEntry}, UnrecordedColdStart},
+		{"multi-database record", true, []string{"app\x00orders"}, UnrecordedMultiDatabase},
+		{"ordinary record", true, []string{"kd", "users"}, ""},
+		{"empty record", true, nil, ""},
+	} {
+		if got := unrecordedReason(c.recorded, c.established); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}

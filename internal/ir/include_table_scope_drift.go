@@ -108,8 +108,12 @@ type TableIdentityReader interface {
 // established set to the dropped set, and it leaves the live-added set. The
 // changes the stream discarded before it stopped are then on record, so a
 // start that admits the table again refuses until it is copied again.
+// unrecorded is "" when that dropped record was written, and otherwise says
+// why it could not be (no record on a legacy stream, a multi-database
+// record, a cold start in progress, no row): then nothing on record protects
+// a restart that only narrows the exclusion (R8b).
 type LiveAddedTableRetirer interface {
-	RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) error
+	RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) (unrecorded string, err error)
 }
 
 // DroppedAllUncopiedEntry is the dropped-set value behind

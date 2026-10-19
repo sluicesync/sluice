@@ -236,12 +236,12 @@ var _ ir.LiveAddedTableRetirer = (*ChangeApplier)(nil)
 // RetireLiveAddedTables implements [ir.LiveAddedTableRetirer]: the running
 // stream's LIVE-ADDED-TABLE-EXCLUDED write ([appliershared.RetireLiveAddedTables])
 // over this engine's comma-list live_added_tables.
-func (a *ChangeApplier) RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) error {
+func (a *ChangeApplier) RetireLiveAddedTables(ctx context.Context, streamID string, tables []string) (string, error) {
 	if err := a.ensureTableSetColumns(ctx, streamID); err != nil {
-		return err
+		return "", err
 	}
 	if err := ensureLiveAddedTablesColumn(ctx, a.db, a.controlKeyspace); err != nil {
-		return err
+		return "", err
 	}
 	ref := controlTableRef(a.controlKeyspace, controlTableName)
 	q := appliershared.RetireQueries{

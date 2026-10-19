@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -427,8 +428,8 @@ func retireLiveAdded(ctx context.Context, t *testing.T, store Store, read func()
 			t.Fatal(err)
 		}
 	}
-	if err := r.RetireLiveAddedTables(ctx, "s1", []string{"rt", "rp"}); err != nil {
-		t.Fatal(err)
+	if unrecorded, err := r.RetireLiveAddedTables(ctx, "s1", []string{"rt", "rp"}); err != nil || unrecorded != "" {
+		t.Fatalf("retire: %q, %v; want every table recorded", unrecorded, err)
 	}
 	if rec := read(); !reflect.DeepEqual(rec.Established, []string{"a"}) || rec.IDs["a"] != "7" ||
 		!reflect.DeepEqual(rec.Dropped, []string{"old", "rp", "rt"}) {
@@ -447,8 +448,16 @@ func retireLiveAdded(ctx context.Context, t *testing.T, store Store, read func()
 	if live, err := r.ReadLiveAddedTables(ctx, "s1"); err != nil || !reflect.DeepEqual(live, []string{"keep"}) {
 		t.Fatalf("live-added after the retire: %v, %v; want [keep]", live, err)
 	}
-	if err := r.RetireLiveAddedTables(ctx, "no-such-stream", []string{"rt"}); err != nil {
-		t.Fatalf("retiring on a missing row: %v", err)
+	if unrecorded, err := r.RetireLiveAddedTables(ctx, "no-such-stream", []string{"rt"}); err != nil || unrecorded == "" {
+		t.Fatalf("retiring on a missing row: %q, %v; want the no-row reason", unrecorded, err)
+	}
+	// R8b: during a cold start in progress nothing is recorded as dropped,
+	// and the retire says so rather than returning a bare success.
+	if err := store.BeginColdStartRecord(ctx, "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if unrecorded, err := r.RetireLiveAddedTables(ctx, "s1", []string{"keep"}); err != nil || unrecorded != appliershared.UnrecordedColdStart {
+		t.Fatalf("retire during a cold start: %q, %v; want %q", unrecorded, err, appliershared.UnrecordedColdStart)
 	}
 	if err := store.ClearPendingAddedTables(ctx, "s1", []string{"rp"}); err != nil {
 		t.Fatal(err)

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -784,11 +785,14 @@ type LiveAddedCodec struct {
 // an emptied target table, or a cold start that copies it; every other
 // admit refuses as dropped. No row is nothing to retire; the established
 // half is skipped for a stream with no record, a cold start in progress, or
-// a multi-database record. The caller has ensured the columns exist.
-func RetireLiveAddedTables(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RetireQueries, live LiveAddedCodec, streamID string, tables []string) (err error) {
+// a multi-database record, and unrecorded then says which (one of the
+// Unrecorded* reasons; "" when every table was recorded as dropped) — the
+// caller must not claim a protection the record does not give (R8b). The
+// caller has ensured the columns exist.
+func RetireLiveAddedTables(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q RetireQueries, live LiveAddedCodec, streamID string, tables []string) (unrecorded string, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("%s: retire live-added tables: begin: %w", cfg.EngineName, err)
+		return "", fmt.Errorf("%s: retire live-added tables: begin: %w", cfg.EngineName, err)
 	}
 	defer func() {
 		if err != nil {
@@ -798,16 +802,16 @@ func RetireLiveAddedTables(ctx context.Context, db *sql.DB, cfg *ControlTableCon
 	var pendingCol, establishedCol, droppedCol, liveCol sql.NullString
 	switch serr := tx.QueryRowContext(ctx, q.ReadForUpdate, streamID).Scan(&pendingCol, &establishedCol, &droppedCol, &liveCol); {
 	case errors.Is(serr, sql.ErrNoRows):
-		return tx.Rollback()
+		return UnrecordedNoRow, tx.Rollback()
 	case serr != nil:
-		return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, serr)
+		return "", fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, serr)
 	}
 
 	pendingNext := nullableString(pendingCol)
 	if pendingCol.Valid {
 		pending, err := DecodeTableSet(pendingCol.String)
 		if err != nil {
-			return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(PendingAddedTablesColumn, pendingCol.String, err))
+			return "", fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(PendingAddedTablesColumn, pendingCol.String, err))
 		}
 		pset := toEntrySet(pending)
 		for _, t := range tables {
@@ -819,32 +823,33 @@ func RetireLiveAddedTables(ctx context.Context, db *sql.DB, cfg *ControlTableCon
 	}
 
 	establishedNext, droppedNext := nullableString(establishedCol), nullableString(droppedCol)
+	var est []string
+	var ids map[string]string
 	if establishedCol.Valid {
-		est, ids, err := DecodeTableSetIDs(establishedCol.String)
+		if est, ids, err = DecodeTableSetIDs(establishedCol.String); err != nil {
+			return "", fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(EstablishedTablesColumn, establishedCol.String, err))
+		}
+	}
+	if unrecorded = unrecordedReason(establishedCol.Valid, est); unrecorded == "" {
+		drop, err := DecodeTableSet(droppedCol.String)
 		if err != nil {
-			return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(EstablishedTablesColumn, establishedCol.String, err))
+			return "", fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(DroppedTablesColumn, droppedCol.String, err))
 		}
-		if !inProgressOrMultiDatabase(est) {
-			drop, err := DecodeTableSet(droppedCol.String)
-			if err != nil {
-				return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable(DroppedTablesColumn, droppedCol.String, err))
-			}
-			eset, dset := toEntrySet(est), toEntrySet(drop)
-			for _, t := range tables {
-				delete(eset, t)
-				delete(ids, t)
-				dset[t] = struct{}{}
-			}
-			establishedNext = EncodeTableSetIDs(entriesOf(eset), ids)
-			droppedNext = EncodeTableSet(entriesOf(dset))
+		eset, dset := toEntrySet(est), toEntrySet(drop)
+		for _, t := range tables {
+			delete(eset, t)
+			delete(ids, t)
+			dset[t] = struct{}{}
 		}
+		establishedNext = EncodeTableSetIDs(entriesOf(eset), ids)
+		droppedNext = EncodeTableSet(entriesOf(dset))
 	}
 
 	liveNext := nullableString(liveCol)
 	if liveCol.Valid {
 		current, err := live.Decode(liveCol.String)
 		if err != nil {
-			return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable("live_added_tables", liveCol.String, err))
+			return "", fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, undecodable("live_added_tables", liveCol.String, err))
 		}
 		leaving := toEntrySet(tables)
 		kept := make([]string, 0, len(current))
@@ -856,12 +861,35 @@ func RetireLiveAddedTables(ctx context.Context, db *sql.DB, cfg *ControlTableCon
 		liveNext = live.Encode(kept)
 	}
 	if _, err := tx.ExecContext(ctx, q.Update, pendingNext, establishedNext, droppedNext, liveNext, streamID); err != nil {
-		return fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, err)
+		return "", fmt.Errorf("%s: retire live-added tables: %w", cfg.EngineName, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("%s: retire live-added tables: commit: %w", cfg.EngineName, err)
+		return "", fmt.Errorf("%s: retire live-added tables: commit: %w", cfg.EngineName, err)
 	}
-	return nil
+	return unrecorded, nil
+}
+
+// Why [RetireLiveAddedTables] recorded no table as dropped.
+const (
+	UnrecordedNoRow         = "the stream has no control row"
+	UnrecordedLegacy        = "the stream has no established-table record (it was cold-started before the record existed)"
+	UnrecordedColdStart     = "a cold start of the stream is in progress"
+	UnrecordedMultiDatabase = "a multi-database stream's record keys tables by database, and add-table names a bare table"
+)
+
+// unrecordedReason is why [RetireLiveAddedTables] cannot record a table as
+// dropped on an established record in this state, "" when it can.
+func unrecordedReason(recorded bool, established []string) string {
+	switch {
+	case !recorded:
+		return UnrecordedLegacy
+	case slices.Contains(established, ColdStartInProgressEntry):
+		return UnrecordedColdStart
+	case inProgressOrMultiDatabase(established):
+		return UnrecordedMultiDatabase
+	default:
+		return ""
+	}
 }
 
 // entriesOf is a set's entries, sorted.

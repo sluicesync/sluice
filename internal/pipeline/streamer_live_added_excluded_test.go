@@ -11,9 +11,51 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
+
+// TestLiveAddedExcluded_UnrecordedRetireSaysUnprotected is R8b: when the
+// retire commits but cannot record the table as dropped — a legacy stream
+// with no record, a multi-database record, a cold start in progress, no row
+// — the refusal must not claim a narrowed-exclusion restart refuses; it
+// names the reason and says that restart is NOT protected. The recorded case
+// keeps the protected wording.
+func TestLiveAddedExcluded_UnrecordedRetireSaysUnprotected(t *testing.T) {
+	refusalFor := func(unrecorded string) string {
+		t.Helper()
+		live := &liveAddedFilter{}
+		check := liveAddedCheck{
+			streamID: "st", base: migcore.TableFilter{Exclude: []string{"tmp_*"}}, source: "postgres", target: "postgres",
+			retire: func(context.Context, []string) (string, error) { return unrecorded, nil },
+		}
+		if observeLiveAdded(context.Background(), check, live, []string{"tmp_keep"}) {
+			t.Fatal("the contradiction was installed")
+		}
+		if live.refusalErr() == nil {
+			t.Fatal("the stream kept running")
+		}
+		return live.refusalErr().Error()
+	}
+	for _, reason := range []string{
+		appliershared.UnrecordedLegacy, appliershared.UnrecordedMultiDatabase, appliershared.UnrecordedColdStart,
+		appliershared.UnrecordedNoRow,
+	} {
+		msg := refusalFor(reason)
+		for _, want := range []string{"could not record it as dropped: " + reason, "is NOT protected", "redo its copy"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("%s: refusal lacks %q: %s", reason, want, msg)
+			}
+		}
+		if strings.Contains(msg, "has recorded the table as dropped") || strings.Contains(msg, "only narrows the exclusion refuses") {
+			t.Errorf("%s: refusal claims a protection the record does not give: %s", reason, msg)
+		}
+	}
+	if msg := refusalFor(""); !strings.Contains(msg, "has recorded the table as dropped") || strings.Contains(msg, "NOT protected") {
+		t.Errorf("recorded: want the protected wording: %s", msg)
+	}
+}
 
 // liveAddedApplier is a fakeApplier carrying a live-added set.
 type liveAddedApplier struct {
@@ -113,7 +155,7 @@ func TestLiveAddedExcluded_RunningStreamStops(t *testing.T) {
 	retired := make(chan []string, 1)
 	check := liveAddedCheck{
 		streamID: "st", base: base, source: "postgres", target: "postgres",
-		retire: func(_ context.Context, tables []string) error { retired <- tables; return nil },
+		retire: func(_ context.Context, tables []string) (string, error) { retired <- tables; return "", nil },
 	}
 	go pollLiveAddedTables(ctx, reader, check, live)
 
@@ -177,7 +219,7 @@ func TestLiveAddedExcluded_RetireFailureStillStops(t *testing.T) {
 	live := &liveAddedFilter{}
 	check := liveAddedCheck{
 		streamID: "st", base: migcore.TableFilter{Exclude: []string{"tmp_*"}}, source: "mysql", target: "mysql",
-		retire: func(context.Context, []string) error { return errors.New("control row unwritable") },
+		retire: func(context.Context, []string) (string, error) { return "", errors.New("control row unwritable") },
 	}
 	if observeLiveAdded(context.Background(), check, live, []string{"tmp_keep"}) {
 		t.Fatal("the contradiction was installed")
