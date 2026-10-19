@@ -193,12 +193,17 @@ func TestIncludeTableScopeDrift_BinlogStopAtTheAnchorRefuses(t *testing.T) {
 // TestIncludeTableScopeDrift_PgoutputStopAtTheAnchorThenRecreateRefuses is
 // R9c: without the ids on the anchor's record, a table dropped and
 // re-created under the same name while the stream was stopped passed the
-// identity check (nothing to compare) instead of refusing.
+// identity check (nothing to compare) instead of refusing. The re-created
+// table goes back into the publication, as an operator re-adding it would
+// (or a FOR ALL TABLES / FOR TABLES IN SCHEMA publication does by itself),
+// so the "no longer in publication" conviction cannot catch it first: only
+// the identity check can.
 func TestIncludeTableScopeDrift_PgoutputStopAtTheAnchorThenRecreateRefuses(t *testing.T) {
 	r := pgAnchorRig(t)
 	stopAfterTheAnchor(t, r.run("k*"))
-	r.applySrc(`DROP TABLE kx; CREATE TABLE kx (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO kx VALUES (9, 'new')`)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	r.applySrc(`DROP TABLE kx; CREATE TABLE kx (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO kx VALUES (9, 'new');
+		ALTER PUBLICATION sluice_pub ADD TABLE kx`)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	err := r.run("k*").Run(ctx)
 	if !errors.Is(err, ir.ErrIncludeTableScopeDrift) || !strings.Contains(err.Error(), "TABLE-IDENTITY-CHANGED") {
