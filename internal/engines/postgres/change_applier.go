@@ -1253,26 +1253,26 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 var _ ir.ColdStartAnchorWriter = (*ChangeApplier)(nil)
 
 // WriteColdStartAnchor implements [ir.ColdStartAnchorWriter]: the cold
-// start's CDC anchor and, in the same transaction, the record's
-// cold-start-in-progress mark on a row that has no record yet (Bug 321
-// R9b). A stream's first cold start has no control row until this write,
-// so its in-progress mark could not be set before the copy; a stop between
-// the anchor and the record left a row with a position and no record — a
-// stream the scope door judges as one cold-started by an older release,
-// which convicts almost nothing. Written together, a stop there leaves the
-// mark, which refuses COLD-START-INCOMPLETE until a cold start records its
-// copy. Where the record's columns cannot be added (a role that cannot
-// ALTER the control table), the anchor is written alone, as before.
-func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position) error {
+// start's CDC anchor and, in the same transaction, the copied set as the
+// record of a row that has none yet (Bug 321 R9b). A stream's first cold
+// start has no control row until this write; a stop between the anchor and
+// the full record write used to leave a row with a position and no record —
+// a stream the scope door judges as one cold-started by an older release,
+// which convicts almost nothing. Written with the anchor, the copy that the
+// anchor describes is on record, so the warm resume the anchor exists for
+// (GitHub #15) is judged on it. A row that already has a record (a later
+// cold start, marked in progress before its copy) is left alone. Where the
+// record's columns cannot be added (a role that cannot ALTER the control
+// table), the anchor is written alone, as before.
+func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position, copied []string) error {
 	if a.ensureTableSetColumns(ctx, streamID) != nil {
 		return a.writePositionWith(ctx, streamID, pos, nil)
 	}
-	mark := "UPDATE " + controlTableRef(a.controlSchema) + " SET " + appliershared.EstablishedTablesColumn +
+	record := "UPDATE " + controlTableRef(a.controlSchema) + " SET " + appliershared.EstablishedTablesColumn +
 		" = $1 WHERE stream_id = $2 AND " + appliershared.EstablishedTablesColumn + " IS NULL"
 	return a.writePositionWith(ctx, streamID, pos, func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, mark, appliershared.EncodeTableSet([]string{appliershared.ColdStartInProgressEntry}), streamID)
-		if err != nil {
-			return fmt.Errorf("postgres: applier: mark the cold start in progress with its anchor: %w", err)
+		if _, err := tx.ExecContext(ctx, record, appliershared.EncodeTableSet(copied), streamID); err != nil {
+			return fmt.Errorf("postgres: applier: record the cold start's copy with its anchor: %w", err)
 		}
 		return nil
 	})

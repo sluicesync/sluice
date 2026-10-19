@@ -634,9 +634,11 @@ func (r *scopeDriftRig) establishTwo(second, tables string, extra ...string) {
 		r.t.Fatalf("cold start: target kd = %q%s", got, run.logTail())
 	}
 	// Stop only once the cold start recorded what it copied: the copied rows
-	// are visible before the record write, and a stop in between leaves the
-	// in-progress mark (R9b), which the next start refuses. Before R9b a stop
-	// there left no record at all — the CI failure this wait came from.
+	// are visible before the anchor, and a stop before it leaves a cold start
+	// with no anchor (a loud refusal on the narrowed restart, not the state
+	// this test is about). A stop between the anchor and the full record now
+	// keeps the copied set the anchor recorded (R9b); before R9b it left no
+	// record at all — the CI failure this wait came from.
 	r.waitRecorded(run)
 	run.end()
 	time.Sleep(2 * time.Second)

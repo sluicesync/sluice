@@ -970,15 +970,19 @@ func beginColdStartRecord(ctx context.Context, applier ir.ChangeApplier, streamI
 
 // writeColdStartAnchor writes a cold start's CDC anchor, through
 // [ir.ColdStartAnchorWriter] where the applier has it (Bug 321 R9b): with
-// the anchor it marks a record-less row cold-start-in-progress, so a stop
-// before [Streamer.recordColdStartEstablished] refuses COLD-START-INCOMPLETE
-// instead of leaving a stream with no record. [beginColdStartRecord] cannot
-// mark a stream's first cold start: it has no row until this write. The
-// three anchor sites — the cold start, the stopped-cold-start resume and the
-// multi-database fan-out — all write through here.
-func writeColdStartAnchor(ctx context.Context, pw ir.PositionWriter, streamID string, pos ir.Position) error {
+// the anchor it records copied — the record entries the anchor's copy
+// covered — on a row that has no record yet, so a stop before
+// [Streamer.recordColdStartEstablished] leaves the stream judged on the copy
+// it made instead of on no record at all. A stream's first cold start has no
+// row until this write, so [beginColdStartRecord] could not mark it, and a
+// mark would be wrong here anyway: the copy has finished, and the warm
+// resume this anchor exists for (GitHub #15) is the correct next step. The
+// full record (ids, the dropped set) follows in recordColdStartEstablished.
+// The three anchor sites — the cold start, the stopped-cold-start resume and
+// the multi-database fan-out — all write through here.
+func writeColdStartAnchor(ctx context.Context, pw ir.PositionWriter, streamID string, pos ir.Position, copied []string) error {
 	if aw, ok := pw.(ir.ColdStartAnchorWriter); ok {
-		return aw.WriteColdStartAnchor(ctx, streamID, pos)
+		return aw.WriteColdStartAnchor(ctx, streamID, pos, copied)
 	}
 	return pw.WritePosition(ctx, streamID, pos)
 }

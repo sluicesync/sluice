@@ -392,11 +392,11 @@ func narrowAndAbandon(ctx context.Context, t *testing.T, store Store) {
 	retireLiveAdded(ctx, t, store, read, recordPending, complete)
 }
 
-// ColdStartAnchor is Bug 321 R9b: a cold start's anchor write marks a stream
-// with no record cold-start-in-progress in its own transaction (a first
-// cold start has no row to mark before it), leaves an existing record
-// alone, and a plain position write (broker, migrate checkpoint) marks
-// nothing.
+// ColdStartAnchor is Bug 321 R9b: a cold start's anchor write records its
+// copied set on a stream with no record, in its own transaction (a first
+// cold start has no row before it); an anchor over an existing record — a
+// later cold start's in-progress mark included — leaves it; and a plain
+// position write (broker, migrate checkpoint) records nothing.
 func ColdStartAnchor(ctx context.Context, t *testing.T, store Store) {
 	t.Helper()
 	aw, ok := store.(ir.ColdStartAnchorWriter)
@@ -419,20 +419,29 @@ func ColdStartAnchor(ctx context.Context, t *testing.T, store Store) {
 	if rec := readOf("anchor-plain"); rec.Recorded {
 		t.Fatalf("a plain position write marked the record: %+v", rec)
 	}
-	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos); err != nil {
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"kd", "kx"}); err != nil {
 		t.Fatal(err)
 	}
-	if rec := readOf("anchor-new"); !rec.ColdStartInProgress {
-		t.Fatalf("a first cold start's anchor left the record %+v; want cold start in progress", rec)
+	if rec := readOf("anchor-new"); !rec.Recorded || rec.ColdStartInProgress || !reflect.DeepEqual(rec.Established, []string{"kd", "kx"}) {
+		t.Fatalf("a first cold start's anchor left the record %+v; want established [kd kx]", rec)
 	}
 	if err := store.RecordEstablishedTables(ctx, "anchor-new", []string{"kd"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos); err != nil {
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"zz"}); err != nil {
 		t.Fatal(err)
 	}
-	if rec := readOf("anchor-new"); rec.ColdStartInProgress || !reflect.DeepEqual(rec.Established, []string{"kd"}) {
+	if rec := readOf("anchor-new"); !reflect.DeepEqual(rec.Established, []string{"kd"}) {
 		t.Fatalf("an anchor over an existing record changed it: %+v", rec)
+	}
+	if err := store.BeginColdStartRecord(ctx, "anchor-new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := aw.WriteColdStartAnchor(ctx, "anchor-new", pos, []string{"zz"}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := readOf("anchor-new"); !rec.ColdStartInProgress {
+		t.Fatalf("an anchor over a later cold start's in-progress mark replaced it: %+v", rec)
 	}
 }
 

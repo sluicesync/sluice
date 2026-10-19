@@ -361,13 +361,13 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	// Persist the cold-start CDC anchor (GitHub #15), then start CDC
 	// from the snapshot's position. The returned stop closure closes
 	// the snapshot stream when Run unwinds.
+	//
+	// Every in-scope table is now copied under this anchor: the stream's
+	// established set (INCLUDE-TABLE-SCOPE-DRIFT), recorded by
+	// phaseOpenChangeStream once the branch returns, and — for a stream with
+	// no record yet — by the anchor write itself (R9b), which reads it here.
+	s.coldStartEstablished = snapshotTables
 	changes, stop, err = s.coldStartBeginCDC(ctx, stream, applier, streamID)
-	if err == nil {
-		// Every in-scope table is now copied under this anchor: the
-		// stream's established set (INCLUDE-TABLE-SCOPE-DRIFT), recorded by
-		// phaseOpenChangeStream once the branch returns.
-		s.coldStartEstablished = snapshotTables
-	}
 	return changes, stop, err
 }
 
@@ -1536,7 +1536,7 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 	// this write and not a detail.
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		anchorCtx, anchorCancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
-		err := writeColdStartAnchor(anchorCtx, pw, streamID, stream.Position)
+		err := writeColdStartAnchor(anchorCtx, pw, streamID, stream.Position, s.coldStartEstablished)
 		anchorCancel()
 		if err != nil {
 			_ = stream.Abandon()

@@ -1149,20 +1149,19 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 var _ ir.ColdStartAnchorWriter = (*ChangeApplier)(nil)
 
 // WriteColdStartAnchor implements [ir.ColdStartAnchorWriter]: the cold
-// start's CDC anchor and, in the same transaction, the record's
-// cold-start-in-progress mark on a row that has no record yet (Bug 321
-// R9b; see the Postgres applier's for the window it closes). Where the
-// record's columns cannot be added, the anchor is written alone.
-func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position) error {
+// start's CDC anchor and, in the same transaction, the copied set as the
+// record of a row that has none yet (Bug 321 R9b; see the Postgres
+// applier's for the window it closes). Where the record's columns cannot be
+// added, the anchor is written alone.
+func (a *ChangeApplier) WriteColdStartAnchor(ctx context.Context, streamID string, pos ir.Position, copied []string) error {
 	if a.ensureTableSetColumns(ctx, streamID) != nil {
 		return a.writePositionWith(ctx, streamID, pos, nil)
 	}
-	mark := "UPDATE " + controlTableRef(a.controlKeyspace, controlTableName) + " SET " + appliershared.EstablishedTablesColumn +
+	record := "UPDATE " + controlTableRef(a.controlKeyspace, controlTableName) + " SET " + appliershared.EstablishedTablesColumn +
 		" = ? WHERE stream_id = ? AND " + appliershared.EstablishedTablesColumn + " IS NULL"
 	return a.writePositionWith(ctx, streamID, pos, func(ctx context.Context, tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, mark, appliershared.EncodeTableSet([]string{appliershared.ColdStartInProgressEntry}), streamID)
-		if err != nil {
-			return fmt.Errorf("mysql: applier: mark the cold start in progress with its anchor: %w", err)
+		if _, err := tx.ExecContext(ctx, record, appliershared.EncodeTableSet(copied), streamID); err != nil {
+			return fmt.Errorf("mysql: applier: record the cold start's copy with its anchor: %w", err)
 		}
 		return nil
 	})
