@@ -4,9 +4,15 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.163.2] - 2026-10-20
+
 ### Fixed
 
-- **A failed re-read of a copy's table ids no longer passes the check it exists for (ANCHOR-ID-REREAD-FAILURE-PASSES, MEDIUM, silent for one run; Postgres; present since v0.163.1).** A cold start's CDC anchor, and `schema add-table` before recording an add complete, re-read each table's `pg_class.oid` and refuse `TABLE-IDENTITY-CHANGED` on one that moved since the copy. A read that failed (a connection error, a namespace that could not be resolved) returned no id, which the check treated like a table the source no longer holds, so it passed and recorded the copy-time ids. A table re-created in the same window then had its changes applied onto the old table's rows for the rest of that run; the next start's identity check refused it. A failed re-read now refuses with `TABLE-IDENTITY-UNREAD`, naming the cause, and writes nothing; a table the source genuinely no longer holds still passes. Sources whose ids are not proof (MySQL-family) keep their best-effort read. Pinned by `TestAnchorTableIDs` and `TestAddTableVerifiedTableIdentity`.
+- **A failed re-read of a copy's table ids no longer passes the check it exists for (ANCHOR-ID-REREAD-FAILURE-PASSES, MEDIUM, silent for one run; Postgres; present since v0.163.1).** A cold start's CDC anchor, and `schema add-table` before recording an add complete, re-read each table's `pg_class.oid` and refuse `TABLE-IDENTITY-CHANGED` on one that moved since the copy. A read that failed (a connection error, a namespace that could not be resolved) returned no id, which the check treated like a table the source no longer holds, so it passed and recorded the copy-time ids. A table re-created in the same window then had its changes applied onto the old table's rows for the rest of that run; the next start's identity check refused it. A failed re-read now refuses with `TABLE-IDENTITY-UNREAD`, naming the cause, and writes nothing; a table the source genuinely no longer holds still passes. Sources whose ids are not proof (MySQL-family) keep their best-effort read. Pinned by `TestAnchorTableIDs` and `TestAddTableVerifiedTableIdentity`. On the refusal, re-copy as for `TABLE-IDENTITY-CHANGED` (for an add, empty the target table and run it again); not measured end to end.
+
+### Compatibility
+
+- No flag change and no backup format change (`BackupFormatVersion` stays 15).
 
 ## [0.163.1] - 2026-10-19
 

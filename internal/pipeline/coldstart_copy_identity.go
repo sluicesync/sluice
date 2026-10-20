@@ -144,13 +144,15 @@ func (s *Streamer) anchorTableIDs(ctx context.Context, keys []string) (map[strin
 }
 
 // copyIdentityUnread is the TABLE-IDENTITY-UNREAD refusal of an anchor
-// whose re-read of the copy's ids failed. Nothing is anchored, so the run
-// is still a stopped cold start.
+// whose re-read of the copy's ids failed. Nothing is anchored; the remedy
+// is the TABLE-IDENTITY-CHANGED one, because a fresh cold start's refusal
+// abandons its stream (dropping the slot), so a plain re-run would not
+// resume.
 func (s *Streamer) copyIdentityUnread(cause error) error {
 	return fmt.Errorf("pipeline: %s: could not re-read the source's table ids to prove the tables are the ones this cold "+
-		"start copied, so sluice has not written the CDC anchor: %w. Re-run your `sluice sync start` command once the "+ // remedy-partial: the operator's own invocation carries their DSNs and flags
-		"source can be read; if it refuses on this stream's existing replication slot, re-copy: `sluice slot drop "+
-		"--source-driver %s --source <SOURCE-DSN> %s --yes`, then the same command with --restart-from-scratch added",
+		"start copied, so sluice has not written the CDC anchor: %w. Once the source can be read, re-copy: drop this "+
+		"stream's replication slot with `sluice slot drop --source-driver %s --source <SOURCE-DSN> %s --yes` if one is "+ // remedy-partial: the operator's own invocation carries their DSNs and flags
+		"left, then re-run your `sluice sync start` command with --restart-from-scratch added",
 		TableIdentityUnreadMarker, cause, s.Source.Name(), resolveSlotNameForDisplay(s.SlotName))
 }
 
