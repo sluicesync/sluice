@@ -122,12 +122,19 @@ func (s *Streamer) anchorTableIDs(ctx context.Context, keys []string) (map[strin
 	if coldStartBeforeAnchorIDsForTest != nil {
 		coldStartBeforeAnchorIDsForTest()
 	}
+	// The re-read runs on the anchor write's uncancellable, bounded context
+	// ([coldStartAnchorWriteTimeout]): a stop landing here must not fail
+	// the read, because a failed read now refuses, and a fresh cold start's
+	// refusal abandons its stream, dropping the slot of a copy that
+	// succeeded — the wedge that write exists to prevent.
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldStartAnchorWriteTimeout)
+	defer cancel()
 	if !s.identityProof() {
-		current := s.establishedIDs(ctx, keys)
+		current := s.establishedIDs(readCtx, keys)
 		s.coldStartIDs.anchored = nonNil(current)
 		return current, nil
 	}
-	current, readErr := s.readEstablishedIDs(ctx, keys)
+	current, readErr := s.readEstablishedIDs(readCtx, keys)
 	ids, changed := verifyCopyIdentities(s.coldStartIDs.copied, current, keys)
 	if len(changed) > 0 {
 		return nil, s.copyIdentityChanged(changed, "between its copy and its CDC anchor (sluice has not written the anchor)")
