@@ -779,7 +779,7 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 	// sink is simply not wired. Requires a PositionWriter applier (every
 	// shipping engine implements it); without one we skip the wiring (the
 	// checkpoint would have nowhere durable to land).
-	applyCopyCheckpoint(stream.Rows, applier, streamID)
+	applyCopyCheckpoint(stream.Rows, applier, s.Source, streamID)
 
 	return stream, nil
 }

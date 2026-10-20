@@ -313,7 +313,7 @@ jobs:
     name: Pipeline vstream suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 89
+    timeout-minutes: 93
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
       # The -run alternation, defined ONCE so the budget guard below and
@@ -343,7 +343,12 @@ jobs:
       # Re-derived 2026-10-16 (UNIQUE-KEY-STOPPED-WINDOW-DOOR): +1,
       # TestStreamer_UniqueKeyDoor_VStream — one vttestserver boot, a cold
       # start and three restarts (~3m) — makes 23, 83m/89m.
-      VSTREAM_PIPELINE_EXPECTED_TESTS: "23"
+      # Re-derived 2026-10-20 (VSTREAM-COPY-RESUME-* measurements): +1,
+      # TestStreamer_VStreamCopyResume — one vttestserver boot and six
+      # unskipped cells, three of them the VSTREAM-COPY-CURSORLESS-
+      # CHECKPOINT-WARM-RESUMES pins (~3.5m locally; the RECREATED-TABLE
+      # cells skip until fixed) — makes 24, 87m/93m.
+      VSTREAM_PIPELINE_EXPECTED_TESTS: "24"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7.0.0
@@ -388,7 +393,7 @@ jobs:
       - name: Run the pipeline vstream tests
         run: |
           set -o pipefail
-          go test -tags='integration vstream' -race -count=1 -timeout=83m \
+          go test -tags='integration vstream' -race -count=1 -timeout=87m \
             -run "$VSTREAM_PIPELINE_RUN" -v ./internal/pipeline/ 2>&1 | tee vstream-pipeline.out
           # Second half of the TEST-9 guard, mirroring the filtered-tag-
           # gate's per-test PASS assert: every matched test must have

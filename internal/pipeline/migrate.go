@@ -2407,7 +2407,21 @@ func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *
 // behaviour (position persisted only at COPY_COMPLETED). The ctx passed
 // to the sink at call time is the COPY pump's own context, supplied per
 // checkpoint by the engine — there's no pipeline-side ctx to capture.
-func applyCopyCheckpoint(rows ir.RowReader, applier ir.ChangeApplier, streamID string) {
+//
+// A checkpoint is persisted ONLY when the next start will read it as a
+// mid-COPY resume ([ir.SnapshotStreamResumer.PositionCarriesCopyCursor])
+// (VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES). The next start routes
+// a persisted position without a cursor to the plain warm resume, which
+// is what a COMPLETED copy leaves; a mid-COPY position without one (the
+// first checkpoint before any TablePKs, one taken between two tables, every
+// checkpoint of a multi-table single-stream copy) was therefore read as a
+// finished copy, and the rest of the table was never copied, at exit 0.
+// Skipping such a write leaves whatever was there: an earlier cursor (the
+// resume re-copies from it), a completed stream's position under the
+// cold start's in-progress mark (COLD-START-INCOMPLETE), or no row at all
+// (the populated-target refusal). A source with no resumer cannot resume
+// any mid-COPY position, so nothing is wired.
+func applyCopyCheckpoint(rows ir.RowReader, applier ir.ChangeApplier, source ir.Engine, streamID string) {
 	cp, ok := rows.(ir.CopyCheckpointer)
 	if !ok {
 		return
@@ -2416,7 +2430,16 @@ func applyCopyCheckpoint(rows ir.RowReader, applier ir.ChangeApplier, streamID s
 	if !ok {
 		return
 	}
+	resumer, ok := source.(ir.SnapshotStreamResumer)
+	if !ok {
+		return
+	}
 	cp.SetCopyCheckpoint(func(checkpointCtx context.Context, pos ir.Position) error {
+		if !resumer.PositionCarriesCopyCursor(pos) {
+			slog.DebugContext(checkpointCtx, "COPY checkpoint not persisted: its position carries no copy cursor, so the "+
+				"next start would read it as a completed copy", slog.String("stream_id", streamID))
+			return nil
+		}
 		return pw.WritePosition(checkpointCtx, streamID, pos)
 	})
 }
