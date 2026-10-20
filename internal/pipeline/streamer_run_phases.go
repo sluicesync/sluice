@@ -24,6 +24,12 @@ import (
 // live-add would have a window where events on the live-added table
 // were dropped (poll is on a 5s tick) — the seed closes that window.
 //
+// It is NOT what puts the persisted set in scope for the reader: the reader
+// is already pumping when this runs. [Streamer.phaseReadLiveAddedScope]
+// seeds the filter before the reader opens (Bug 322); this re-read picks up
+// an add recorded between the two and applies the running-stream exclusion
+// check to it.
+//
 // Engines without [liveAddedTablesReader] (PG; pre-v0.27.0 control
 // table) silently skip; the streamer behaves as if there are no
 // live-adds, which is correct for those engines (PG uses
@@ -1030,10 +1036,17 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 	// the seed and the poll cleanly — type assertion fails and the
 	// dispatch filter sees an empty live-added set forever, preserving
 	// pre-v0.27.0 behaviour.
-	liveFilter := &liveAddedFilter{}
-	// Publish to the reader-side scope predicate (Bug 246) so a live-added
-	// table's XA policy check agrees with the dispatch filter.
-	s.liveFilterRef.Store(liveFilter)
+	//
+	// The filter is the one [Streamer.phaseReadLiveAddedScope] created and
+	// published to the reader-side scope predicate (Bug 246) before the
+	// reader opened, already holding the persisted set (Bug 322): creating a
+	// fresh one here would leave the reader judging its first events against
+	// an empty set. The seed below re-reads the set onto it.
+	liveFilter := s.liveFilterRef.Load()
+	if liveFilter == nil {
+		liveFilter = &liveAddedFilter{}
+		s.liveFilterRef.Store(liveFilter)
+	}
 	s.seedLiveAddedFilter(applyCtx, applier, streamID, liveFilter)
 	s.startLiveAddedTablesPoll(applyCtx, applier, streamID, liveFilter)
 

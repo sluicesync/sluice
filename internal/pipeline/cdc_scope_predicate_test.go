@@ -4,6 +4,7 @@
 package pipeline
 
 import (
+	"context"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -75,5 +76,46 @@ func TestWireCDCScopePredicate(t *testing.T) {
 	s.Filter = inc
 	if !r.allowed("app", "orders") {
 		t.Fatal("a live-added table outside an --include-table list is out of the reader's scope")
+	}
+}
+
+// TestWireCDCScopePredicate_PersistedLiveAddInScopeBeforeTheReaderOpens pins
+// Bug 322 at the seam every reader-open site shares: once
+// [Streamer.phaseReadLiveAddedScope] has run — the first thing
+// phaseOpenChangeStream does, before any branch opens a reader — the reader's
+// scope predicate already admits a table a previous run live-added. The apply
+// sidecars, which used to create the filter, have NOT run here. Before the
+// fix the predicate rejected the table in that gap and the MySQL binlog
+// reader dropped its stopped-window changes at every restart, at exit 0.
+// Engine-neutral by construction: it is the predicate every
+// [ir.CDCScopePredicateSetter] reader is handed.
+func TestWireCDCScopePredicate_PersistedLiveAddInScopeBeforeTheReaderOpens(t *testing.T) {
+	inc, err := migcore.NewTableFilter([]string{"kd"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Streamer{Filter: inc}
+	app := &scopeDriftApplier{liveAdded: []string{"users"}}
+	if err := s.phaseReadLiveAddedScope(context.Background(), app, "st"); err != nil {
+		t.Fatalf("phaseReadLiveAddedScope: %v", err)
+	}
+	r := &recordingScopeReader{}
+	s.wireCDCScopePredicate(r)
+	if !r.allowed("app", "users") {
+		t.Fatal("the reader's scope predicate rejects a persisted live-added table before the apply sidecars run — " +
+			"the reader drops its stopped-window changes (Bug 322)")
+	}
+	if r.allowed("app", "other") {
+		t.Fatal("the predicate admits a table neither the filter nor the live-added set names")
+	}
+
+	// A later attempt starts from the set it reads, not the previous
+	// attempt's: an --abandon'ed add is out of scope at the next start.
+	app.liveAdded = nil
+	if err := s.phaseReadLiveAddedScope(context.Background(), app, "st"); err != nil {
+		t.Fatalf("phaseReadLiveAddedScope (second attempt): %v", err)
+	}
+	if r.allowed("app", "users") {
+		t.Fatal("a live-added table the stream no longer carries stays in the reader's scope from a previous attempt")
 	}
 }

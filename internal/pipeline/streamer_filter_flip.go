@@ -458,8 +458,20 @@ func (c liveAddedCheck) refusalWith(tables []string, what string) error {
 // add. --reset-target-data deletes the control row the set lives on before its
 // cold start, so the set is discarded rather than copied; the WARN names what
 // that leaves unreplicated.
+//
+// It also creates the attempt's [liveAddedFilter], seeded with the set, and
+// publishes it in s.liveFilterRef — HERE, before any branch opens a reader,
+// because the reader's scope predicate ([Streamer.wireCDCScopePredicate])
+// reads that filter from the first event the reader decodes (Bug 322). The
+// filter used to be created by the apply sidecars, after the reader had
+// started: the MySQL binlog reader, which drops a rows event whose table the
+// predicate rejects, read a live-added table's stopped-window changes in that
+// gap, found the table out of scope and discarded them, at exit 0, on every
+// restart. The sidecars' seed and poll refresh this same filter.
 func (s *Streamer) phaseReadLiveAddedScope(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
 	s.startLiveAdded = nil
+	live := &liveAddedFilter{}
+	s.liveFilterRef.Store(live)
 	reader, ok := applier.(liveAddedTablesReader)
 	if !ok {
 		return nil
@@ -490,6 +502,7 @@ func (s *Streamer) phaseReadLiveAddedScope(ctx context.Context, applier ir.Chang
 		return s.liveAddedCheckFor(streamID, applier).refusal(excluded)
 	}
 	s.startLiveAdded = tables
+	live.Set(tables)
 	return nil
 }
 
@@ -510,9 +523,15 @@ func (s *Streamer) copyFilter() migcore.TableFilter {
 // excluding the table changed nothing the reader could see). Wired at every
 // reader-open site — cold start, warm resume, and both multidb paths — the
 // same enumeration the poll-interval setter carries. The closure reads the
-// live-add set through an atomic pointer (nil until the apply sidecars
-// create it — correct, since no live-add can exist before they start), so
-// it is safe from the reader's pump goroutine. Type-assert/silent-ignore
+// live-add set through an atomic pointer, so it is safe from the reader's
+// pump goroutine. Every reader-open site is reached through
+// [Streamer.phaseOpenChangeStream], which runs
+// [Streamer.phaseReadLiveAddedScope] first, so the pointer already holds the
+// persisted live-added set when the reader decodes its first event. It was
+// once nil until the apply sidecars ran, under a comment calling that correct
+// "since no live-add can exist before they start" — false for a live-add a
+// previous run persisted, whose stopped-window changes the binlog reader then
+// dropped (Bug 322). Type-assert/silent-ignore
 // like every optional reader surface: engines without reader-side policy
 // checks don't implement it.
 func (s *Streamer) wireCDCScopePredicate(r ir.CDCReader) {

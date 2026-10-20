@@ -25,9 +25,10 @@ import (
 //     prior, and the caller caches the entry immediately after, so a single
 //     skipped call disarms it permanently for the process.
 //   - The predicate the pipeline supplies is EMPTY exactly when it fires.
-//     `wireCDCScopePredicate` closes over `s.liveFilterRef`, which is nil
+//     `wireCDCScopePredicate` closes over `s.liveFilterRef`, which was nil
 //     until `phaseStartApplySidecars` — and that runs after StreamChanges
-//     opens the reader. On a warm resume of a stream carrying a live-added
+//     opens the reader (the pipeline seeds it before the reader opens since
+//     Bug 322; the door stays ungated regardless). On a warm resume of a stream carrying a live-added
 //     table (`schema add-table`), the first RelationMessage for that table
 //     is graded while the predicate still answers false for it.
 //   - The seed KNOWS that table: on warm resume the seed is built from the

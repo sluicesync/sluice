@@ -429,9 +429,10 @@ func (r *CDCReader) gradeRelationSchemaRace(relations map[uint32]*relationCacheE
 	//     witness (pipeline.loadWarmResumeSchemaSeed), so it holds exactly
 	//     the tables this stream maintains. Gating it again added no safety.
 	//  2. The gate was empty exactly when this door fires. The predicate the
-	//     pipeline supplies reads `s.liveFilterRef`, which is nil until
+	//     pipeline supplies reads `s.liveFilterRef`, which was nil until
 	//     phaseStartApplySidecars — and that runs AFTER StreamChanges opens
-	//     the reader. So on a warm resume of a stream with a live-added
+	//     the reader (since Bug 322 the pipeline seeds it before the reader
+	//     opens; the door stays ungated for reason 1). So on a warm resume of a stream with a live-added
 	//     table (schema add-table), the first RelationMessage for that table
 	//     arrives while the predicate answers false for it. This door is
 	//     ONE-SHOT (it only fires while relations[relationID] is nil, and

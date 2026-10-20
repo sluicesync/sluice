@@ -1328,6 +1328,120 @@ func TestIncludeTableScopeDrift_BinlogDrainedAddedTableStaysInScope(t *testing.T
 	stagedWaveKeepsTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt))
 }
 
+// stoppedWindowReachesTheAddedTable is Bug 322: a table `schema add-table`
+// brought in, changed while the stream is stopped, then the same `sync start`.
+// The stopped-window INSERT, UPDATE and DELETE are the FIRST events after the
+// resume position, so the reader reaches them in its first milliseconds —
+// before v0.163.1 that was before the apply sidecars seeded the live-added
+// set, and a reader-side scope drop (the MySQL binlog reader's, since
+// v0.154.0) discarded them at exit 0 with the stream green. A second
+// stop/write/restart is measured too: the loss recurred at every restart.
+// addArgs is passed to the add-table run (--no-drain, or nothing).
+func stoppedWindowReachesTheAddedTable(t *testing.T, r *scopeDriftRig, addArgs ...string) {
+	t.Helper()
+	r.establishKD("kd")
+	r.exec(r.src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x'), (2, 'y'), (3, 'z')")
+	if code, out := r.addTable("users", addArgs...); code != 0 {
+		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
+	}
+	if got, ok := r.waitRows(r.tgt, "users", "e", "1|x,2|y,3|z", 30*time.Second); !ok {
+		t.Fatalf("add-table copy: target users = %q, want 1|x,2|y,3|z", got)
+	}
+
+	for round, w := range []struct{ stopped, live, want string }{
+		{
+			stopped: "INSERT INTO users VALUES (4, 'w'); UPDATE users SET e = 'y2' WHERE id = 2; DELETE FROM users WHERE id = 3",
+			live:    "INSERT INTO users VALUES (5, 'v'); INSERT INTO kd VALUES (3, 'c')",
+			want:    "1|x,2|y2,4|w,5|v",
+		},
+		{
+			stopped: "INSERT INTO users VALUES (6, 'u'); UPDATE users SET e = 'x2' WHERE id = 1; DELETE FROM users WHERE id = 4",
+			live:    "INSERT INTO users VALUES (7, 't'); INSERT INTO kd VALUES (4, 'd')",
+			want:    "1|x2,2|y2,5|v,6|u,7|t",
+		},
+	} {
+		r.exec(r.src, w.stopped)
+		run := r.startSync("kd")
+		requireStreaming(t, run, 8*time.Second, fmt.Sprintf("restart %d after add-table", round+1))
+		r.exec(r.src, w.live)
+		// The live users row lands after the stopped-window events in the
+		// binlog, so once it is on the target every earlier event has been
+		// read and either applied or dropped.
+		if got, ok := r.waitRows(r.tgt, "users", "e", w.want, 60*time.Second); !ok {
+			t.Fatalf("restart %d: target users = %q, want %q (source %q) — the changes made to the added table while the "+
+				"stream was stopped never reached the target (Bug 322)%s", round+1, got, w.want, r.rows(r.src, "users", "e"), run.logTail())
+		}
+		run.end()
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheAddedTable is Bug
+// 322 on a MySQL binlog source with the drained add — lost at every restart
+// since v0.163.0 brought the drained add's table back into scope.
+func TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheAddedTable(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	stoppedWindowReachesTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt))
+}
+
+// TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheNoDrainAddedTable
+// is Bug 322 with `--no-drain` (ADR-0034's filter flip) — lost since v0.154.0.
+func TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheNoDrainAddedTable(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	stoppedWindowReachesTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt), "--no-drain")
+}
+
+// TestIncludeTableScopeDrift_BinlogAddedTableRecopyRemedyConverges measures
+// the remedy the Bug 322 notes give an operator whose target already lost a
+// live-added table's stopped-window changes: empty the target table, run
+// `schema add-table` for it again, and the same `sync start`. The lost state
+// is reproduced by diverging the target table by hand (a missing row, a stale
+// value, a row the source deleted), which is what the defect left behind;
+// the stream's live-added set already names the table, as it does for an
+// affected stream.
+func TestIncludeTableScopeDrift_BinlogAddedTableRecopyRemedyConverges(t *testing.T) {
+	src, tgt, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	r := newScopeDriftRig(t, "mysql", src, tgt)
+	r.establishKD("kd")
+	r.exec(src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x'), (2, 'y'), (3, 'z')")
+	if code, out := r.addTable("users"); code != 0 {
+		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
+	}
+	r.exec(src, "INSERT INTO users VALUES (4, 'w'); UPDATE users SET e = 'y2' WHERE id = 2; DELETE FROM users WHERE id = 3")
+	run := r.startSync("kd")
+	if got, ok := r.waitRows(tgt, "users", "e", "1|x,2|y2,4|w", 60*time.Second); !ok {
+		t.Fatalf("restart: target users = %q%s", got, run.logTail())
+	}
+	run.end()
+	time.Sleep(2 * time.Second)
+	// What an affected stream's target holds: row 4 missing, row 2 stale,
+	// row 3 still present.
+	r.exec(tgt, "DELETE FROM users WHERE id = 4; UPDATE users SET e = 'y' WHERE id = 2; INSERT INTO users VALUES (3, 'z')")
+
+	r.exec(tgt, "DELETE FROM users")
+	if code, out := r.addTable("users"); code != 0 {
+		t.Fatalf("schema add-table users (the remedy, on a table already in the live-added set): exit %d\n%s", code, out)
+	}
+	run = r.startSync("kd")
+	requireStreaming(t, run, 8*time.Second, "restart after the remedy re-copied the table")
+	r.exec(src, "INSERT INTO users VALUES (5, 'v')")
+	if got, ok := r.waitRows(tgt, "users", "e", "1|x,2|y2,4|w,5|v", 60*time.Second); !ok {
+		t.Fatalf("after the remedy: target users = %q, want 1|x,2|y2,4|w,5|v%s", got, run.logTail())
+	}
+}
+
+// TestIncludeTableScopeDrift_PgoutputStoppedWindowReachesTheAddedTable is the
+// same flow on pgoutput, whose reader has no table-scope row drop: the
+// control that the shape is right, and the pin should one be added.
+func TestIncludeTableScopeDrift_PgoutputStoppedWindowReachesTheAddedTable(t *testing.T) {
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+	stoppedWindowReachesTheAddedTable(t, newScopeDriftRig(t, "postgres", src, tgt))
+}
+
 // requireLiveAddedExcludedRefusal asserts run exits naming
 // LIVE-ADDED-TABLE-EXCLUDED, table, and each of reasons.
 func requireLiveAddedExcludedRefusal(t *testing.T, run *straddleBinaryRun, table string, reasons ...string) {

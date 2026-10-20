@@ -356,10 +356,11 @@ type Streamer struct {
 	// advances the position past the dropped ones.
 	Filter migcore.TableFilter
 
-	// liveFilterRef publishes the run's live-added-tables filter to the
-	// reader-side scope predicate (Bug 246; see wireCDCScopePredicate).
-	// Stored by phaseStartApplySidecars when the filter is created; nil
-	// before then, which the predicate treats as "no live-adds yet".
+	// liveFilterRef publishes the attempt's live-added-tables filter to the
+	// reader-side scope predicate (Bug 246; see wireCDCScopePredicate) and
+	// to the dispatch filter. [Streamer.phaseReadLiveAddedScope] creates it
+	// seeded with the persisted set before any reader opens; the apply
+	// sidecars' seed and poll refresh the same filter (Bug 322).
 	liveFilterRef atomic.Pointer[liveAddedFilter]
 
 	// startLiveAdded is the live-added set read at this attempt's start
