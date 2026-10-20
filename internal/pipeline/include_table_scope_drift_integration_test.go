@@ -1611,10 +1611,7 @@ func TestIncludeTableScopeDrift_CorruptRecordRecovers(t *testing.T) {
 		t.Fatalf("slot drop: exit %d\n%s%s", code, stdout, stderr)
 	}
 	run = r.startSync("kd", "--restart-from-scratch")
-	r.exec(src, "INSERT INTO kd VALUES (3, 'c')")
-	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 90*time.Second); !ok {
-		t.Fatalf("the re-copy over a corrupt record: target kd = %q%s", got, run.logTail())
-	}
+	r.waitRecopyHandedOff(run, "the re-copy over a corrupt record")
 	waitLog(t, run, "does not decode")
 	run.end()
 	time.Sleep(2 * time.Second)
@@ -1642,10 +1639,7 @@ func TestIncludeTableScopeDrift_CorruptDroppedSetDoesNotOutliveTheRecopy(t *test
 		t.Fatalf("slot drop: exit %d\n%s%s", code, stdout, stderr)
 	}
 	run := r.startSync("", "--restart-from-scratch")
-	r.exec(src, "INSERT INTO kd VALUES (3, 'c')")
-	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 90*time.Second); !ok {
-		t.Fatalf("the re-copy over a corrupt dropped set: target kd = %q%s", got, run.logTail())
-	}
+	r.waitRecopyHandedOff(run, "the re-copy over a corrupt dropped set")
 	run.end()
 	time.Sleep(2 * time.Second)
 	if got, _ := r.waitScalar(tgt, `SELECT (COALESCE(dropped_tables, '') LIKE '%all-uncopied%')::text FROM sluice_cdc_state WHERE stream_id = 'itsd'`, "false", 5*time.Second); got != "false" {
@@ -1656,6 +1650,23 @@ func TestIncludeTableScopeDrift_CorruptDroppedSetDoesNotOutliveTheRecopy(t *test
 	run = r.startSync("")
 	requireStreaming(t, run, 8*time.Second, "restart with a table created after the re-copy")
 	requireWarnNames(t, run, "nt")
+}
+
+// waitRecopyHandedOff waits until a re-copy of kd (rows 1|a,2|b) has handed
+// off to CDC: it waits for the copy to finish, then inserts row 3 and waits
+// for it. An insert made after the copy finished is past the snapshot, so
+// it arrives through CDC, which starts only after the anchor has rewritten
+// the state record. Waiting on the target's rows instead cannot tell: they
+// are already there from the first run, and an insert racing the snapshot
+// is copied, after which the caller stopped the cold start before its
+// handoff and the old record stayed (seen on the v0.163.2 tag's CI).
+func (r *scopeDriftRig) waitRecopyHandedOff(run *straddleBinaryRun, what string) {
+	r.t.Helper()
+	waitLog(r.t, run, "entering CDC mode")
+	r.exec(r.src, "INSERT INTO kd VALUES (3, 'c')")
+	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b,3|c", 90*time.Second); !ok {
+		r.t.Fatalf("%s: target kd = %q, want row 3 through CDC%s", what, got, run.logTail())
+	}
 }
 
 // renameWhileStopped establishes kd and t8 on an unfiltered stream, stops
