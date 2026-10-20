@@ -902,3 +902,47 @@ func TestVStreamFilteredSyncSurfaces(t *testing.T) {
 	(&vstreamSnapshotChanges{}).SetFullBeforeImageTables(map[string]bool{"t": true})
 	t.Log("ADR-0174 Piece 2 filtered-sync capability surfaces present (RowFilterSetter / FilteredSnapshotOpener / FilteredSnapshotResumer / fullBeforeImageSetter)")
 }
+
+// TestVStreamSnapshot_CheckpointWithholdsAShardThatWouldSkipItsCopy pins
+// the writer's rule at the cadence itself
+// (VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES, multi-shard arm): a
+// durable position in which one shard has a GTID and no cursor is not
+// persisted, because that shard's resume would only catch up; the next one,
+// with both shards carrying cursors, is.
+func TestVStreamSnapshot_CheckpointWithholdsAShardThatWouldSkipItsCopy(t *testing.T) {
+	s := newTestSnapshotStream()
+	s.checkpointRows = 1
+	s.checkpointInterval = time.Hour
+	var got []ir.Position
+	s.checkpointFn = func(_ context.Context, pos ir.Position) error {
+		got = append(got, pos)
+		return nil
+	}
+	pk := []encodedTablePK{{TableName: "users", Lastpk: "QkFTRTY0"}}
+	seed := func(shards []shardGtid, rows int64) {
+		pos, err := encodeVStreamPos(shards)
+		if err != nil {
+			t.Fatalf("encodeVStreamPos: %v", err)
+		}
+		s.currentVgtid = shards
+		s.enqueuedRows = rows
+		s.recordBreadcrumbLocked(pos)
+	}
+	rows := &vstreamSnapshotRows{snap: s}
+
+	seed([]shardGtid{{Keyspace: "main", Shard: "-80", Gtid: "g1", TablePKs: pk}, {Keyspace: "main", Shard: "80-", Gtid: "g2"}}, 1)
+	rows.AdvanceDurableRows(1)
+	s.rowsSinceCheckpoint = 1
+	last := s.maybeCheckpoint(context.Background(), time.Now())
+	if len(got) != 0 {
+		t.Fatalf("persisted a position whose shard 80- has a GTID and no cursor; its resume would skip that shard's copy")
+	}
+
+	seed([]shardGtid{{Keyspace: "main", Shard: "-80", Gtid: "g1", TablePKs: pk}, {Keyspace: "main", Shard: "80-", Gtid: "g2", TablePKs: pk}}, 2)
+	rows.AdvanceDurableRows(1)
+	s.rowsSinceCheckpoint = 1
+	_ = s.maybeCheckpoint(context.Background(), last)
+	if len(got) != 1 {
+		t.Fatalf("persisted %d positions once every shard carries a cursor; want 1", len(got))
+	}
+}

@@ -1096,6 +1096,30 @@ func anyTablePKsPresent(start []shardGtid) bool {
 	return false
 }
 
+// everyShardResumesItsCopy reports whether a mid-COPY position, resumed,
+// copies every shard's uncopied rows: some shard carries a TablePKs cursor,
+// and each shard either has not started (no GTID: it copies from the
+// beginning) or carries one. Vitess decides per shard (uvstreamer copies iff
+// startPos == "" || len(TablePKs) > 0), so a shard with a GTID and no cursor
+// only catches up; persisted mid-COPY, such a position skipped that shard's
+// rest of the table at exit 0 (VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES,
+// the multi-shard arm). That shape arises per shard between its field event
+// and its first LASTPK, and after it finishes a table. This is the WRITER's
+// rule for a checkpoint; the resume router stays [anyTablePKsPresent], since
+// tightening it would send an already-persisted position to the plain warm
+// resume, which copies nothing.
+func everyShardResumesItsCopy(start []shardGtid) bool {
+	if !anyTablePKsPresent(start) {
+		return false
+	}
+	for _, sg := range start {
+		if sg.Gtid != "" && len(sg.TablePKs) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // verifyVStreamPositionReachable is the VStream counterpart of the binlog
 // reader's verifyGTIDSetReachable (Bug 146 / ADR-0093). For each shard's
 // resume GTID it asks the source whether gtid_purged ⊆ resume; a 0 (the

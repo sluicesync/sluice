@@ -1884,6 +1884,14 @@ func (s *vstreamSnapshotStream) maybeCheckpoint(ctx context.Context, lastCheckpo
 	s.rowsSinceCheckpoint = 0
 	s.mu.Unlock()
 
+	// Persist only a position whose resume copies every shard's uncopied
+	// rows (VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES). Skipping is
+	// safe for the same reason as above: an older checkpoint resumes earlier.
+	if shards, ok, err := decodeVStreamPos(pos); err != nil || !ok || !everyShardResumesItsCopy(shards) {
+		slog.DebugContext(ctx, "mysql/vstream: snapshot: COPY checkpoint not persisted: a shard's resume would skip its copy")
+		return time.Now()
+	}
+
 	if err := fn(ctx, pos); err != nil {
 		// Non-fatal: log and keep copying. The watermark is re-attempted
 		// on the next cadence tick, and the final fully-durable position

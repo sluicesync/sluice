@@ -481,3 +481,28 @@ func TestSentinelHelpers(t *testing.T) {
 		}
 	})
 }
+
+// TestEveryShardResumesItsCopy pins the checkpoint writer's rule
+// (VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES, multi-shard arm): a
+// position is persisted mid-COPY only when its resume copies every shard,
+// so a shard with a GTID and no cursor (between its field event and its
+// first LASTPK, or past its table) withholds the checkpoint.
+func TestEveryShardResumesItsCopy(t *testing.T) {
+	pk := []encodedTablePK{{TableName: "t"}}
+	for _, tc := range []struct {
+		name   string
+		shards []shardGtid
+		want   bool
+	}{
+		{"one shard with a cursor", []shardGtid{{Shard: "-", Gtid: "g1", TablePKs: pk}}, true},
+		{"one shard with no cursor", []shardGtid{{Shard: "-", Gtid: "g1"}}, false},
+		{"cursor and a shard not started", []shardGtid{{Shard: "-80", Gtid: "g1", TablePKs: pk}, {Shard: "80-"}}, true},
+		{"cursor and a shard started with no cursor", []shardGtid{{Shard: "-80", Gtid: "g1", TablePKs: pk}, {Shard: "80-", Gtid: "g2"}}, false},
+		{"no shard started", []shardGtid{{Shard: "-80"}, {Shard: "80-"}}, false},
+		{"both shards with cursors", []shardGtid{{Shard: "-80", Gtid: "g1", TablePKs: pk}, {Shard: "80-", Gtid: "g2", TablePKs: pk}}, true},
+	} {
+		if got := everyShardResumesItsCopy(tc.shards); got != tc.want {
+			t.Errorf("%s: everyShardResumesItsCopy = %v; want %v", tc.name, got, tc.want)
+		}
+	}
+}

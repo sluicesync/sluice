@@ -356,6 +356,42 @@ func vcrStopMidCopy(t *testing.T, r vcrRig, s *Streamer, cursorTable string, sou
 	return got
 }
 
+// vcrSkipsACopy reads the persisted position and says why resuming it would
+// skip a copy ("" when it would not, or when none is persisted). Vitess
+// copies a shard on resume only when that shard has not started (no GTID)
+// or carries a TablePKs cursor, so a position with no cursor at all (read
+// as a completed copy) or with a started shard that has none (that shard
+// only catches up) skips rows. Decoded here from the token's JSON, not
+// through the engine's own predicates.
+func vcrSkipsACopy(t *testing.T, r vcrRig, streamID string) string {
+	t.Helper()
+	tok := twfbCell{tgt: r.tgt(), streamID: streamID}.persistedPosition(t)
+	if tok == "" {
+		return ""
+	}
+	var shards []struct {
+		Shard    string            `json:"shard"`
+		Gtid     string            `json:"gtid"`
+		TablePKs []json.RawMessage `json:"table_p_ks"`
+	}
+	if err := json.Unmarshal([]byte(tok), &shards); err != nil {
+		t.Fatalf("persisted position is not a VStream token: %v\n%s", err, tok)
+	}
+	anyCursor := false
+	for _, sh := range shards {
+		anyCursor = anyCursor || len(sh.TablePKs) > 0
+	}
+	if !anyCursor {
+		return "a position with no copy cursor is persisted"
+	}
+	for _, sh := range shards {
+		if sh.Gtid != "" && len(sh.TablePKs) == 0 {
+			return fmt.Sprintf("a position whose shard %q has started and carries no cursor is persisted", sh.Shard)
+		}
+	}
+	return ""
+}
+
 // vcrStopAfterRows is where the stop lands: past the first COPY checkpoint
 // (written at 1,500–2,500 rows, measured), which used to persist a
 // cursor-less position, so the cells are not vacuous on the defect.
@@ -377,13 +413,13 @@ func vcrStopMidCopyHoldingTheCursorRule(t *testing.T, r vcrRig, s *Streamer, big
 		if broken {
 			return
 		}
-		tabs, ok := vcrCursorTables(t, r, s.StreamID)
-		if ok && len(tabs) == 0 {
-			if n := len(vcrIDs(t, r.tgt(), big)); n < sourceRows {
-				broken = true
-				t.Errorf("%s: a cursor-less position is persisted while %s holds %d of %d rows; the next start would warm-resume "+
-					"it as a completed copy", when, big, n, sourceRows)
-			}
+		why := vcrSkipsACopy(t, r, s.StreamID)
+		if why == "" {
+			return
+		}
+		if n := len(vcrIDs(t, r.tgt(), big)); n < sourceRows {
+			broken = true
+			t.Errorf("%s: %s while %s holds %d of %d rows; the next start's resume would skip copying them", when, why, big, n, sourceRows)
 		}
 	}
 	for {
@@ -753,4 +789,64 @@ func vcrWiden(t *testing.T, r vcrRig, p, phase1DSN, phase2DSN string) {
 	}
 	vcrResumeAndGrade(t, r, r.streamer(streamID, []string{a, b, c}, phase2DSN),
 		map[string]int64{b: 9_000_001, c: 9_000_001}, []string{a, b, c})
+}
+
+// TestStreamer_VStreamCopyResume_TwoShards is the multi-shard arm of
+// VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES (found by the v0.163.2
+// pre-tag value-fidelity review): Vitess resumes each shard on its own, so a
+// checkpoint in which one shard carries a cursor and another has started
+// without one skipped the second shard's rest of the table. The keyspace has
+// two shards (-80, 80-) and a hash vindex, so every table's rows are spread
+// over both, and each cell holds the per-shard rule throughout the copy.
+func TestStreamer_VStreamCopyResume_TwoShards(t *testing.T) {
+	const keyspace = "commerce"
+	mysqlDSN, grpcEndpoint, _, cleanupSrc := startShardedVTTestServer(t, keyspace, 2)
+	defer cleanupSrc()
+	tgtDSN, cleanupTgt := startPGTarget(t)
+	defer cleanupTgt()
+
+	var logs logcapture.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	r := vcrRig{
+		mysqlDSN: mysqlDSN,
+		streamDSN: fmt.Sprintf("%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=-80,80-",
+			mysqlDSN, grpcEndpoint),
+		tgtDSN: tgtDSN,
+		logs:   &logs,
+	}
+	createSharded := func(t *testing.T, tables ...string) {
+		t.Helper()
+		vcrCreate(t, r, tables...)
+		for _, tbl := range tables {
+			r.src().exec(t, "ALTER VSCHEMA ON "+keyspace+"."+tbl+" ADD VINDEX hash(id) USING hash")
+		}
+		time.Sleep(3 * time.Second) // schema-tracker settle
+	}
+	// The keys are globally unique (one id space, hash-sharded), so the
+	// shards merge into one target table: the Bug 152 door's opt-out.
+	merged := func(streamID string, include ...string) *Streamer {
+		s := r.streamer(streamID, include, "")
+		s.AllowCrossShardMerge = true
+		return s
+	}
+
+	t.Run("DefaultPath/stop-mid-copy", func(t *testing.T) {
+		const a, b = "sh_a", "sh_b"
+		createSharded(t, a, b)
+		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
+		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
+		vcrStopMidCopyHoldingTheCursorRule(t, r, merged("vcrsh", a, b), b, vcrBigRows)
+		vcrResumeUnderTraffic(t, r, merged("vcrsh", a, b), a, []string{a, b})
+	})
+
+	t.Run("SingleTableScope/stop-mid-copy", func(t *testing.T) {
+		const b = "sh_t"
+		createSharded(t, b)
+		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
+		vcrStopMidCopyHoldingTheCursorRule(t, r, merged("vcrsht", b), b, vcrBigRows)
+		vcrResumeUnderTraffic(t, r, merged("vcrsht", b), b, []string{b})
+	})
 }
