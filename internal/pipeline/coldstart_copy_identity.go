@@ -46,7 +46,10 @@ package pipeline
 // Residual, stated: the copy-time ids are read just after the snapshot
 // opens, so a table re-created between those two statements is recorded
 // with its new id. That window is a few statements inside the run, not the
-// copy or the stop this check exists for.
+// copy or the stop this check exists for. A copy-time read that fails leaves
+// its tables with no ids in the anchor and the record too (a fresh read
+// later could certify a re-created table), so a later warm resume cannot
+// check those tables' identity until a re-copy records them.
 
 import (
 	"context"
@@ -84,8 +87,23 @@ func (s *Streamer) identityProof() bool {
 // it is about to copy (keys as the stream's record keys them).
 func (s *Streamer) captureCopyIdentities(ctx context.Context, keys []string) {
 	s.coldStartIDs = coldStartIdentities{proof: s.identityProof()}
-	if s.coldStartIDs.proof {
-		s.coldStartIDs.copied = nonNil(s.establishedIDs(ctx, keys))
+	s.addCopyIdentities(ctx, keys)
+}
+
+// addCopyIdentities adds the ids of more tables a copy is about to make: the
+// multi-database fan-out reads each namespace's tables inside its copy loop,
+// so it starts the lane with an empty capture and adds one namespace at a
+// time, each before that namespace's copy. A lane that captured nothing
+// would anchor and record no ids at all on a source whose ids are proof.
+func (s *Streamer) addCopyIdentities(ctx context.Context, keys []string) {
+	if !s.coldStartIDs.proof {
+		return
+	}
+	if s.coldStartIDs.copied == nil {
+		s.coldStartIDs.copied = map[string]string{}
+	}
+	for k, id := range s.establishedIDs(ctx, keys) {
+		s.coldStartIDs.copied[k] = id
 	}
 }
 

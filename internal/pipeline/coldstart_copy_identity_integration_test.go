@@ -161,3 +161,50 @@ func TestResumeTableIdentity_PgoutputVacuumFullWhileStoppedResumes(t *testing.T)
 	}
 	r.requireTheCopyWithIDs([]string{"kd", "kx"})
 }
+
+// multiSchemaAnchorStreamer is a Postgres multi-schema fan-out over sales.w
+// and billing.w, the lane whose anchor first shipped recording no ids
+// (v0.163.1 pre-tag review): it never captured its copy's ids, so on a
+// source whose ids are proof the anchor verified nothing and recorded none.
+func multiSchemaAnchorStreamer(t *testing.T) (*Streamer, anchorRig) {
+	t.Helper()
+	src, tgt, cleanup := startPostgresLogical(t)
+	t.Cleanup(cleanup)
+	applyDDL(t, src, `CREATE SCHEMA sales; CREATE SCHEMA billing;
+		CREATE TABLE sales.w (id INT PRIMARY KEY); INSERT INTO sales.w VALUES (1);
+		CREATE TABLE billing.w (id INT PRIMARY KEY); INSERT INTO billing.w VALUES (2);`)
+	r := newAnchorRig(t, "postgres", src, tgt, func(q string) { applyDDL(t, src, q) })
+	return &Streamer{
+		Source: r.eng, Target: r.eng, SourceDSN: src, TargetDSN: tgt, StreamID: "rs",
+		DatabaseFilter: DatabaseFilter{Include: []string{"sales", "billing"}},
+	}, r
+}
+
+// TestCopyIdentity_PgoutputMultiSchemaStopAtTheAnchorRecords: the fan-out's
+// anchor records each namespace's tables with their copy-time ids.
+func TestCopyIdentity_PgoutputMultiSchemaStopAtTheAnchorRecords(t *testing.T) {
+	s, r := multiSchemaAnchorStreamer(t)
+	stopAfterTheAnchor(t, s)
+	r.requireTheCopyWithIDs([]string{"billing\x00w", "sales\x00w"})
+}
+
+// TestCopyIdentity_PgoutputMultiSchemaRecreatedBeforeTheAnchorRefuses: a
+// table re-created between the fan-out's copy and its anchor refuses, and
+// the record does not certify the new table.
+func TestCopyIdentity_PgoutputMultiSchemaRecreatedBeforeTheAnchorRefuses(t *testing.T) {
+	s, r := multiSchemaAnchorStreamer(t)
+	coldStartBeforeAnchorIDsForTest = func() {
+		r.applySrc(`DROP TABLE sales.w; CREATE TABLE sales.w (id INT PRIMARY KEY); INSERT INTO sales.w VALUES (7);`)
+	}
+	t.Cleanup(func() { coldStartBeforeAnchorIDsForTest = nil })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	err := s.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "TABLE-IDENTITY-CHANGED") || !strings.Contains(err.Error(), "copied as id") {
+		t.Fatalf("a table re-created between the fan-out's copy and its anchor: %v; want TABLE-IDENTITY-CHANGED", err)
+	}
+	now := pgQueryOne[string](t, r.src, "SELECT 'sales.w'::regclass::oid::text")
+	if rec := r.record(); rec.IDs["sales\x00w"] == now {
+		t.Fatalf("the record certified the re-created sales.w's id %s: %+v", now, rec)
+	}
+}

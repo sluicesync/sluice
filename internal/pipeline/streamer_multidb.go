@@ -169,8 +169,9 @@ func (s *Streamer) persistMultiDatabaseAnchor(ctx context.Context, applier ir.Ch
 		)
 		return nil
 	}
-	// A MySQL-family fan-out: its ids are not proof, so this records a fresh
-	// read, as before (coldstart_copy_identity.go).
+	// A Postgres multi-schema fan-out verifies the ids each namespace's copy
+	// started with; a MySQL-family one's ids are not proof, so it records a
+	// fresh read, as before (coldstart_copy_identity.go).
 	ids, err := s.anchorTableIDs(ctx, copied)
 	if err != nil {
 		return err
@@ -402,6 +403,9 @@ func (s *Streamer) coldStartMultiDatabase(
 	multiRC, closeRecording := s.openColdStartRecording(ctx, streamID, ir.SnapshotAnchorRecord{})
 	defer closeRecording()
 	var pendingViews []namespaceViews
+	// The copy's table ids, added per namespace inside the loop
+	// (coldStartCopyOneDatabase), each before its namespace's copy.
+	s.captureCopyIdentities(ctx, nil)
 	s.multiDBFilterTally = &migcore.FanoutFilterTally{}
 	for _, database := range selected {
 		if err := s.coldStartCopyOneDatabase(ctx, multiRC, stream, applier, streamID, database, inScope, targetDeriver, targetCanDeriveDB, fresh, budgetReport.CopyFanoutCeiling, &readerSeed, &pendingViews); err != nil {
@@ -1252,7 +1256,11 @@ func (s *Streamer) coldStartCopyOneDatabase(
 	// and same rationale as coldStartPrepareSchema's single-stream capture;
 	// the caller hands the accumulated seed to the reader before
 	// StreamChanges. See schema_seed_multidb.go.
+	seeded := len(*readerSeed)
 	*readerSeed = multiDatabaseColdStartSchemaSeed(*readerSeed, database, schema)
+	// The ids of this namespace's tables, read before its copy below and
+	// verified at the fan-out's anchor (coldstart_copy_identity.go).
+	s.addCopyIdentities(ctx, establishedKeysOf((*readerSeed)[seeded:]))
 
 	// Apply per-column type / expression overrides before schema-apply.
 	schema, err = translate.ApplyMappings(schema, s.Mappings)
