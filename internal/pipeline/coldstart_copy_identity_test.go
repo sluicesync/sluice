@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,9 +19,13 @@ type identitySource struct {
 	stubEngine
 	ids   map[string]string
 	proof bool
+	err   error // when set, every read fails with it
 }
 
 func (s identitySource) TableIdentities(_ context.Context, _ string, tables []string) (map[string]string, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
 	out := map[string]string{}
 	for _, t := range tables {
 		if id, ok := s.ids[t]; ok {
@@ -120,6 +125,20 @@ func TestAddTableVerifiedTableIdentity(t *testing.T) {
 	if id, err := innodb.verifiedTableIdentity(ctx); err != nil || id != "9" {
 		t.Fatalf("ids that are not proof: %q, %v; want the fresh read 9", id, err)
 	}
+	// ANCHOR-ID-REREAD-FAILURE-PASSES: a failed re-read is not a pass.
+	failed := &AddTable{Source: identitySource{proof: true, err: errors.New("connection reset")}, TableName: "kx", copyTimeID: "1"}
+	if _, err := failed.verifiedTableIdentity(ctx); err == nil || !strings.Contains(err.Error(), "TABLE-IDENTITY-UNREAD") ||
+		!strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("a failed re-read: %v; want TABLE-IDENTITY-UNREAD naming the cause", err)
+	}
+	gone := &AddTable{Source: identitySource{ids: map[string]string{}, proof: true}, TableName: "kx", copyTimeID: "1"}
+	if id, err := gone.verifiedTableIdentity(ctx); err != nil || id != "1" {
+		t.Fatalf("a table the re-read finds absent: %q, %v; want the copy-time id 1", id, err)
+	}
+	failedInnodb := &AddTable{Source: identitySource{err: errors.New("connection reset")}, TableName: "kx", copyTimeID: "1"}
+	if id, err := failedInnodb.verifiedTableIdentity(ctx); err != nil || id != "" {
+		t.Fatalf("a failed read where ids are not proof: %q, %v; want no id and no refusal, as before", id, err)
+	}
 }
 
 // TestAnchorTableIDs covers the anchor's re-read: a moved id refuses
@@ -133,14 +152,32 @@ func TestAnchorTableIDs(t *testing.T) {
 		!strings.Contains(err.Error(), "kb (copied as id 2, now id 9)") || !strings.Contains(err.Error(), "TABLE-IDENTITY-CHANGED") {
 		t.Fatalf("a moved id at the anchor: %v; want TABLE-IDENTITY-CHANGED naming kb", err)
 	}
-	unread := &Streamer{Source: identitySource{ids: map[string]string{"ka": "1"}, proof: true}, SourceDSN: "src"}
-	unread.coldStartIDs = coldStartIdentities{copied: map[string]string{"ka": "1", "kb": "2"}, proof: true}
-	ids, err := unread.anchorTableIDs(context.Background(), keys)
+	absent := &Streamer{Source: identitySource{ids: map[string]string{"ka": "1"}, proof: true}, SourceDSN: "src"}
+	absent.coldStartIDs = coldStartIdentities{copied: map[string]string{"ka": "1", "kb": "2"}, proof: true}
+	ids, err := absent.anchorTableIDs(context.Background(), keys)
 	if err != nil || !reflect.DeepEqual(ids, map[string]string{"ka": "1", "kb": "2"}) {
-		t.Fatalf("an id the re-read cannot see: %v, %v; want the copy-time ids recorded", ids, err)
+		t.Fatalf("a table the re-read finds absent: %v, %v; want the copy-time ids recorded", ids, err)
 	}
-	if got := unread.recordedTableIDs(context.Background(), keys); !reflect.DeepEqual(got, ids) {
+	if got := absent.recordedTableIDs(context.Background(), keys); !reflect.DeepEqual(got, ids) {
 		t.Fatalf("the record after the anchor carries %v; want the anchor's %v", got, ids)
+	}
+	// ANCHOR-ID-REREAD-FAILURE-PASSES: a failed re-read is not an absent
+	// table, so it refuses and anchors nothing.
+	failed := &Streamer{Source: identitySource{proof: true, err: errors.New("connection reset")}, SourceDSN: "src"}
+	failed.coldStartIDs = coldStartIdentities{copied: map[string]string{"ka": "1", "kb": "2"}, proof: true}
+	if ids, err := failed.anchorTableIDs(context.Background(), keys); err == nil || ids != nil ||
+		!strings.Contains(err.Error(), "TABLE-IDENTITY-UNREAD") || !strings.Contains(err.Error(), "connection reset") ||
+		failed.coldStartIDs.anchored != nil {
+		t.Fatalf("a failed re-read at the anchor: %v, %v (anchored %v); want TABLE-IDENTITY-UNREAD naming the cause", ids, err, failed.coldStartIDs.anchored)
+	}
+	failedUncaptured := &Streamer{Source: identitySource{proof: true, err: errors.New("connection reset")}, SourceDSN: "src"}
+	failedUncaptured.coldStartIDs = coldStartIdentities{proof: true}
+	if ids, err := failedUncaptured.anchorTableIDs(context.Background(), keys); err != nil || len(ids) != 0 {
+		t.Fatalf("a failed re-read on a lane with no copy-time ids: %v, %v; want none recorded and no refusal", ids, err)
+	}
+	failedInnodb := &Streamer{Source: identitySource{err: errors.New("connection reset")}, SourceDSN: "src"}
+	if ids, err := failedInnodb.anchorTableIDs(context.Background(), keys); err != nil || len(ids) != 0 {
+		t.Fatalf("a failed read where ids are not proof: %v, %v; want none recorded and no refusal, as before", ids, err)
 	}
 	uncaptured := &Streamer{Source: identitySource{ids: map[string]string{"ka": "1", "kb": "2"}, proof: true}, SourceDSN: "src"}
 	if ids, err := uncaptured.anchorTableIDs(context.Background(), keys); err != nil || len(ids) != 0 {

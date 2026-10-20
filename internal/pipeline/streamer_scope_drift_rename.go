@@ -26,6 +26,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -169,6 +170,12 @@ func (s *Streamer) readTableIdentities(ctx context.Context, scope streamScope, t
 // longer matches the stream's record (R6-S3).
 const TableIdentityChangedMarker = "TABLE-IDENTITY-CHANGED"
 
+// TableIdentityUnreadMarker names a table whose id could not be re-read
+// where a copy's id was to be verified: a failed read proves nothing, so
+// the verification refuses rather than passing it
+// (ANCHOR-ID-REREAD-FAILURE-PASSES).
+const TableIdentityUnreadMarker = "TABLE-IDENTITY-UNREAD"
+
 // judgeTableIdentities compares each established, in-scope table's recorded
 // engine id with the source's id for the same name (R6-S3). The rename
 // match ([Streamer.detectRenames]) only looks at names gone from the source,
@@ -247,14 +254,28 @@ func (s *Streamer) judgeTableIdentities(ctx context.Context, streamID string, sc
 // or a failed read, records the entries without them (a later rename then
 // needs --accept-table-rename).
 func (s *Streamer) establishedIDs(ctx context.Context, keys []string) map[string]string {
+	out, err := s.readEstablishedIDs(ctx, keys)
+	if err != nil {
+		slog.WarnContext(ctx, "cold start: could not read the source's table ids; the record is written without them",
+			slog.String("error", err.Error()))
+	}
+	return out
+}
+
+// readEstablishedIDs is [Streamer.establishedIDs] with its failures
+// reported: out holds every id that was read, and err every namespace whose
+// read failed, so "the read failed" is never the same answer as "the table
+// is gone" (a table the source does not hold is simply absent from out).
+// A caller that verifies ids against the copy's must refuse on err
+// (ANCHOR-ID-REREAD-FAILURE-PASSES).
+func (s *Streamer) readEstablishedIDs(ctx context.Context, keys []string) (map[string]string, error) {
 	reader, ok := s.Source.(ir.TableIdentityReader)
 	if !ok || len(keys) == 0 {
-		return nil
+		return nil, nil
 	}
 	pairs, err := s.uniqueKeyDoorScopes(ctx)
 	if err != nil {
-		slog.WarnContext(ctx, "cold start: could not resolve the source namespaces to read table ids", slog.String("error", err.Error()))
-		return nil
+		return nil, fmt.Errorf("resolve the source namespaces: %w", err)
 	}
 	dsnOf := map[string]string{}
 	for _, p := range pairs {
@@ -266,38 +287,47 @@ func (s *Streamer) establishedIDs(ctx context.Context, keys []string) map[string
 		byNamespace[ns] = append(byNamespace[ns], bareTableOfKey(k))
 	}
 	out := map[string]string{}
+	var errs []error
 	for ns, names := range byNamespace {
 		dsn, ok := dsnOf[ns]
 		if !ok {
+			errs = append(errs, fmt.Errorf("namespace %q is not among the stream's source namespaces", ns))
 			continue
 		}
 		ids, err := reader.TableIdentities(ctx, dsn, names)
 		if err != nil {
-			slog.WarnContext(ctx, "cold start: could not read the source's table ids; the record is written without them",
-				slog.String("error", err.Error()))
+			errs = append(errs, err)
 			continue
 		}
 		for name, id := range ids {
 			out[establishedKey(ns, name)] = id
 		}
 	}
-	return out
+	return out, errors.Join(errs...)
 }
 
 // tableIdentity is the added table's engine-stable id, "" when the source
 // exposes none.
 func (a *AddTable) tableIdentity(ctx context.Context) string {
-	reader, ok := a.Source.(ir.TableIdentityReader)
-	if !ok {
-		return ""
-	}
-	ids, err := reader.TableIdentities(ctx, a.SourceDSN, []string{a.TableName})
+	id, err := a.readTableIdentity(ctx)
 	if err != nil {
 		slog.WarnContext(ctx, "add-table: could not read the table's id; a later rename of it needs --accept-table-rename",
 			slog.String("table", a.TableName), slog.String("error", err.Error()))
-		return ""
 	}
-	return ids[a.TableName]
+	return id
+}
+
+// readTableIdentity is [AddTable.tableIdentity] with its failure reported.
+func (a *AddTable) readTableIdentity(ctx context.Context) (string, error) {
+	reader, ok := a.Source.(ir.TableIdentityReader)
+	if !ok {
+		return "", nil
+	}
+	ids, err := reader.TableIdentities(ctx, a.SourceDSN, []string{a.TableName})
+	if err != nil {
+		return "", err
+	}
+	return ids[a.TableName], nil
 }
 
 // verifiedTableIdentity is the id the add records for its table: on a
@@ -307,10 +337,19 @@ func (a *AddTable) tableIdentity(ctx context.Context) string {
 // (coldstart_copy_identity.go). On any other source a fresh read, as
 // before.
 func (a *AddTable) verifiedTableIdentity(ctx context.Context) (string, error) {
-	now := a.tableIdentity(ctx)
 	reader, ok := a.Source.(ir.TableIdentityReader)
 	if !ok || !reader.TableIdentitySurvivesRebuild() {
-		return now, nil
+		return a.tableIdentity(ctx), nil
+	}
+	now, err := a.readTableIdentity(ctx)
+	if err != nil && a.copyTimeID != "" {
+		// A failed re-read proves nothing either way, and recording the
+		// copy-time id on it would certify a table nothing checked
+		// (ANCHOR-ID-REREAD-FAILURE-PASSES).
+		return "", fmt.Errorf("pipeline: add-table: %s: %q: could not re-read the table's id to prove it is the table this "+
+			"add copied, so the add is not recorded complete: %w. Once the source can be read, empty the target table "+
+			"and run `sluice schema add-table` for it again", // remedy-partial: the operator's own add-table invocation carries their DSNs and flags
+			TableIdentityUnreadMarker, a.TableName, err)
 	}
 	if a.copyTimeID != "" && now != "" && now != a.copyTimeID {
 		return "", fmt.Errorf("pipeline: add-table: %s: %q is no longer the table this add copied (copied as id %s, now id %s): "+

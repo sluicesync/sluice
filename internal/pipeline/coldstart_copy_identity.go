@@ -28,7 +28,8 @@ package pipeline
 //   - into the recorded copy's fingerprint (the `table_ids` aspect), which
 //     the resume compares table by table ([Streamer.resumeTableIdentityGate]);
 //   - into the CDC anchor, which re-reads them and refuses on any table
-//     whose id moved since the copy ([Streamer.anchorTableIDs]); the record
+//     whose id moved since the copy, or whose re-read failed (TABLE-IDENTITY-UNREAD:
+//     a failed read is not an absent table) ([Streamer.anchorTableIDs]); the record
 //     written after the anchor takes the anchor's verified ids, never a new
 //     read ([Streamer.recordedTableIDs]).
 //
@@ -121,17 +122,36 @@ func (s *Streamer) anchorTableIDs(ctx context.Context, keys []string) (map[strin
 	if coldStartBeforeAnchorIDsForTest != nil {
 		coldStartBeforeAnchorIDsForTest()
 	}
-	current := s.establishedIDs(ctx, keys)
 	if !s.identityProof() {
+		current := s.establishedIDs(ctx, keys)
 		s.coldStartIDs.anchored = nonNil(current)
 		return current, nil
 	}
+	current, readErr := s.readEstablishedIDs(ctx, keys)
 	ids, changed := verifyCopyIdentities(s.coldStartIDs.copied, current, keys)
 	if len(changed) > 0 {
 		return nil, s.copyIdentityChanged(changed, "between its copy and its CDC anchor (sluice has not written the anchor)")
 	}
+	// A failed re-read is not an absent table: passing it would record
+	// the copy-time ids over a table nothing checked
+	// (ANCHOR-ID-REREAD-FAILURE-PASSES). A lane with no copy-time ids to
+	// verify loses nothing to it.
+	if readErr != nil && len(ids) > 0 {
+		return nil, s.copyIdentityUnread(readErr)
+	}
 	s.coldStartIDs.anchored = ids
 	return ids, nil
+}
+
+// copyIdentityUnread is the TABLE-IDENTITY-UNREAD refusal of an anchor
+// whose re-read of the copy's ids failed. Nothing is anchored, so the run
+// is still a stopped cold start.
+func (s *Streamer) copyIdentityUnread(cause error) error {
+	return fmt.Errorf("pipeline: %s: could not re-read the source's table ids to prove the tables are the ones this cold "+
+		"start copied, so sluice has not written the CDC anchor: %w. Re-run your `sluice sync start` command once the "+ // remedy-partial: the operator's own invocation carries their DSNs and flags
+		"source can be read; if it refuses on this stream's existing replication slot, re-copy: `sluice slot drop "+
+		"--source-driver %s --source <SOURCE-DSN> %s --yes`, then the same command with --restart-from-scratch added",
+		TableIdentityUnreadMarker, cause, s.Source.Name(), resolveSlotNameForDisplay(s.SlotName))
 }
 
 // recordedTableIDs returns the ids the record written after the anchor
