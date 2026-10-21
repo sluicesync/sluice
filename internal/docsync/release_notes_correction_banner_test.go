@@ -88,6 +88,18 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 163, 3},
+		fixedIn:     semver{0, 163, 3},
+		claimMarker: "the table holding the cursor gets changes only for rows at or below it",
+		why: "narrower than Vitess behaves. vttablet v0.24.4's shouldSendEventForTable sends every " +
+			"catch-up event for the table whose copy is in progress (isRowCopied always returns true, " +
+			"with a TODO to filter by primary key), so rows above the cursor get their changes too. The " +
+			"sentence came from copy.go's comment (\"upto last pk\") rather than from the function that " +
+			"does the filtering. The measured harm is the other arm -- tables re-copied from the start, " +
+			"whose stopped-window events are dropped -- so the withdrawal stands and fixedIn is the " +
+			"amended version itself. Found by the v0.163.3 learnings sweep",
+	},
+	{
 		amended:     semver{0, 144, 0},
 		fixedIn:     semver{0, 144, 0},
 		claimMarker: "Compact a chain an older binary had already mixed and the result is a segment claiming to be redacted over plaintext chunks",

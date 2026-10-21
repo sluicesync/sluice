@@ -1,5 +1,9 @@
 # sluice v0.163.3
 
+> **Correction (2026-10-21).** One clause in the first Fixed entry describes Vitess more narrowly than its code behaves. It is left as published; this is what it should have said.
+>
+> **"the table holding the cursor gets changes only for rows at or below it"** — not what vttablet v0.24.4 does. For the table whose copy is in progress, `shouldSendEventForTable` sends every catch-up event (`isRowCopied` always returns true, with a TODO to filter by primary key later), so changes to rows above the cursor are delivered too, at least once. The harm this release measured, and the reason the resume is withdrawn, is the other arm: the tables re-copied from the start, whose stopped-window changes Vitess drops. Whether the cursor table on its own lost anything was never measured. The fix shipped in v0.163.3 is unchanged and needs no upgrade beyond it; only the explanation was wrong. Found by the post-release learnings sweep, which read the Vitess source instead of its comment.
+
 **HIGH fix, silent — a PlanetScale/Vitess cold start stopped during its copy is now re-copied, never resumed, because a resumed copy kept rows the source had deleted (VSTREAM-COPY-RESUME-RECREATED-TABLE, present since v0.99.5).** A resumed VStream copy copies the already-finished tables again by upsert, which removes nothing, so any row deleted on the source while the stream was stopped stayed on the target, and so did every old row of a table dropped and re-created under its name. Measured on Vitess 24 before this release: 6,701 rows on the target against 701 on the source after a re-create. The re-run after a stop now refuses, and `--restart-from-scratch` clears the in-scope target tables and copies them again. Also: three unsafe paths around that refusal are closed, and the build moves to Go 1.26.10 for a reachable standard-library advisory. No flag change and no backup format change.
 
 ## Fixed
