@@ -62,18 +62,10 @@ import (
 // drop this one without an unused-variable or a visible `_`.
 // [backup.RefusePositionFromRedactedChain] is what grades it.
 func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Position, *irbackup.RedactionInfo, error) {
-	// nil comparator: position-from-manifest only reads the terminal
-	// position; the structural + write-time guarantees suffice (no
-	// source engine instance available here without breaking the
-	// pipeline's no-engine-registry layering).
-	chain, err := lineage.BuildLineageChain(ctx, store, nil)
+	terminal, err := chainTerminalManifest(ctx, store)
 	if err != nil {
-		return ir.Position{}, nil, fmt.Errorf("position-from-manifest: build lineage: %w", err)
+		return ir.Position{}, nil, err
 	}
-	if len(chain) == 0 {
-		return ir.Position{}, nil, errors.New("position-from-manifest: store contains no manifests")
-	}
-	terminal := chain[len(chain)-1].Manifest
 	if terminal.EndPosition.Engine == "" && terminal.EndPosition.Token == "" {
 		// FALL BACK TO StartPosition when the terminal link has one (Bug
 		// 275). The two empty-EndPosition populations are distinguishable
@@ -133,4 +125,44 @@ func LoadChainTerminalPosition(ctx context.Context, store irbackup.Store) (ir.Po
 		)
 	}
 	return terminal.EndPosition, terminal.Redaction, nil
+}
+
+// chainTerminalManifest builds the chain in store and returns its terminal
+// manifest.
+func chainTerminalManifest(ctx context.Context, store irbackup.Store) (*irbackup.Manifest, error) {
+	// nil comparator: position-from-manifest only reads the terminal
+	// manifest; the structural + write-time guarantees suffice (no
+	// source engine instance available here without breaking the
+	// pipeline's no-engine-registry layering).
+	chain, err := lineage.BuildLineageChain(ctx, store, nil)
+	if err != nil {
+		return nil, fmt.Errorf("position-from-manifest: build lineage: %w", err)
+	}
+	if len(chain) == 0 {
+		return nil, errors.New("position-from-manifest: store contains no manifests")
+	}
+	return chain[len(chain)-1].Manifest, nil
+}
+
+// LoadChainTerminalTables returns the tables the chain in store holds: the
+// terminal manifest's schema, which a backup records after applying its
+// table filter (so a filtered backup lists only what it backed up). A
+// terminal manifest with no schema is an error, never an empty set. It
+// cannot see a filter the RESTORE applied (`restore --include-table`).
+func LoadChainTerminalTables(ctx context.Context, store irbackup.Store) (map[string]bool, error) {
+	terminal, err := chainTerminalManifest(ctx, store)
+	if err != nil {
+		return nil, err
+	}
+	if terminal.Schema == nil {
+		return nil, fmt.Errorf("position-from-manifest: terminal manifest %q records no schema, so the tables the chain "+
+			"holds cannot be named", lineage.ManifestBackupID(terminal))
+	}
+	out := make(map[string]bool, len(terminal.Schema.Tables))
+	for _, t := range terminal.Schema.Tables {
+		if t != nil {
+			out[t.Name] = true
+		}
+	}
+	return out, nil
 }
