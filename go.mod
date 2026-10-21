@@ -34,7 +34,7 @@ require (
 	github.com/knadh/koanf/providers/file v1.2.1
 	github.com/knadh/koanf/v2 v2.3.6
 	github.com/mattn/go-isatty v0.0.24
-	github.com/moby/moby/api v1.55.0
+	github.com/moby/moby/api v1.56.1
 	github.com/muesli/termenv v0.16.0
 	github.com/parquet-go/parquet-go v0.32.0
 	github.com/testcontainers/testcontainers-go v0.44.0
