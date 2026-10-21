@@ -15,10 +15,10 @@ import (
 // buildTablePlan and shouldSendEventForTable) copies again from the start
 // every in-scope table that has no cursor, including the tables the
 // stopped run had already finished, and drops their changes from the
-// stopped window, as for a table not yet copied. The table holding the
-// cursor gets changes only for rows at or below it, and the target can
-// hold rows above it (the checkpoint trails what was written). The
-// re-copy writes by upsert, which removes nothing, so every row the
+// stopped window, as for a table not yet copied. (The table holding the
+// cursor is not filtered: isRowCopied always returns true in v0.24.4, so
+// its catch-up events all arrive, rows above the cursor included; that
+// arm was never measured to lose anything.) The re-copy writes by upsert, which removes nothing, so every row the
 // source deleted while the stream was stopped stays on the target, and
 // so does every old row of a table dropped and re-created under its name.
 // Measured on Vitess 24: 6,701 rows on the target against 701 on the
