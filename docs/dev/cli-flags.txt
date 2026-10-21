@@ -567,6 +567,7 @@ sync start --apply-retry-attempts
 sync start --apply-retry-backoff-base
 sync start --apply-retry-backoff-cap
 sync start --apply-tune-target-latency
+sync start --assert-copy-finished
 sync start --auto-prune-change-log
 sync start --auto-prune-interval
 sync start --auto-prune-keep

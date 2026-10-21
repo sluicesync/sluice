@@ -203,6 +203,7 @@ var inertFlagRegistry = []inertFlag{
 	{"sync start", "vstream-preserve-skew", inertOnSource, sourceCDCIsNot(ir.CDCVStream), reasonVStreamOnly},
 	{"sync start", "no-float-exact-reread", inertOnSource, sourceCDCIsNot(ir.CDCVStream), reasonVStreamOnly + " (its snapshot COPY is already float-exact)"},
 	{"sync start", "strict-float", inertOnSource, sourceCDCIsNot(ir.CDCVStream), reasonVStreamOnly + " (its snapshot COPY is already float-exact)"},
+	{"sync start", "assert-copy-finished", inertOnSource, sourceCDCIsNot(ir.CDCVStream), reasonVStreamOnly + " (only a VStream warm resume judges whether its copy finished: VSTREAM-COPY-COMPLETION-UNPROVEN)"},
 	// --- sync start: trigger-CDC change log ---
 	{"sync start", "auto-prune-change-log", inertOnSource, sourceCDCIsNot(ir.CDCTriggers), "it reaps a trigger-CDC source's sluice_change_log, and this source has no change log (it is not a trigger-CDC engine)"},
 	// --- sync start: target-side knobs ---

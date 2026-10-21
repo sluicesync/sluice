@@ -42,6 +42,23 @@ func TestSyncStartCmd_validateFlagCombos(t *testing.T) {
 			wantSubstrs: []string{"--position-from-manifest", "--reset-target-data", "mutually exclusive"},
 		},
 		{
+			name:        "assert-copy-finished + restart-from-scratch → rejected",
+			cmd:         SyncStartCmd{AssertCopyFinished: true, RestartFromScratch: true},
+			wantErr:     true,
+			wantSubstrs: []string{"--assert-copy-finished", "--restart-from-scratch"},
+		},
+		{
+			name:        "assert-copy-finished + reset-target-data → rejected",
+			cmd:         SyncStartCmd{AssertCopyFinished: true, ResetTargetData: true},
+			wantErr:     true,
+			wantSubstrs: []string{"--assert-copy-finished", "--reset-target-data"},
+		},
+		{
+			name:    "assert-copy-finished alone → ok",
+			cmd:     SyncStartCmd{AssertCopyFinished: true},
+			wantErr: false,
+		},
+		{
 			name:    "restart-from-scratch alone → ok",
 			cmd:     SyncStartCmd{RestartFromScratch: true},
 			wantErr: false,

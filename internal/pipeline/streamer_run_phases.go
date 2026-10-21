@@ -714,7 +714,9 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 	// copy keeps the rows the source deleted while the stream was stopped.
 	// It must not reach warmResume either, whose plain CDC reader would
 	// leave the uncopied rest of the table missing. A cursor-less persisted
-	// position (a finished cold start) stays on the warmResume path.
+	// position stays on the warmResume path, where on a VStream source it is
+	// judged first by VSTREAM-COPY-COMPLETION-UNPROVEN: a release before
+	// v0.163.2 could persist one mid-copy too (Bug 327).
 	// Set by whichever cold-start lane copies (coldStart, the fan-out, the
 	// stopped-cold-start resume) and recorded below once the branch returns.
 	s.coldStartEstablished = nil
@@ -761,10 +763,22 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			// populated target).
 			changes, stop, err = s.coldStartMultiDatabase(streamCtx, applier, streamID, restartReason(s.RestartFromScratch))
 		case found:
-			// INCLUDE-TABLE-SCOPE-DRIFT: before the reader opens (see the
-			// single-database branch below).
+			// VSTREAM-COPY-COMPLETION-UNPROVEN, then INCLUDE-TABLE-SCOPE-DRIFT:
+			// before the reader opens (see the single-database branch below).
+			// No VStream source reaches here today (its multi-database
+			// snapshot refuses), so the door is a fail-closed no-op that
+			// keeps the two warm-resume branches judged alike.
+			assertRecord, doorErr := s.phaseRefuseUnprovenVStreamCopy(ctx, applier, streamID, persisted)
+			if doorErr != nil {
+				return nil, func() {}, false, doorErr
+			}
 			if err := s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID); err != nil {
 				return nil, func() {}, false, err
+			}
+			if assertRecord {
+				if err := s.recordAssertedCopy(ctx, applier, streamID); err != nil {
+					return nil, func() {}, false, err
+				}
 			}
 			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, applier, streamID)
 			warmResumed = err == nil
@@ -836,6 +850,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 		)
 		return nil, func() {}, false, copyResumeWithdrawnError(streamID)
 	case found:
+		// VSTREAM-COPY-COMPLETION-UNPROVEN (Bug 327): a cursor-less position
+		// on a VStream source is a finished copy's anchor OR a pre-v0.163.2
+		// mid-copy checkpoint; only the target's record of a finished copy
+		// tells them apart. First, before anything below reads or writes.
+		assertRecord, doorErr := s.phaseRefuseUnprovenVStreamCopy(ctx, applier, streamID, persisted)
+		if doorErr != nil {
+			return nil, func() {}, false, doorErr
+		}
 		// SLM-1 / SLM-1b: a warm resume's prior shape per table is the
 		// target's zone witness, with the retained schema-history version
 		// at the persisted position as the fallback. The loader is
@@ -859,6 +881,13 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 		// publication as it found it (the reader's own open re-ensures it).
 		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID); err != nil {
 			return nil, func() {}, false, err
+		}
+		// --assert-copy-finished: recorded only once the scope door has
+		// passed, so a table it refuses is never recorded as copied.
+		if assertRecord {
+			if err := s.recordAssertedCopy(ctx, applier, streamID); err != nil {
+				return nil, func() {}, false, err
+			}
 		}
 		changes, stop, err = s.warmResume(streamCtx, persisted)
 		warmResumed = err == nil
