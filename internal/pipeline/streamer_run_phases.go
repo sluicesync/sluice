@@ -782,6 +782,12 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			}
 			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, applier, streamID)
 			warmResumed = err == nil
+			if err == nil {
+				if rerr := s.recordManifestHandoff(ctx, applier, streamID, persisted); rerr != nil {
+					stop()
+					return nil, func() {}, false, rerr
+				}
+			}
 			// Slot-missing fall-through (ADR-0022), multi-database analogue:
 			// if the persisted server-wide position references binlog the
 			// source has since purged, the reader returns an error wrapping
@@ -891,6 +897,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 		}
 		changes, stop, err = s.warmResume(streamCtx, persisted)
 		warmResumed = err == nil
+		// A --position-from-manifest handoff that started records its
+		// restored copy, so later plain restarts are judged on a record.
+		if err == nil {
+			if rerr := s.recordManifestHandoff(ctx, applier, streamID, persisted); rerr != nil {
+				stop()
+				return nil, func() {}, false, rerr
+			}
+		}
 		// A foreign-lineage verdict never satisfies ErrPositionInvalid, so
 		// the fall-through below cannot engage on it; frame it as the
 		// pipeline's refusal so the operator reads what was NOT done and

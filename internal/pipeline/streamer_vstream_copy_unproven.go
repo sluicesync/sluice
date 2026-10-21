@@ -53,13 +53,15 @@ package pipeline
 //
 // On both warm-resume branches of [Streamer.phaseOpenChangeStream], first,
 // before the INCLUDE-TABLE-SCOPE-DRIFT door and the reader open, so a
-// refusal has applied no change and changed no target table. Every caller
+// refusal has applied no change and changed no table in the stream's scope. Every caller
 // that warm-resumes a VStream position from the target's control row goes
 // through there: `sync start`, every `sync run` leg and supervisor restart
 // (Streamer.Run), and the in-process retry ladder (runOnce again). The
 // door is skipped, deliberately, for --position-from-manifest: that position
 // is a backup chain's terminal manifest, never a sync cold start's copy
-// checkpoint, and the copy under it is the restore's. `sync from-backup run`
+// checkpoint, and the copy under it is the restore's; that handoff records
+// the stream's tables once it starts ([Streamer.recordManifestHandoff]), so
+// its later plain restarts pass on the record. `sync from-backup run`
 // (the broker) has its own position format and never opens a VStream reader.
 // A cold start, --restart-from-scratch and --reset-target-data never reach a
 // warm-resume branch.
@@ -185,7 +187,7 @@ func vstreamCopyUnprovenError(streamID, why string) error {
 		"a position that looks exactly like a finished copy's, and resuming from it would never copy the rest of the "+
 		"tables, while the stream reported healthy. A copy that finished on v0.149.0 or later leaves a record proving it; "+
 		"this stream has none, so it was cold-started by a release before v0.149.0, or stopped during its copy on "+
-		"v0.163.1 or earlier. No change has been applied by this run and no target table was changed. Re-copy the stream: "+
+		"v0.163.1 or earlier. No change has been applied by this run and no table in the stream's scope was changed on the target. Re-copy the stream: "+
 		"the same `sluice sync start` command with --restart-from-scratch, which clears the in-scope target tables before "+
 		"copying them. If you know the copy finished (the stream has been streaming changes for a while, and the target's "+
 		"row counts match the source's), re-run the same command once with --assert-copy-finished: it records the "+
@@ -210,23 +212,10 @@ func (s *Streamer) recordAssertedCopy(ctx context.Context, applier ir.ChangeAppl
 			slog.String("stream_id", streamID))
 		return nil
 	}
-	liveAdded, err := s.uniqueKeyDoorLiveAdded(ctx, applier, streamID)
+	keys, names, err := s.currentScopeKeys(ctx, applier, streamID)
 	if err != nil {
 		return controlReadFailure(fmt.Errorf("pipeline: %s: %w", copyFinishedAssertedMarker, err))
 	}
-	scope, err := s.readStreamScope(ctx, func(table string) bool {
-		return scopeAdmits(table, s.Filter, func(t string) bool { return liveAdded[t] })
-	})
-	if err != nil {
-		return controlReadFailure(fmt.Errorf("pipeline: %s: %w", copyFinishedAssertedMarker, err))
-	}
-	keys := make([]string, 0, len(scope.tables))
-	names := make([]string, 0, len(scope.tables))
-	for _, t := range scope.tables {
-		keys = append(keys, t.key())
-		names = append(names, t.display())
-	}
-	sort.Strings(names)
 	if err := recordEstablishedAfterCopy(ctx, store, streamID, keys, s.establishedIDs(ctx, keys), s.sourceTableKeys); err != nil {
 		return controlReadFailure(fmt.Errorf("pipeline: resume refused: %s: --assert-copy-finished could not record this "+
 			"stream's tables as copied (no change has been applied by this run); fix what the error names and re-run the "+
@@ -236,4 +225,28 @@ func (s *Streamer) recordAssertedCopy(ctx context.Context, applier ir.ChangeAppl
 		"the operator's --assert-copy-finished; later resumes pass without the flag",
 		slog.String("stream_id", streamID), slog.String("tables", strings.Join(names, ", ")))
 	return nil
+}
+
+// currentScopeKeys lists the stream's current scope as established-record
+// keys, with display names: the set a cold start of this scope would copy
+// and record, live-added tables included.
+func (s *Streamer) currentScopeKeys(ctx context.Context, applier ir.ChangeApplier, streamID string) (keys, names []string, err error) {
+	liveAdded, err := s.uniqueKeyDoorLiveAdded(ctx, applier, streamID)
+	if err != nil {
+		return nil, nil, err
+	}
+	scope, err := s.readStreamScope(ctx, func(table string) bool {
+		return scopeAdmits(table, s.Filter, func(t string) bool { return liveAdded[t] })
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	keys = make([]string, 0, len(scope.tables))
+	names = make([]string, 0, len(scope.tables))
+	for _, t := range scope.tables {
+		keys = append(keys, t.key())
+		names = append(names, t.display())
+	}
+	sort.Strings(names)
+	return keys, names, nil
 }
