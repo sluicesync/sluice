@@ -33,14 +33,12 @@ const (
 	// binlog path, whose defaultNativeCopyTableParallelism flipped to auto-4
 	// in the perf-parity gap-3 chunk — it DELIBERATELY stays 1:
 	//
-	//   - K is not persisted in the position token (ADR-0099 §5 kept the
-	//     ADR-0098 token shape); a resume must re-derive the SAME table→stream
-	//     partition with the SAME K. A default flip would silently change the
-	//     effective K for any durable-watermark job resumed across the upgrade
-	//     boundary → the in-progress cursor's table lands in a different
-	//     stream → missed or double-copied table, the silent-loss class the
-	//     ADR's operator contract exists to prevent. (The native path has no
-	//     cross-process resume, which is why ITS flip is safe.)
+	//   - (LAPSED in v0.163.3.) K is not persisted in the position token, so
+	//     a default flip would have re-partitioned a durable-watermark job
+	//     resumed across the upgrade boundary (ADR-0099 §5). The cross-process
+	//     mid-COPY resume has since been withdrawn (VSTREAM-COPY-RESUME-WITHDRAWN:
+	//     a persisted cursor is refused), so no job resumes across an upgrade
+	//     and this no longer argues against a flip; the reasons below still do.
 	//   - K > 1 is K INDEPENDENT causally-unordered vtgate sessions whose
 	//     handoff rests on the set-min stitch + its loud-refusal divergence
 	//     path (ADR-0099 §4) — sound, but a refusal class K = 1 structurally

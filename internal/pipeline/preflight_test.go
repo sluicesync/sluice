@@ -128,6 +128,13 @@ func TestRecoveryHintFor_SyncNamesBothColdStartRoutes(t *testing.T) {
 		"replication slot",          // what an operator should look at on a PG source
 		"--reset-target-data --yes", // the remedy both routes share
 		"wipe the target tables and any stale cdc-state row",
+		// VSTREAM-COPY-RESUME-WITHDRAWN: a stopped PlanetScale/Vitess copy
+		// lands here, and its remedy clears before re-copying.
+		"`--restart-from-scratch`",
+		// --force-cold-start upserts over the populated table on those
+		// sources, which keeps deleted rows; the hint used to say it
+		// would collide on PRIMARY KEY, false for an upsert writer.
+		"keeps every target row the source has since deleted",
 	} {
 		if !strings.Contains(hint, want) {
 			t.Errorf("sync-mode hint is missing %q; got %q", want, hint)

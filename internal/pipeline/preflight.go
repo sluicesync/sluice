@@ -171,8 +171,13 @@ func recoveryHintFor(mode preflightMode) string {
 			"cdc-state row [preferred] (on PG sources, if the interrupted run left its replication slot behind " +
 			"— a killed process can't clean up — drop it first via `sluice slot drop`); (b) manually `DROP TABLE` " +
 			"the affected target tables (and on PG sources, drop the source slot via `sluice slot drop`), then " +
-			"re-run; (c) pass `--force-cold-start` to bulk-copy " +
-			"into the populated table anyway (will collide on PRIMARY KEY in most cases — use with extreme caution)"
+			"re-run. On a PlanetScale or Vitess source stopped during its copy this refusal is the expected re-run " +
+			"result (no position is saved until the copy finishes, since v0.163.3): re-run the same command with " +
+			"`--restart-from-scratch`, which clears the in-scope target tables and copies them again. " +
+			"(c) `--force-cold-start` copies into the populated table without clearing it: a source that copies by " +
+			"upsert (PlanetScale, Vitess) then keeps every target row the source has since deleted, " +
+			"silently, and every other source collides on PRIMARY KEY — use it only when the target rows are known " +
+			"to be a subset of the source's"
 	default: // preflightModeMigrate
 		return "this usually means a previous cold-start was killed mid-bulk-copy. " +
 			"To recover: (1) drop the partial dest tables (or use `--resume` on `sluice migrate`), " +
@@ -187,7 +192,7 @@ func recoveryHintFor(mode preflightMode) string {
 // operator prose (which stays in the error message).
 func refusalHintFor(mode preflightMode) string {
 	if mode == preflightModeSync {
-		return "re-run with --reset-target-data --yes to wipe the target tables and stale cdc-state, or pass --force-cold-start to bulk-copy into the populated table anyway"
+		return "re-run with --reset-target-data --yes to wipe the target tables and stale cdc-state, or with --restart-from-scratch to clear and re-copy the in-scope tables (the remedy for a PlanetScale/Vitess copy that was stopped); --force-cold-start copies over the populated table without clearing it and keeps rows the source has deleted"
 	}
 	return "use --resume on sluice migrate, or pass --force-cold-start to bulk-copy into the populated table anyway"
 }

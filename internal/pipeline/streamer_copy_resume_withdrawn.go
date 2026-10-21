@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -29,6 +30,44 @@ import (
 // --restart-from-scratch clears the in-scope target tables first
 // ([freshCopyReason.clearsTarget]), so it cannot keep a stale row.
 const copyResumeWithdrawnMarker = "VSTREAM-COPY-RESUME-WITHDRAWN"
+
+// restartUnclearedMarker names the refusal of a re-copy that was asked to
+// clear the target (--restart-from-scratch) but cannot, because
+// --schema-already-applied forbids the drop-and-recreate the clear is.
+const restartUnclearedMarker = "RESTART-FROM-SCRATCH-TARGET-NOT-CLEARED"
+
+// refuseUnclearedRestart refuses --restart-from-scratch combined with
+// --schema-already-applied on an upsert reader (VStream) while an in-scope
+// target table still holds rows. That cold start takes the
+// schema-already-applied branch, which skips the clear, and the upsert copy
+// then keeps every target row the source has deleted since it was copied,
+// silently — the harm VSTREAM-COPY-RESUME-WITHDRAWN names --restart-from-scratch
+// as the remedy for. A target whose emptiness cannot be probed is refused
+// too: the clear cannot be proven to be unnecessary. With the tables
+// emptied by hand, the same command copies into them correctly.
+func refuseUnclearedRestart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter) error {
+	checker, ok := rw.(ir.TableEmptyChecker)
+	if !ok {
+		return fmt.Errorf("pipeline: cold start refused: %s: --restart-from-scratch with --schema-already-applied "+
+			"cannot clear the target (that would drop the tables you pre-created), and this target cannot report "+
+			"whether its tables are empty; empty the in-scope target tables yourself, then re-run the same command",
+			restartUnclearedMarker)
+	}
+	for _, table := range schema.Tables {
+		empty, err := checker.IsTableEmpty(ctx, table)
+		if err != nil {
+			return fmt.Errorf("pipeline: %s: probe of target table %q: %w", restartUnclearedMarker, table.Name, err)
+		}
+		if !empty {
+			return fmt.Errorf("pipeline: cold start refused: %s: --restart-from-scratch with --schema-already-applied "+
+				"does not clear the target (that would drop the tables you pre-created), and target table %q still "+
+				"holds rows: an upsert re-copy over them would keep every row the source has deleted since they were "+
+				"copied. Empty the in-scope target tables yourself (e.g. TRUNCATE), then re-run the same command; "+
+				"no target table was changed by this run", restartUnclearedMarker, table.Name)
+		}
+	}
+	return nil
+}
 
 // copyResumeWithdrawnError carries [ir.ErrIncludeTableScopeDrift], as
 // COLD-START-INCOMPLETE does: both refuse a stream whose cold start

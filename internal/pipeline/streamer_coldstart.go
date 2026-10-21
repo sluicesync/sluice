@@ -1009,6 +1009,17 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 			return nil, err
 		}
 	case s.SchemaAlreadyApplied:
+		// --restart-from-scratch asks for a clear this branch cannot do
+		// (RESTART-FROM-SCRATCH-TARGET-NOT-CLEARED): refuse on an upsert
+		// reader while the target holds rows, before anything is written.
+		if fresh.clearsTarget() && copyReaderIsIdempotent(stream.Rows) {
+			if err := refuseUnclearedRestart(ctx, schema, rw); err != nil {
+				migcore.CloseIf(rw)
+				migcore.CloseIf(sw)
+				_ = stream.Abandon()
+				return nil, err
+			}
+		}
 		// GitHub issue #17: operator promises every source table
 		// exists on the target with a compatible schema, and that
 		// the sluice_cdc_state control table has been pre-created.

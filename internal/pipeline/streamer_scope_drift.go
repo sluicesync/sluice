@@ -232,6 +232,20 @@ type streamScope struct {
 // touched the publication.
 func (s *Streamer) phaseRefuseIncludeTableScopeDrift(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
 	if s.scopeDriftDoorDone {
+		// The rest of the door ran once this process; the in-progress mark is
+		// re-checked on every warm resume all the same. A cold start begun
+		// later in this process (the reactive re-snapshot after an invalid
+		// position, say) can stop mid-copy and fall back to a warm resume
+		// from the position it was replacing, and the mark is what refuses
+		// that resume onto its partly re-copied target.
+		rec, err := readEstablishedRecord(ctx, applier, streamID)
+		if err != nil {
+			return err
+		}
+		if rec.ColdStartInProgress {
+			slog.ErrorContext(ctx, "warm resume refused: INCLUDE-TABLE-SCOPE-DRIFT (COLD-START-INCOMPLETE)", slog.String("stream_id", streamID))
+			return coldStartIncompleteError(streamID)
+		}
 		return nil
 	}
 	liveAdded, err := s.uniqueKeyDoorLiveAdded(ctx, applier, streamID)
@@ -951,8 +965,13 @@ func coldStartIncompleteError(streamID string) error {
 //
 // A failure to mark a RECORDED stream stops the cold start before it changes
 // anything: proceeding would leave a record describing a target this cold
-// start is about to change. A stream with no record (no row yet, or an older
-// stream on a control table this role cannot ALTER) has nothing to protect,
+// start is about to change. So does a failure on a stream with no record but
+// a persisted position (an older stream on a control table this role cannot
+// ALTER): the mark is all that stops a re-copy stopped mid-copy from being
+// warm-resumed from that old position onto the cleared, partly re-copied
+// target, which leaves every row not yet re-copied missing. (Until v0.163.3
+// a mid-copy checkpoint could overwrite that position; none is written now.)
+// Only a stream with neither, a first cold start, has nothing to protect,
 // and the failure WARNs.
 func beginColdStartRecord(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
 	store, ok := applier.(ir.EstablishedTablesStore)
@@ -964,9 +983,11 @@ func beginColdStartRecord(ctx context.Context, applier ir.ChangeApplier, streamI
 		return nil
 	}
 	if rec, rerr := store.ReadEstablishedRecord(ctx, streamID); rerr == nil && !rec.Recorded {
-		slog.WarnContext(ctx, "cold start could not mark the established-table record in progress; the stream has no "+
-			"record yet, so there is nothing to protect", slog.String("stream_id", streamID), slog.String("error", err.Error()))
-		return nil
+		if _, found, perr := applier.ReadPosition(ctx, streamID); perr == nil && !found {
+			slog.WarnContext(ctx, "cold start could not mark the established-table record in progress; the stream has no "+
+				"record and no position yet, so there is nothing to protect", slog.String("stream_id", streamID), slog.String("error", err.Error()))
+			return nil
+		}
 	}
 	return controlReadFailure(fmt.Errorf("pipeline: cold start: mark the established-table record in progress before "+
 		"changing the target (the target was not changed): %w", err))

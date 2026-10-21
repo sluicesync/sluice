@@ -31,8 +31,16 @@ type scopeDriftApplier struct {
 	completeErr error
 	writes      []string // "established=a,b" / "dropped=a" / "begin" / "clear=a" / "touch=a alive" / "complete=a"
 	liveAdded   []string
-	narrowErr   error // NarrowEstablishedRecord fails with it
-	recErr      error // ReadEstablishedRecord fails with it
+	narrowErr   error        // NarrowEstablishedRecord fails with it
+	recErr      error        // ReadEstablishedRecord fails with it
+	position    *ir.Position // ReadPosition reports it as found; nil = no position
+}
+
+func (a *scopeDriftApplier) ReadPosition(context.Context, string) (ir.Position, bool, error) {
+	if a.position == nil {
+		return ir.Position{}, false, nil
+	}
+	return *a.position, true, nil
 }
 
 func (a *scopeDriftApplier) now() time.Time {
@@ -686,6 +694,31 @@ func TestColdStartEstablishedRecord(t *testing.T) {
 	if err := beginColdStartRecord(ctx, app, "st"); err != nil {
 		t.Fatalf("a failed mark of a stream with no record: %v; want a WARN only", err)
 	}
+	// No record but a persisted position (an older stream on a control table
+	// this role cannot ALTER): the mark is what keeps a re-copy stopped
+	// mid-copy from being warm-resumed from that position onto the cleared,
+	// partly re-copied target, so failing to write it stops the cold start.
+	app = &scopeDriftApplier{beginErr: errors.New("permission denied"), position: &ir.Position{Engine: "mysql", Token: "old"}}
+	if err := beginColdStartRecord(ctx, app, "st"); err == nil || !strings.Contains(err.Error(), "the target was not changed") {
+		t.Fatalf("a failed mark of an unrecorded stream WITH a position: %v; want the cold start stopped", err)
+	}
+}
+
+// TestScopeDriftDoor_ColdStartInProgressAfterTheDoorRan: the door's other
+// arms run once per process, but the in-progress mark is re-checked on every
+// warm resume, so a cold start begun later in the same process (the reactive
+// re-snapshot) that stopped mid-copy cannot fall back to a warm resume from
+// the position it was replacing.
+func TestScopeDriftDoor_ColdStartInProgressAfterTheDoorRan(t *testing.T) {
+	ctx := context.Background()
+	src := newScopeDriftEngine("kd")
+	src.published = []string{"kd"}
+	s := driftStreamer(t, src, nonScoperEngine{}, "kd")
+	s.scopeDriftDoorDone = true
+	app := &scopeDriftApplier{rec: ir.EstablishedRecord{Recorded: true, ColdStartInProgress: true}}
+	requireDrift(t, s.phaseRefuseIncludeTableScopeDrift(ctx, app, "st"), "COLD-START-INCOMPLETE", "--restart-from-scratch")
+	app.rec = ir.EstablishedRecord{Recorded: true, Established: []string{"kd"}}
+	requireNoDrift(t, s.phaseRefuseIncludeTableScopeDrift(ctx, app, "st"))
 }
 
 // TestEstablishedKeys pins the record's entry shape on both stream kinds.

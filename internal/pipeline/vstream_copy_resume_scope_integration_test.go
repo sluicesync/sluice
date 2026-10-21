@@ -57,6 +57,7 @@ import (
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // vcrBigRows sizes the table the stop lands in: large enough that the
@@ -311,6 +312,11 @@ func vcrRequireRefusal(t *testing.T, r vcrRig, s *Streamer) {
 	if run.err == nil {
 		t.Fatal("the re-run after a stopped copy exited nil; want a loud refusal")
 	}
+	// The populated-target refusal by its code, so a rig failure (a boot or
+	// connection error) cannot pass as "refused loudly".
+	if ce, ok := sluicecode.FromError(run.err); !ok || ce.Code != sluicecode.CodeColdStartTargetNotEmpty {
+		t.Fatalf("the re-run failed, but not with %s: %v", sluicecode.CodeColdStartTargetNotEmpty, run.err)
+	}
 	if tok := (twfbCell{tgt: r.tgt(), streamID: s.StreamID}).persistedPosition(t); tok != "" {
 		t.Fatalf("the refused re-run persisted a position: %s", tok)
 	}
@@ -432,6 +438,91 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 				vcrSeed(t, r.mysqlDSN, a, "new", vcrRange(5001, 1, 500))
 				vcrSeed(t, r.mysqlDSN, b, "new", vcrRange(1, 1000, 700)) // odd ids, none an old one
 			}, a, []string{a, b})
+	})
+
+	// --restart-from-scratch with --schema-already-applied cannot clear the
+	// target, so over a stopped copy's rows it must refuse
+	// (RESTART-FROM-SCRATCH-TARGET-NOT-CLEARED, review finding F2) rather
+	// than re-copy by upsert and keep the rows deleted while stopped.
+	t.Run("SchemaAlreadyApplied/restart-refuses-uncleared", func(t *testing.T) {
+		const b = "sa_b"
+		vcrCreate(t, r, b)
+		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
+		time.Sleep(3 * time.Second)
+		vcrStopMidCopyPersistingNothing(t, r, r.streamer("vcrsa", []string{b}, ""), b, vcrBigRows)
+		r.src().exec(t, "DELETE FROM "+b+" WHERE id <= 20")
+		before := len(vcrIDs(t, r.tgt(), b))
+		s := r.streamer("vcrsa", []string{b}, "")
+		s.RestartFromScratch, s.SchemaAlreadyApplied = true, true
+		run := startTWFBRun(s)
+		defer func() { _ = run.stop(t) }()
+		deadline := time.Now().Add(3 * time.Minute)
+		for !run.exited() {
+			if time.Now().After(deadline) {
+				t.Fatal("--restart-from-scratch --schema-already-applied over a populated target neither refused nor exited in 3 minutes")
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if run.err == nil || !strings.Contains(run.err.Error(), restartUnclearedMarker) {
+			t.Fatalf("want the %s refusal; got %v", restartUnclearedMarker, run.err)
+		}
+		if after := len(vcrIDs(t, r.tgt(), b)); after != before {
+			t.Fatalf("the refused run changed the target: %d rows before, %d after", before, after)
+		}
+		t.Logf("REFUSED (loud): %v", run.err)
+	})
+
+	// Changes made DURING an uninterrupted cold copy to rows already copied
+	// (review finding F5 of the v0.163.3 pre-tag review): Vitess replays
+	// them in the copy's catch-up, a DELETE carries only a before image, and
+	// the copy-phase decoder reads only after images. Rows 1..100 are
+	// deleted and row 200's key moved to 900000 once the target holds
+	// 50,000 rows; after the handoff the target must equal the source.
+	t.Run("ChangesDuringCopy/default-path", func(t *testing.T) {
+		const b = "dc_b"
+		vcrCreate(t, r, b)
+		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
+		time.Sleep(3 * time.Second)
+		s := r.streamer("vcrdc", []string{b}, "")
+		logStart := r.logs.Len()
+		run := startTWFBRun(s)
+		defer func() { _ = run.stop(t) }()
+		deadline := time.Now().Add(8 * time.Minute)
+		for {
+			if run.exited() || time.Now().After(deadline) {
+				t.Fatalf("RIG: the copy exited or timed out before %s held 50,000 rows (%v)", b, run.err)
+			}
+			n, _ := strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+b))
+			if n >= 50_000 {
+				if n == vcrBigRows {
+					t.Fatalf("RIG: %s was fully copied before the changes", b)
+				}
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		r.src().exec(t, "DELETE FROM "+b+" WHERE id <= 100")
+		r.src().exec(t, "UPDATE "+b+" SET id = 900000 WHERE id = 200")
+		cell := twfbCell{tgt: r.tgt(), streamID: s.StreamID}
+		if cell.persistedPosition(t) == "" {
+			t.Log("the changes landed before the CDC handoff (no position persisted yet)")
+		}
+		for cell.persistedPosition(t) == "" {
+			if run.exited() || time.Now().After(deadline) {
+				vcrLogTail(t, r, logStart)
+				t.Fatalf("the cold start never handed off to CDC (%v)", run.err)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		vcrSeed(t, r.mysqlDSN, b, "marker", []int64{9_000_001})
+		if !r.tgt().waitRow(t, b, 9_000_001, run, 120*time.Second) {
+			t.Fatalf("the marker never reached the target (%v)", run.err)
+		}
+		if d := vcrCompare(t, r, b); d.exact() {
+			t.Logf("EXACT: %s", d)
+		} else {
+			t.Errorf("SILENT DIVERGENCE after an uninterrupted cold copy (stream running): %s", d)
+		}
 	})
 
 	// The single-stream path (vstream_copy_single_stream=true) with two
