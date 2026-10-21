@@ -59,6 +59,7 @@ var syncStartFleetExclusions = map[string]string{
 	// is also bound to one confirmed_flush_lsn value, so a stale key would
 	// refuse anyway once the slot moved.
 	"accept-table-rename":             "one-shot acknowledgement of a rename the record then follows; a human decision taken with the leg out of the fleet, like the other one-shot acknowledgements, and matching nothing once followed",
+	"assert-copy-finished":            "one-shot acknowledgement of a VSTREAM-COPY-COMPLETION-UNPROVEN refusal that records the stream's tables, after which no resume needs it; as standing config it would pass every future copy whose completion is unproven, including a copy stopped midway",
 	"accept-slot-acked-past-position": "one-shot acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION refusal bound to one confirmed_flush_lsn; as standing config it would pre-accept a skipped gap on each restart",
 
 	// ---- position-from-manifest / broker resume family (cli-only) ----

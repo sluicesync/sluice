@@ -51,10 +51,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 	"sluicesync.dev/sluice/internal/sluicecode"
@@ -332,15 +334,28 @@ func vcrRecopyExact(t *testing.T, r vcrRig, s *Streamer, traffic string, compare
 	if !s.RestartFromScratch {
 		t.Fatal("RIG: phase 3 must run with --restart-from-scratch")
 	}
+	vcrStreamExact(t, r, s, traffic, compare)
+}
+
+// vcrTrafficCalls numbers vcrStreamExact's calls in this process.
+var vcrTrafficCalls atomic.Int64
+
+// vcrStreamExact runs s, writing one row a second into traffic, until every
+// compare table matches the source exactly (within five minutes, with the
+// run still going); an exit or a lasting difference fails the cell.
+func vcrStreamExact(t *testing.T, r vcrRig, s *Streamer, traffic string, compare []string) {
+	t.Helper()
 	logStart := r.logs.Len()
 	run := startTWFBRun(s)
 	defer func() { _ = run.stop(t) }()
-	const trafficBase = 8_000_000
+	// A fresh id range per call, so two runs writing traffic into one table
+	// never collide (each writes at most one row a second for five minutes).
+	trafficBase := 8_000_000 + vcrTrafficCalls.Add(1)*10_000
 	deadline := time.Now().Add(5 * time.Minute)
 	for i := int64(0); ; i++ {
 		if run.exited() {
 			vcrLogTail(t, r, logStart)
-			t.Fatalf("the --restart-from-scratch re-copy exited: %v", run.err)
+			t.Fatalf("the run exited before the target matched the source (restart-from-scratch=%v): %v", s.RestartFromScratch, run.err)
 		}
 		vcrSeed(t, r.mysqlDSN, traffic, "traffic", []int64{trafficBase + i})
 		exact := true
@@ -360,7 +375,7 @@ func vcrRecopyExact(t *testing.T, r vcrRig, s *Streamer, traffic string, compare
 			vcrLogTail(t, r, logStart)
 			for _, tbl := range compare {
 				if d := vcrCompare(t, r, tbl); !d.exact() {
-					t.Errorf("after the --restart-from-scratch re-copy: %s", d)
+					t.Errorf("after the run (restart-from-scratch=%v): %s", s.RestartFromScratch, d)
 				}
 			}
 			return
@@ -544,6 +559,125 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 		vcrStopRefuseRecopy(t, r, func() *Streamer { return r.streamer("vcrst", []string{b}, "") }, b, vcrBigRows,
 			func() { r.src().exec(t, "DELETE FROM "+b+" WHERE id <= 20") }, b, []string{b})
 	})
+
+	// Bug 327 (VSTREAM-COPY-COMPLETION-UNPROVEN): a cold start stopped
+	// mid-copy by v0.163.1 or earlier often left its frozen, CURSOR-LESS
+	// first checkpoint, byte-identical in shape to a finished copy's anchor;
+	// v0.163.2/v0.163.3 warm-resumed from it and never copied the rest
+	// (40,000–49,000 of 300,000 rows missing at exit 0). No current release
+	// writes that row, so it is planted: a finished stream's own cursor-less
+	// position, written onto a stream stopped mid-copy — which holds no
+	// established_tables record and a sync-<id> header short of complete,
+	// exactly the v0.163.1 shape. Then a genuinely finished stream whose
+	// evidence was removed (the v0.148-era shape: no record, no header)
+	// must refuse too, and pass with --assert-copy-finished, which records
+	// it for the next run.
+	t.Run("CursorlessCheckpoint/unproven-copy", func(t *testing.T) {
+		const fa, fb = "cl_fa", "cl_fb" // the finished stream's tables
+		const ma, mb = "cl_ma", "cl_mb" // the stopped stream's
+		vcrCreate(t, r, fa, fb, ma, mb)
+		vcrSeed(t, r.mysqlDSN, fa, "v1", vcrRange(1, 1, 1000))
+		vcrSeed(t, r.mysqlDSN, fb, "v1", vcrRange(1, 1, 20_000))
+		vcrSeed(t, r.mysqlDSN, ma, "v1", vcrRange(1, 1, 1000))
+		vcrSeed(t, r.mysqlDSN, mb, "v1", vcrRange(1, 1, vcrBigRows))
+		time.Sleep(3 * time.Second)
+
+		fin := func() *Streamer { return r.streamer("vclfin", []string{fa, fb}, "") }
+		vcrStreamExact(t, r, fin(), fa, []string{fa, fb}) // copies, hands off, streams
+		finished := vclReadPosition(t, r, "vclfin")
+		if strings.Contains(finished.Token, "table_p_ks") {
+			t.Fatalf("RIG: the finished stream's position carries a copy cursor: %s", finished.Token)
+		}
+
+		mid := func() *Streamer { return r.streamer("vclmid", []string{ma, mb}, "") }
+		vcrStopMidCopyPersistingNothing(t, r, mid(), mb, vcrBigRows)
+		vclWritePosition(t, r, "vclmid", finished)
+		if got := r.tgt().scalar(t, "SELECT phase FROM sluice_migrate_state WHERE migration_id = 'sync-vclmid'"); got == "complete" {
+			t.Fatalf("RIG: the stopped copy's progress header reads complete")
+		}
+		r.src().exec(t, "DELETE FROM "+ma+" WHERE id <= 20")
+		before := len(vcrIDs(t, r.tgt(), mb))
+		vclRequireUnproven(t, r, mid())
+		if after := len(vcrIDs(t, r.tgt(), mb)); after != before {
+			t.Fatalf("the refused resume changed the target: %d rows before, %d after", before, after)
+		}
+		recopy := mid()
+		recopy.RestartFromScratch = true
+		vcrRecopyExact(t, r, recopy, ma, []string{ma, mb})
+
+		// The finished stream, with the evidence of its finished copy gone.
+		r.tgt().exec(t, "UPDATE sluice_cdc_state SET established_tables = NULL WHERE stream_id = 'vclfin'")
+		r.tgt().exec(t, "DELETE FROM sluice_migrate_state WHERE migration_id = 'sync-vclfin'")
+		vclRequireUnproven(t, r, fin())
+		asserted := fin()
+		asserted.AssertCopyFinished = true
+		vcrStreamExact(t, r, asserted, fa, []string{fa, fb})
+		if got := r.tgt().scalar(t, "SELECT established_tables IS NOT NULL FROM sluice_cdc_state WHERE stream_id = 'vclfin'"); got != "true" {
+			t.Fatalf("--assert-copy-finished resumed without recording the stream's tables (established_tables IS NOT NULL = %s)", got)
+		}
+		vcrStreamExact(t, r, fin(), fb, []string{fa, fb}) // the next plain run passes on the record
+	})
+}
+
+// vclReadPosition reads streamID's persisted position off the target.
+func vclReadPosition(t *testing.T, r vcrRig, streamID string) ir.Position {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tgtEng, _ := engines.Get("postgres")
+	applier, err := tgtEng.OpenChangeApplier(ctx, r.tgtDSN)
+	if err != nil {
+		t.Fatalf("open the target applier: %v", err)
+	}
+	defer migcore.CloseIf(applier)
+	pos, found, err := applier.ReadPosition(ctx, streamID)
+	if err != nil || !found {
+		t.Fatalf("read %s's position: found=%v err=%v", streamID, found, err)
+	}
+	return pos
+}
+
+// vclWritePosition persists pos as streamID's position, the way the
+// cadence checkpoint of v0.163.1 and earlier wrote it.
+func vclWritePosition(t *testing.T, r vcrRig, streamID string, pos ir.Position) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tgtEng, _ := engines.Get("postgres")
+	applier, err := tgtEng.OpenChangeApplier(ctx, r.tgtDSN)
+	if err != nil {
+		t.Fatalf("open the target applier: %v", err)
+	}
+	defer migcore.CloseIf(applier)
+	pw, ok := applier.(ir.PositionWriter)
+	if !ok {
+		t.Fatal("RIG: the Postgres applier is not an ir.PositionWriter")
+	}
+	if err := pw.WritePosition(ctx, streamID, pos); err != nil {
+		t.Fatalf("write %s's position: %v", streamID, err)
+	}
+}
+
+// vclRequireUnproven runs s, which must refuse VSTREAM-COPY-COMPLETION-UNPROVEN
+// within three minutes.
+func vclRequireUnproven(t *testing.T, r vcrRig, s *Streamer) {
+	t.Helper()
+	logStart := r.logs.Len()
+	run := startTWFBRun(s)
+	defer func() { _ = run.stop(t) }()
+	deadline := time.Now().Add(3 * time.Minute)
+	for !run.exited() {
+		if time.Now().After(deadline) {
+			vcrLogTail(t, r, logStart)
+			t.Fatal("the resume neither refused nor exited in 3 minutes")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if run.err == nil || !strings.Contains(run.err.Error(), vstreamCopyUnprovenMarker) {
+		vcrLogTail(t, r, logStart)
+		t.Fatalf("want the %s refusal; got %v", vstreamCopyUnprovenMarker, run.err)
+	}
+	t.Logf("REFUSED (loud): %v", run.err)
 }
 
 // TestStreamer_VStreamCopyResume_TwoShards runs the same phases on a

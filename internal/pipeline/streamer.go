@@ -519,6 +519,16 @@ type Streamer struct {
 	// ([Streamer.wireSlotAckedPastAcceptance]).
 	AcceptSlotAckedPastPosition string
 
+	// AssertCopyFinished is the operator's acknowledgement
+	// (`--assert-copy-finished`) of a VSTREAM-COPY-COMPLETION-UNPROVEN
+	// warm-resume refusal: the operator knows this PlanetScale/Vitess
+	// stream's cold-start copy finished, which nothing on the target
+	// proves. The door then passes and records the stream's current tables
+	// as established, so later resumes pass without it
+	// (streamer_vstream_copy_unproven.go). Zero-value safe: false keeps
+	// refusing, for every construction (fleet, tests).
+	AssertCopyFinished bool
+
 	// SchemaAlreadyApplied, when true, declares that the target's
 	// schema (and the `sluice_cdc_state` control table) have been
 	// pre-created out-of-band. Sluice skips every DDL phase during

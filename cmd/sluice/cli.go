@@ -1292,6 +1292,8 @@ type SyncStartCmd struct {
 
 	AcceptSlotAckedPastPosition string `name:"accept-slot-acked-past-position" placeholder:"LSN" help:"One-shot acknowledgement of a SLOT-ACKED-PAST-TARGET-POSITION refusal (Postgres source), given as the confirmed_flush_lsn the refusal prints. A warm resume refuses when the source slot has been acknowledged past the position the target persisted, because PostgreSQL would skip every change committed in between and the target does not hold them (a stop on v0.156.6 or earlier of a Postgres to MySQL-family sync, a target restored to an older state, or a slot recreated after the stream wrote its position). The remedy is a re-copy (--restart-from-scratch). Pass this flag only after verifying the target already holds every change up to that LSN: the stream then resumes and the gap is skipped. An LSN that does not match the slot is refused, so the flag cannot pre-accept a later refusal if it is left in a service definition."`
 
+	AssertCopyFinished bool `name:"assert-copy-finished" help:"Acknowledge a VSTREAM-COPY-COMPLETION-UNPROVEN refusal (PlanetScale/Vitess source): you know this stream's cold-start copy finished. A warm resume refuses when nothing on the target proves the copy finished, because a cold start stopped during its copy by sluice v0.163.1 or earlier can have saved a position that looks exactly like a finished copy's, and resuming from it never copies the rest. Streams last cold-started before v0.149.0 carry no such proof either. The safe remedy is a re-copy (--restart-from-scratch). Pass this flag only when you know the copy finished (the stream has been streaming changes for a while and the target's row counts match the source's): the resume then records every table in the stream's current scope as copied, so later resumes pass without the flag. Inert on any other source."`
+
 	SchemaAlreadyApplied bool `help:"Skip every DDL phase during cold-start (CREATE TABLE / CREATE INDEX / ADD FOREIGN KEY / CREATE VIEW / SyncIdentitySequences / EnsureControlTable). Operator promises the target's catalog matches the source's AND the sluice_cdc_state control table is pre-created. Use this on PlanetScale branches with Safe Migrations enabled (GitHub #17), or on Atlas/Liquibase-managed schemas where DDL goes through a separate pipeline. The cold-start preflight refusal is also skipped — bulk-copy runs into operator-prepared empty tables; sluice does NOT validate the schema match."`
 
 	Yes bool `help:"Confirm --reset-target-data. Required when stdin is not a terminal (scripts, CI, agents): without it the command refuses with SLUICE-E-CONFIRMATION-REQUIRED instead of prompting. On a terminal it skips the typed 'reset' prompt." short:"y"`
@@ -1965,6 +1967,10 @@ func (s *SyncStartCmd) validateFlagCombos() error {
 	if s.PositionFromManifest != "" && s.ResetTargetData {
 		return errors.New("--position-from-manifest and --reset-target-data are mutually exclusive")
 	}
+	if s.AssertCopyFinished && (s.RestartFromScratch || s.ResetTargetData) {
+		return errors.New("--assert-copy-finished cannot be combined with --restart-from-scratch or --reset-target-data " +
+			"(it acknowledges that the existing copy finished and resumes from it; the other two discard it and copy again)")
+	}
 	return nil
 }
 
@@ -2242,6 +2248,7 @@ func (s *SyncStartCmd) run(g *Globals, env *envelopeRun) error {
 		// the zero value (every non-CLI construction) keeps refusing.
 		AcceptSlotAckedPastPosition: s.AcceptSlotAckedPastPosition,
 		AcceptTableRenames:          s.AcceptTableRename,
+		AssertCopyFinished:          s.AssertCopyFinished, // VSTREAM-COPY-COMPLETION-UNPROVEN acknowledgement; zero value keeps refusing
 		SchemaAlreadyApplied:        s.SchemaAlreadyApplied,
 		ApplyBatchSize:              applyBatchSize,
 		AutoTune:                    !s.NoAutoTune,
