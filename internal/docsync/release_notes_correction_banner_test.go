@@ -89,6 +89,19 @@ type notesAmendment struct {
 var declaredNotesAmendments = []notesAmendment{
 	{
 		amended:     semver{0, 163, 3},
+		fixedIn:     semver{0, 163, 4},
+		claimMarker: "A mid-copy position saved by an earlier release is refused under `VSTREAM-COPY-RESUME-WITHDRAWN`",
+		why: "true only of a position that carries a copy cursor. A VStream cold start stopped mid-copy " +
+			"on v0.163.1 or earlier often persisted only its first, cursor-less checkpoint (Bug 325), " +
+			"which v0.163.3 cannot tell from a finished stream's position, so it warm-resumes with an " +
+			"INCLUDE-TABLE-SCOPE-UNRECORDED warning and the copy is never finished (sluice-testing Bug " +
+			"327, measured 40,000-49,000 of 300,000 rows missing at exit 0). The sentence was written " +
+			"from the refusal's predicate (PositionCarriesCopyCursor) rather than from the set of " +
+			"positions an earlier release could have saved. fixedIn is the planned fix release; the " +
+			"banner says so in those words. Found by the v0.163.3 regression cycle's cross-version cells",
+	},
+	{
+		amended:     semver{0, 163, 3},
 		fixedIn:     semver{0, 163, 3},
 		claimMarker: "the table holding the cursor gets changes only for rows at or below it",
 		why: "narrower than Vitess behaves. vttablet v0.24.4's shouldSendEventForTable sends every " +
