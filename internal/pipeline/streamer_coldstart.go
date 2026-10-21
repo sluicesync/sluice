@@ -37,21 +37,16 @@ import (
 // why ctx cancellation alone leaks that goroutine into the next test
 // (cross-test slog.Default() DATA RACE under `-race`).
 //
-// resumeFrom is the INTERRUPTED-cold-start resume cursor (v0.99.8). The
-// zero Position (empty Engine+Token) is the normal fresh cold-start: the
-// snapshot opens from the beginning and the populated-target preflight
-// gates as usual. A non-zero resumeFrom means a process restart caught an
-// in-flight cold-start COPY whose persisted position carries a mid-COPY
-// cursor ([ir.SnapshotStreamResumer.PositionCarriesCopyCursor]); coldStart
-// then (a) opens the snapshot via [ir.SnapshotStreamResumer.
-// OpenSnapshotStreamFromPosition] so the bulk COPY continues from the
-// cursor (NOT from row 0) through the batched bulk-COPY writer, and (b)
-// SKIPS the populated-target cold-start preflight — the partial copy on
-// the target is the expected state, and the idempotent COPY writer
-// absorbs the overlap. Everything else (schema read, publication scope,
-// the bulk-copy machinery, the CDC handoff) is shared verbatim with the
-// fresh path. The completed-cold-start warm-resume (cursor-less position)
-// never reaches here — it stays on the fast plain-CDC warmResume path.
+// The copy always starts from the beginning. Until v0.163.3 a persisted
+// mid-COPY VStream cursor resumed the copy here (v0.99.8); that resume kept
+// the rows the source deleted while the stream was stopped, so the cursor
+// is now refused before any cold start runs ([copyResumeWithdrawnMarker]).
+// The helpers below still take resumingCopy, and this path passes false:
+// coldStartReadSourceSchema keeps it for [Streamer.resumeStoppedColdStart],
+// while the resumingCopy branches of coldStartGatePreflight and
+// coldStartRunCopy are no longer reachable. Removing them, together with
+// the engine's checkpoint machinery, is filed as
+// VSTREAM-COPY-RESUME-DEAD-MACHINERY.
 // forceFresh marks a DELIBERATE re-copy onto an expectedly-populated target:
 // the operator's `--restart-from-scratch` OR the automatic ADR-0093
 // auto-resnapshot (warm-resume → ir.ErrPositionInvalid fall-through, where the
@@ -65,11 +60,8 @@ import (
 // auto-resnapshot path took the default branch with force=false and ALWAYS
 // dead-ended on the populated-target refusal (a re-snapshot of an existing
 // stream is populated by definition) — the live Track-B/D finding.
-func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position, fresh freshCopyReason) (changes <-chan ir.Change, stop func(), err error) {
-	// resumingCopy is the interrupted-cold-start discriminator: a non-zero
-	// resume position. It gates the seeded snapshot open and the preflight
-	// skip in the phases below. Read once here so the call sites can't drift.
-	resumingCopy := resumeFrom.Engine != "" || resumeFrom.Token != ""
+func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, streamID string, fresh freshCopyReason) (changes <-chan ir.Change, stop func(), err error) {
+	const resumingCopy = false
 	stop = func() {}
 
 	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
@@ -214,7 +206,7 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	// Open the snapshot stream — seeded from the persisted mid-COPY
 	// cursor when resuming an interrupted cold-start (v0.99.8), from
 	// the beginning otherwise.
-	stream, err := s.coldStartOpenSnapshot(ctx, applier, streamID, resumeFrom, resumingCopy, snapshotTables)
+	stream, err := s.coldStartOpenSnapshot(ctx, snapshotTables)
 	if err != nil {
 		return nil, stop, err
 	}
@@ -656,60 +648,14 @@ func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error)
 	return schema, nil
 }
 
-// coldStartOpenSnapshot opens the snapshot+CDC stream — seeded from
-// the persisted mid-COPY cursor when resuming an interrupted
-// cold-start (v0.99.8), via the slot-/table-scoped default open
-// otherwise — then applies the operator byte cap and wires the
-// resumable COPY-cursor checkpoint sink (ADR-0072 Phase B).
-func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position, resumingCopy bool, snapshotTables []string) (*ir.SnapshotStream, error) {
-	// Interrupted-cold-start resume (v0.99.8): seed the bulk snapshot
-	// stream from the persisted mid-COPY cursor so vtgate continues the
-	// COPY from the last-copied PK through the batched bulk-COPY writer,
-	// instead of the plain CDC reader's per-row apply path (~10 rows/sec —
-	// the silent-degrade this fixes). Fresh cold-starts open from the
-	// beginning as before. The resumer surface is gated by the caller
-	// (runOnce only sets resumeFrom when the source implements
-	// SnapshotStreamResumer AND the position carries a cursor), but we
-	// re-assert the type here so a misrouted call fails loudly rather than
-	// silently re-copying from row 0.
-	var stream *ir.SnapshotStream
-	var err error
-	if resumingCopy {
-		resumer, ok := s.Source.(ir.SnapshotStreamResumer)
-		if !ok {
-			return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf(
-				"pipeline: source engine %q does not support resumable cold-start COPY but a resume cursor was supplied",
-				s.Source.Name(),
-			))
-		}
-		slog.InfoContext(
-			ctx, "resuming interrupted cold-start COPY from persisted cursor (bulk path)",
-			slog.String("stream_id", streamID),
-			slog.String("position_token", truncateDryRunToken(resumeFrom.Token, 60)),
-		)
-		// Pass the filtered table allowlist (snapshotTables, computed above)
-		// so the resumed COPY is scoped to --include-table exactly as a fresh
-		// cold-start is — Vitess's TablePKs cursor is per-table, so the scope
-		// composes with the cursor without any manual reconciliation.
-		//
-		// ADR-0174 Piece 2: a resumed FILTERED cold-start must re-push the same
-		// `--where` predicate server-side, or the resumed scan copies
-		// out-of-scope rows (a silent leak). The VStream engine implements the
-		// filtered resumer; when a filter is set and the engine supports it, use
-		// it. Otherwise the plain resume runs and the post-open ApplyRowFilters
-		// gate below is the loud-failure authority.
-		if fr, ok := s.Source.(ir.FilteredSnapshotResumer); ok && len(s.RowFilters) > 0 {
-			// serverSideRowFilters, not RowFilters: on VStream a PAD-SPACE table
-			// is OMITTED here (streamed unfiltered) and filtered client-side by
-			// the ApplyClientCopyFilter gate below (audit 2026-07-19 A0). Equal
-			// to RowFilters on every other path.
-			stream, err = fr.OpenSnapshotStreamFromPositionFiltered(ctx, s.SourceDSN, resumeFrom, snapshotTables, s.serverSideRowFilters)
-		} else {
-			stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom, snapshotTables)
-		}
-	} else {
-		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables, s.serverSideRowFilters)
-	}
+// coldStartOpenSnapshot opens the snapshot+CDC stream, slot- or
+// table-scoped, then applies the operator byte cap and the row filters.
+// A cold start always copies from the beginning: a persisted mid-COPY
+// cursor is refused before any cold start runs
+// ([copyResumeWithdrawnMarker]), and no mid-COPY checkpoint is wired, so
+// none is persisted.
+func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, snapshotTables []string) (*ir.SnapshotStream, error) {
+	stream, err := openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables, s.serverSideRowFilters)
 	if err != nil {
 		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
 	}
@@ -768,18 +714,6 @@ func (s *Streamer) coldStartOpenSnapshot(ctx context.Context, applier ir.ChangeA
 		_ = stream.Close()
 		return nil, migcore.WrapWithHint(migcore.PhaseSnapshot, err)
 	}
-
-	// Wire the resumable COPY-cursor checkpoint sink (ADR-0072 Phase B).
-	// Engines whose snapshot reader carries a mid-COPY resume cursor (the
-	// VStream cold-start reader, whose position round-trips Vitess's
-	// per-shard TablePKs) persist that cursor to the control table on a
-	// bounded cadence, so a fault mid-COPY resumes from the checkpoint
-	// instead of re-copying the table from row 0. Engines without the
-	// cursor (PG, vanilla MySQL) don't implement CopyCheckpointer and the
-	// sink is simply not wired. Requires a PositionWriter applier (every
-	// shipping engine implements it); without one we skip the wiring (the
-	// checkpoint would have nowhere durable to land).
-	applyCopyCheckpoint(stream.Rows, applier, s.Source, streamID)
 
 	return stream, nil
 }

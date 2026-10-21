@@ -3,24 +3,23 @@
 
 package pipeline
 
-// v0.99.8 SILENT-DEGRADE fix — routing pin. An INTERRUPTED cold-start
-// COPY (persisted position carries a mid-COPY TablePKs cursor) must route
-// through coldStart's bulk snapshot resume path
-// (SnapshotStreamResumer.OpenSnapshotStreamFromPosition → batched
-// bulk-COPY writer), NOT through warmResume's plain CDC reader (per-row
-// apply, ~10 rows/sec). A COMPLETED cold-start (cursor-less position)
-// must stay on the fast plain-CDC warmResume path.
+// Routing pins for a persisted position. One carrying a mid-COPY TablePKs
+// cursor (an INTERRUPTED cold start, written by a release before v0.163.3)
+// is refused VSTREAM-COPY-RESUME-WITHDRAWN: it neither resumes the copy
+// from the cursor, which kept the rows the source deleted while stopped,
+// nor reaches warmResume's plain CDC reader, which would leave the rest of
+// the copy missing. --restart-from-scratch, the refusal's remedy, still
+// runs. A COMPLETED cold start (cursor-less position) stays on the
+// plain-CDC warmResume path.
 //
 // These tests assert the runOnce dispatch decision in isolation: a
 // recording source engine reports whether the cursor was present and
-// records WHICH open path the streamer took. coldStart is short-circuited
-// right after the routing decision by having the seeded snapshot open
-// return an error, so the test exercises the branch without booting a
-// real snapshot.
+// records WHICH open path the streamer took.
 
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,16 +27,12 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// errResumeRouted is the sentinel the resumer source returns from the
-// seeded snapshot open so coldStart unwinds immediately after the routing
-// decision (we only care which path was taken, not the full cold-start).
-var errResumeRouted = errors.New("resume routed (test short-circuit)")
-
-// TestStreamer_InterruptedColdStart_RoutesToBulkResume asserts that a
-// persisted position carrying a mid-COPY cursor drives the bulk snapshot
-// resume path — OpenSnapshotStreamFromPosition is called with that exact
-// position, and the plain CDC reader's StreamChanges is NEVER reached.
-func TestStreamer_InterruptedColdStart_RoutesToBulkResume(t *testing.T) {
+// TestStreamer_InterruptedColdStart_RefusesTheCursor asserts that a
+// persisted position carrying a mid-COPY cursor is refused
+// VSTREAM-COPY-RESUME-WITHDRAWN under the supervisor's no-restart marker,
+// before any open: neither the seeded snapshot (the withdrawn resume) nor
+// the plain CDC reader (a warm resume that copies nothing) is reached.
+func TestStreamer_InterruptedColdStart_RefusesTheCursor(t *testing.T) {
 	const token = `[{"keyspace":"main","shard":"-","gtid":"MySQL56/abcd:1-100","table_p_ks":[{"table_name":"widgets","lastpk":"AAAA"}]}]`
 	cdc := &capturingCDCReader{captured: make(chan struct{})}
 	source := &copyResumeEngine{
@@ -45,7 +40,6 @@ func TestStreamer_InterruptedColdStart_RoutesToBulkResume(t *testing.T) {
 		caps:           ir.Capabilities{CDC: ir.CDCBinlog},
 		cdcReader:      cdc,
 		carriesCursor:  true,
-		resumeOpenErr:  errResumeRouted,
 		schemaOneTable: true,
 	}
 	target := &copyResumeEngine{name: "postgres"}
@@ -68,30 +62,55 @@ func TestStreamer_InterruptedColdStart_RoutesToBulkResume(t *testing.T) {
 	}
 	err := s.Run(ctx)
 
-	// coldStart's seeded snapshot open returned errResumeRouted; Run wraps
-	// it. The load-bearing assertion is the path, not the error text.
-	if source.resumeOpenCalls.Load() != 1 {
-		t.Errorf("OpenSnapshotStreamFromPosition called %d times; want 1 (interrupted cold-start must take the bulk resume path)",
-			source.resumeOpenCalls.Load())
+	if err == nil || !strings.Contains(err.Error(), copyResumeWithdrawnMarker) || !strings.Contains(err.Error(), "--restart-from-scratch") {
+		t.Fatalf("Run = %v; want the %s refusal naming --restart-from-scratch", err, copyResumeWithdrawnMarker)
 	}
-	if cdc.once {
-		t.Error("plain CDC StreamChanges was called — interrupted cold-start wrongly routed to the per-row warm-resume path (the ~10 rows/sec silent-degrade bug)")
+	if refusalARestartRepeats(err) == nil {
+		t.Errorf("the refusal carries no sentinel in refusalsARestartRepeats, so the supervisor would retry it: %v", err)
 	}
-	if source.cdcOpenCalls.Load() != 0 {
-		t.Errorf("OpenCDCReader called %d times; want 0 (bulk resume must not open the plain CDC reader)", source.cdcOpenCalls.Load())
+	if n := source.resumeOpenCalls.Load(); n != 0 {
+		t.Errorf("OpenSnapshotStreamFromPosition called %d times; want 0 (the cursor resume is withdrawn)", n)
 	}
-	if gotPos := source.resumeOpenPos.Load(); gotPos == nil || gotPos.Token != token {
-		t.Errorf("OpenSnapshotStreamFromPosition got position %v; want token %q", gotPos, token)
+	if cdc.once || source.cdcOpenCalls.Load() != 0 {
+		t.Errorf("the plain CDC reader was opened (%d) — a warm resume from a mid-COPY cursor copies nothing more", source.cdcOpenCalls.Load())
 	}
-	// The resumed COPY must be scoped to the SAME filtered table allowlist a
-	// fresh cold-start uses (v0.99.12 table-scope follow-up for the resume
-	// path). The one-table schema yields exactly ["widgets"].
-	if gotTables := source.resumeOpenTables.Load(); gotTables == nil ||
-		len(*gotTables) != 1 || (*gotTables)[0] != "widgets" {
-		t.Errorf("OpenSnapshotStreamFromPosition got tables %v; want [\"widgets\"] (resume must carry the filtered allowlist)", gotTables)
+}
+
+// TestStreamer_InterruptedColdStart_RestartFromScratchStillRuns asserts the
+// refusal's remedy is reachable: with --restart-from-scratch, a persisted
+// mid-COPY cursor is ignored and a fresh cold start runs (it opens the
+// scoped snapshot, not the seeded one, and unwinds at the unconfigured test
+// target).
+func TestStreamer_InterruptedColdStart_RestartFromScratchStillRuns(t *testing.T) {
+	const token = `[{"keyspace":"main","shard":"-","gtid":"MySQL56/abcd:1-100","table_p_ks":[{"table_name":"widgets","lastpk":"AAAA"}]}]`
+	source := &copyResumeEngine{
+		name:           "planetscale",
+		caps:           ir.Capabilities{CDC: ir.CDCBinlog},
+		cdcReader:      &capturingCDCReader{captured: make(chan struct{})},
+		carriesCursor:  true,
+		schemaOneTable: true,
 	}
-	if err == nil {
-		t.Error("Run returned nil; want the routed-snapshot error to surface (loud, not silent)")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	s := &Streamer{
+		Source:             source,
+		Target:             &copyResumeEngine{name: "postgres"},
+		SourceDSN:          "src",
+		TargetDSN:          "tgt",
+		StreamID:           "test-stream",
+		SchemaChanges:      "refuse",
+		Applier:            &resumeDispatchApplier{stored: ir.Position{Engine: "postgres", Token: token}, found: true},
+		RestartFromScratch: true,
+	}
+	err := s.Run(ctx)
+	if err != nil && strings.Contains(err.Error(), copyResumeWithdrawnMarker) {
+		t.Fatalf("--restart-from-scratch was refused %s; the remedy must run: %v", copyResumeWithdrawnMarker, err)
+	}
+	if n := source.snapshotOpenCalls.Load(); n != 1 {
+		t.Errorf("OpenSnapshotStream called %d times; want 1 (the fresh cold start)", n)
+	}
+	if n := source.resumeOpenCalls.Load(); n != 0 {
+		t.Errorf("OpenSnapshotStreamFromPosition called %d times; want 0", n)
 	}
 }
 
@@ -212,19 +231,14 @@ type copyResumeEngine struct {
 	// cursor-less → plain-CDC branch.
 	carriesCursor bool
 
-	// resumeOpenErr is returned from OpenSnapshotStreamFromPosition so
-	// coldStart unwinds immediately after the routing decision.
-	resumeOpenErr error
-
 	// schemaOneTable makes OpenSchemaReader return a one-table schema so
 	// coldStart proceeds past the empty-schema short-circuit to the
 	// snapshot open (where the routing decision is observable).
 	schemaOneTable bool
 
-	resumeOpenCalls  atomic.Int32
-	cdcOpenCalls     atomic.Int32
-	resumeOpenPos    atomic.Pointer[ir.Position]
-	resumeOpenTables atomic.Pointer[[]string]
+	resumeOpenCalls   atomic.Int32
+	snapshotOpenCalls atomic.Int32
+	cdcOpenCalls      atomic.Int32
 }
 
 func (e *copyResumeEngine) Name() string                  { return e.name }
@@ -259,6 +273,7 @@ func (e *copyResumeEngine) OpenChangeApplier(context.Context, string) (ir.Change
 }
 
 func (e *copyResumeEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
+	e.snapshotOpenCalls.Add(1)
 	return nil, errors.New("not used in copy-resume dispatch test")
 }
 
@@ -269,16 +284,9 @@ func (e *copyResumeEngine) PositionCarriesCopyCursor(ir.Position) bool {
 }
 
 func (e *copyResumeEngine) OpenSnapshotStreamFromPosition(
-	_ context.Context, _ string, from ir.Position, tables []string,
+	context.Context, string, ir.Position, []string,
 ) (*ir.SnapshotStream, error) {
 	e.resumeOpenCalls.Add(1)
-	p := from
-	e.resumeOpenPos.Store(&p)
-	tbls := tables
-	e.resumeOpenTables.Store(&tbls)
-	if e.resumeOpenErr != nil {
-		return nil, e.resumeOpenErr
-	}
 	return nil, errors.New("copy-resume dispatch test: no snapshot produced")
 }
 

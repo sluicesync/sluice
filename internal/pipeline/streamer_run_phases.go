@@ -707,15 +707,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 	// storage; every cold-start path (initial, --reset-target-data
 	// recovery, or warm-resume → ErrPositionInvalid fall-through) is
 	// brand-new-stream-equivalent and skips the prime.
-	// resumeCopyFrom is the interrupted-cold-start resume cursor (v0.99.8).
-	// It is non-zero only when ALL of: a position is persisted (found), the
-	// source engine implements the resumer surface, and the persisted
-	// position carries a mid-COPY TablePKs cursor. In that case the resume
-	// must route through coldStart's bulk-COPY path seeded from the cursor
-	// — NOT through warmResume's plain CDC reader, which would apply the
-	// un-copied COPY tail one row at a time (~10 rows/sec, the silent
-	// degrade this fixes). A cursor-less persisted position (completed
-	// cold-start) leaves this zero and stays on the fast warmResume path.
+	// copyCursorPersisted reports a persisted position that carries a
+	// mid-COPY TablePKs cursor: a cold start that stopped during its copy,
+	// under a release before v0.163.3 (none since persists one). It is
+	// refused, not resumed (copyResumeWithdrawnMarker): a resumed VStream
+	// copy keeps the rows the source deleted while the stream was stopped.
+	// It must not reach warmResume either, whose plain CDC reader would
+	// leave the uncopied rest of the table missing. A cursor-less persisted
+	// position (a finished cold start) stays on the warmResume path.
 	// Set by whichever cold-start lane copies (coldStart, the fan-out, the
 	// stopped-cold-start resume) and recorded below once the branch returns.
 	s.coldStartEstablished = nil
@@ -732,10 +731,10 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 	if err := s.phaseReadLiveAddedScope(ctx, applier, streamID); err != nil {
 		return nil, func() {}, false, err
 	}
-	var resumeCopyFrom ir.Position
+	copyCursorPersisted := false
 	if found && !s.ResetTargetData && !s.RestartFromScratch {
 		if resumer, ok := s.Source.(ir.SnapshotStreamResumer); ok && resumer.PositionCarriesCopyCursor(persisted) {
-			resumeCopyFrom = persisted
+			copyCursorPersisted = true
 		}
 	}
 	switch {
@@ -810,7 +809,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			changes, stop, err = s.coldStartMultiDatabase(streamCtx, applier, streamID, freshCopyNone)
 		}
 	case s.ResetTargetData:
-		changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, freshCopyNone)
+		changes, stop, err = s.coldStart(streamCtx, applier, streamID, freshCopyNone)
 	case s.RestartFromScratch:
 		// Force a fresh cold-start from row 0, ignoring any persisted
 		// position (incl. a mid-COPY cursor). The cold-start gate
@@ -828,22 +827,14 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			ctx, "restart-from-scratch: forcing a fresh cold-start, ignoring the persisted position",
 			slog.String("stream_id", streamID),
 		)
-		changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, freshCopyOperatorRestart)
-	case resumeCopyFrom.Token != "" || resumeCopyFrom.Engine != "":
-		// Interrupted cold-start: resume the bulk COPY from the persisted
-		// cursor (seeded snapshot stream → batched bulk-COPY writer), then
-		// transition to CDC exactly as a fresh cold-start does. The target
-		// keeps its partial copy; the idempotent COPY writer absorbs the
-		// overlap. warmResumed stays false: coldStart's bulk-copy resets
-		// the applier's effective schema-history state, same as a fresh
-		// cold-start, so the schema-history cache prime gets the
-		// brand-new-stream sentinel below.
-		slog.InfoContext(
-			ctx, "persisted position carries a mid-COPY cursor; resuming interrupted cold-start via the bulk path",
+		changes, stop, err = s.coldStart(streamCtx, applier, streamID, freshCopyOperatorRestart)
+	case copyCursorPersisted:
+		slog.ErrorContext(
+			ctx, "resume refused: "+copyResumeWithdrawnMarker,
 			slog.String("stream_id", streamID),
 			slog.String("position_token", truncateDryRunToken(persisted.Token, 60)),
 		)
-		changes, stop, err = s.coldStart(streamCtx, applier, streamID, resumeCopyFrom, freshCopyNone)
+		return nil, func() {}, false, copyResumeWithdrawnError(streamID)
 	case found:
 		// SLM-1 / SLM-1b: a warm resume's prior shape per table is the
 		// target's zone witness, with the retained schema-history version
@@ -920,7 +911,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			// (TestStreamer_MultiSchema_SlotLossRefusesLoudly). The operator's
 			// explicit --restart-from-scratch is unaffected (forces fresh for
 			// any engine); this governs only the AUTOMATIC fall-through.
-			changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, autoResnapshotReason(s.Source))
+			changes, stop, err = s.coldStart(streamCtx, applier, streamID, autoResnapshotReason(s.Source))
 			// coldStart supersedes the warm resume — schema-history
 			// stays brand-new from the applier's perspective (the
 			// snapshot bulk-copy reset effective state).
@@ -954,7 +945,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			}
 			return resumedChanges, resumedStop, false, nil
 		}
-		changes, stop, err = s.coldStart(streamCtx, applier, streamID, ir.Position{}, freshCopyNone)
+		changes, stop, err = s.coldStart(streamCtx, applier, streamID, freshCopyNone)
 	}
 	return changes, stop, warmResumed, err
 }

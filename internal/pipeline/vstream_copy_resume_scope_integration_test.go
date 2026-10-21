@@ -3,59 +3,51 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Measurements for two audit-backlog hypotheses about the VStream
-// interrupted-COPY resume (a persisted TablePKs cursor, routed through
-// coldStart's resumingCopy branch and OpenSnapshotStreamFromPosition):
+// End-to-end pins for the withdrawal of the VStream mid-COPY resume
+// (VSTREAM-COPY-RESUME-WITHDRAWN, v0.163.3), against vttestserver with a
+// Postgres target.
 //
-//   - VSTREAM-COPY-RESUME-RECREATED-TABLE: the cursor carries no table
-//     identity, so a table dropped and re-created while the stream was
-//     stopped may keep the old table's rows on the target, or have the new
-//     table's rows below the old cursor skipped.
-//   - VSTREAM-COPY-RESUME-SCOPE-WIDEN: a table added to --include-table
-//     before the resume may never be copied on the single-stream arms
-//     (vstream_copy_single_stream=true, or a one-table resume scope whose
-//     cursor names another table). REFUTED on every arm (2026-10-20).
+// A resumed VStream copy could not make the target match the source
+// (VSTREAM-COPY-RESUME-RECREATED-TABLE, measured here before the
+// withdrawal): Vitess copies again from the start every table with no
+// cursor, the finished ones included, and drops their stopped-window
+// changes, and the re-copy writes by upsert, which removes nothing. So a
+// row deleted on the source while the stream was stopped stayed on the
+// target, and so did every old row of a table dropped and re-created
+// (rc_b: source 701, target 6701; pd_a: source 1156, target 1176). The
+// cursor-less checkpoints before that were worse
+// (VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES, fixed in v0.163.2: up to
+// 298,000 of 300,000 rows never copied).
 //
-// They found a third, worse, now fixed: VSTREAM-COPY-CURSORLESS-
-// CHECKPOINT-WARM-RESUMES. The COPY checkpoint persisted positions with no
-// cursor, which the next start reads as a completed copy, so the rest of
-// the table was never copied. The SingleStream / SingleTableScope /
-// DefaultPath cells pin its fix (vcrStopMidCopyHoldingTheCursorRule).
+// Every cell drives the REAL Streamer through three phases:
 //
-// Every cell drives the REAL Streamer against vttestserver with a Postgres
-// target: phase 1 is a real cold start, cancelled the moment the target's
-// sluice_cdc_state row carries a mid-COPY cursor naming the expected
-// table; phase 2 is a real `sync start` re-run. The verdict compares the
-// SOURCE's ids (read off vtgate) against the TARGET's ids — never sluice's
-// own state, logs or counters. A cell passes on an exact match or on a
-// loud refusal (Run returns an error), and fails on a target that differs
-// from the source while the stream runs on without error.
+//  1. A cold start, stopped once the big table holds vcrStopAfterRows of
+//     its rows but not all. Throughout, and after the stop, the target holds
+//     no persisted position: no mid-COPY checkpoint is written, so there is
+//     nothing a next start could resume from.
+//  2. With the stream stopped, the source changes (rows deleted, or every
+//     table dropped and re-created), and a plain re-run of the same command
+//     must refuse loudly: it exits with an error and never streams.
+//  3. The refusal's remedy, the same command with --restart-from-scratch,
+//     must leave every table exactly equal to the source while traffic
+//     streams, the stopped-window deletes included.
 //
-// Rig guards (a mismatch is only evidence once these hold): phase 1 must
-// stop with the cursor naming exactly the expected table and the target
-// holding fewer of its rows than the source (a COPY that finished before
-// the stop is a rig failure, not a measurement), and phase 2 must log the
-// mid-COPY resume line (a resume that never took the cursor path measured
-// nothing).
+// The verdict compares the SOURCE's ids (read off vtgate) against the
+// TARGET's ids, never sluice's own state, logs or counters.
 //
 // Usage (Windows; see CLAUDE.md for the Rancher Desktop env):
 //
 //	go test -tags='integration vstream' -count=1 -timeout=60m -v \
 //	  -run 'TestStreamer_VStreamCopyResume' ./internal/pipeline/
-//
-// Cells whose silent loss is measured and not yet fixed are skipped (see
-// vcrSkipConfirmed); SLUICE_VCR_MEASURE=1 runs them, and they fail.
 
 package pipeline
 
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,11 +58,6 @@ import (
 	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
-
-// vcrResumeLog is the literal line phaseOpenChangeStream logs when a
-// persisted position carries a mid-COPY cursor and the run resumes through
-// the bulk path — the anti-vacuity witness that phase 2 measured the resume.
-const vcrResumeLog = "persisted position carries a mid-COPY cursor; resuming interrupted cold-start via the bulk path"
 
 // vcrBigRows sizes the table the stop lands in: large enough that the
 // 50,000-row checkpoint cadence persists several mid-table cursors.
@@ -109,15 +96,6 @@ func (r vcrRig) streamer(streamID string, include []string, extraDSN string) *St
 		StreamID:           streamID,
 		Filter:             filter,
 		ApplyRetryAttempts: 8,
-	}
-}
-
-// vcrSkipConfirmed skips a cell whose silent loss is measured and not yet
-// fixed, so the vstream suite stays green; SLUICE_VCR_MEASURE=1 runs it.
-func vcrSkipConfirmed(t *testing.T, why string) {
-	t.Helper()
-	if os.Getenv("SLUICE_VCR_MEASURE") == "" {
-		t.Skip(why + " (set SLUICE_VCR_MEASURE=1 to reproduce)")
 	}
 }
 
@@ -272,162 +250,29 @@ func vcrCompare(t *testing.T, r vcrRig, table string) vcrDiff {
 	return d
 }
 
-// vcrCursorTables decodes the persisted position token and returns the
-// table names its TablePKs cursor carries (empty for a cursor-less, i.e.
-// streaming, position). ok is false when no position is persisted.
-func vcrCursorTables(t *testing.T, r vcrRig, streamID string) (tables []string, ok bool) {
-	t.Helper()
-	tok := twfbCell{tgt: r.tgt(), streamID: streamID}.persistedPosition(t)
-	if tok == "" {
-		return nil, false
-	}
-	var shards []struct {
-		TablePKs []struct {
-			TableName string `json:"table_name"`
-		} `json:"table_p_ks"`
-	}
-	if err := json.Unmarshal([]byte(tok), &shards); err != nil {
-		t.Fatalf("persisted position is not a VStream token: %v\n%s", err, tok)
-	}
-	seen := map[string]bool{}
-	for _, s := range shards {
-		for _, pk := range s.TablePKs {
-			if !seen[pk.TableName] {
-				seen[pk.TableName] = true
-				tables = append(tables, pk.TableName)
-			}
-		}
-	}
-	sort.Strings(tables)
-	return tables, true
-}
-
-// vcrStopMidCopy runs phase 1 and cancels it the moment the persisted
-// cursor names exactly cursorTable; it then asserts the stop really was
-// mid-table (the rig guard) and returns the target's row count for it.
-func vcrStopMidCopy(t *testing.T, r vcrRig, s *Streamer, cursorTable string, sourceRows int) int {
-	t.Helper()
-	run := startTWFBRun(s)
-	logStart := r.logs.Len()
-	observed := map[string]bool{}
-	deadline := time.Now().Add(8 * time.Minute)
-	for {
-		if time.Now().After(deadline) {
-			_ = run.stop(t)
-			t.Fatalf("RIG: no mid-COPY cursor naming only %s was ever persisted (%d distinct positions observed)", cursorTable, len(observed))
-		}
-		if run.exited() {
-			vcrLogTail(t, r, logStart)
-			t.Fatalf("RIG: phase 1 exited before a mid-COPY cursor was persisted: %v", run.err)
-		}
-		if tabs, ok := vcrCursorTables(t, r, s.StreamID); ok {
-			tok := twfbCell{tgt: r.tgt(), streamID: s.StreamID}.persistedPosition(t)
-			if !observed[tok] {
-				observed[tok] = true
-				t.Logf("phase 1 persisted a position with cursor tables %v (target %s rows: %s)",
-					tabs, cursorTable, r.tgt().scalar(t, "SELECT count(*) FROM "+cursorTable))
-			}
-			if len(tabs) == 1 && tabs[0] == cursorTable {
-				break
-			}
-			// A cursor-less position is also persisted BETWEEN tables on the
-			// auto-shard path (the previous table's completion checkpoint), so
-			// it means "finished" only once the target holds every row.
-			if len(tabs) == 0 && r.tgt().scalar(t, "SELECT count(*) FROM "+cursorTable) == fmt.Sprint(sourceRows) {
-				vcrLogTail(t, r, logStart)
-				_ = run.stop(t)
-				t.Fatalf("RIG: the COPY finished (cursor-less position) before a mid-%s cursor was observed (%d distinct positions observed)", cursorTable, len(observed))
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("RIG: phase 1's stop returned %v", err)
-	}
-	tabs, _ := vcrCursorTables(t, r, s.StreamID)
-	if len(tabs) != 1 || tabs[0] != cursorTable {
-		t.Fatalf("RIG: after the stop the persisted cursor names %v; want [%s]", tabs, cursorTable)
-	}
-	got := len(vcrIDs(t, r.tgt(), cursorTable))
-	if got >= sourceRows {
-		t.Fatalf("RIG: the target already holds %d of %s's %d rows — the stop was not mid-table", got, cursorTable, sourceRows)
-	}
-	t.Logf("phase 1 stopped mid-COPY: cursor names [%s], target holds %d of %d rows", cursorTable, got, sourceRows)
-	return got
-}
-
-// vcrSkipsACopy reads the persisted position and says why resuming it would
-// skip a copy ("" when it would not, or when none is persisted). Vitess
-// copies a shard on resume only when that shard has not started (no GTID)
-// or carries a TablePKs cursor, so a position with no cursor at all (read
-// as a completed copy) or with a started shard that has none (that shard
-// only catches up) skips rows. Decoded here from the token's JSON, not
-// through the engine's own predicates.
-func vcrSkipsACopy(t *testing.T, r vcrRig, streamID string) string {
-	t.Helper()
-	tok := twfbCell{tgt: r.tgt(), streamID: streamID}.persistedPosition(t)
-	if tok == "" {
-		return ""
-	}
-	var shards []struct {
-		Shard    string            `json:"shard"`
-		Gtid     string            `json:"gtid"`
-		TablePKs []json.RawMessage `json:"table_p_ks"`
-	}
-	if err := json.Unmarshal([]byte(tok), &shards); err != nil {
-		t.Fatalf("persisted position is not a VStream token: %v\n%s", err, tok)
-	}
-	anyCursor := false
-	for _, sh := range shards {
-		anyCursor = anyCursor || len(sh.TablePKs) > 0
-	}
-	if !anyCursor {
-		return "a position with no copy cursor is persisted"
-	}
-	for _, sh := range shards {
-		if sh.Gtid != "" && len(sh.TablePKs) == 0 {
-			return fmt.Sprintf("a position whose shard %q has started and carries no cursor is persisted", sh.Shard)
-		}
-	}
-	return ""
-}
-
-// vcrStopAfterRows is where the stop lands: past the first COPY checkpoint
-// (written at 1,500–2,500 rows, measured), which used to persist a
-// cursor-less position, so the cells are not vacuous on the defect.
+// vcrStopAfterRows is where phase 1 stops: past the first COPY checkpoint
+// tick (1,500–2,500 rows, measured), which until v0.163.3 could persist a
+// position, so the no-position assertion is not vacuous.
 const vcrStopAfterRows = 5000
 
-// vcrStopMidCopyHoldingTheCursorRule runs phase 1 and stops it once big
-// holds vcrStopAfterRows of its rows but not all, a point the defect's
-// cursor-less checkpoints had already been persisted by (the first, before
-// any LASTPK; every one of a multi-table single-stream copy). Throughout, it holds the
-// rule VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES's fix makes: while
-// the copy is incomplete, no position without a copy cursor is persisted,
-// because the next start would read it as a completed copy.
-func vcrStopMidCopyHoldingTheCursorRule(t *testing.T, r vcrRig, s *Streamer, big string, sourceRows int) {
+// vcrStopMidCopyPersistingNothing runs phase 1 and stops it once big holds
+// vcrStopAfterRows of its rows but not all. While the copy runs, and after
+// the stop, the target must hold no persisted position for the stream.
+func vcrStopMidCopyPersistingNothing(t *testing.T, r vcrRig, s *Streamer, big string, sourceRows int) {
 	t.Helper()
+	cell := twfbCell{tgt: r.tgt(), streamID: s.StreamID}
 	run := startTWFBRun(s)
 	deadline := time.Now().Add(8 * time.Minute)
-	broken := false
-	checkRule := func(when string) {
-		if broken {
-			return
-		}
-		why := vcrSkipsACopy(t, r, s.StreamID)
-		if why == "" {
-			return
-		}
-		if n := len(vcrIDs(t, r.tgt(), big)); n < sourceRows {
-			broken = true
-			t.Errorf("%s: %s while %s holds %d of %d rows; the next start's resume would skip copying them", when, why, big, n, sourceRows)
-		}
-	}
 	for {
 		if run.exited() || time.Now().After(deadline) {
 			_ = run.stop(t)
 			t.Fatalf("RIG: phase 1 exited or timed out before %s held part of its rows (%v)", big, run.err)
 		}
-		checkRule("during the copy")
+		if tok := cell.persistedPosition(t); tok != "" {
+			_ = run.stop(t)
+			t.Fatalf("a position was persisted during the copy (%s holds %s of %d rows): %s",
+				big, r.tgt().scalar(t, "SELECT count(*) FROM "+big), sourceRows, tok)
+		}
 		n := r.tgt().scalar(t, "SELECT count(*) FROM "+big)
 		if got, err := strconv.Atoi(n); err == nil && got >= vcrStopAfterRows {
 			if n == fmt.Sprint(sourceRows) {
@@ -441,32 +286,55 @@ func vcrStopMidCopyHoldingTheCursorRule(t *testing.T, r vcrRig, s *Streamer, big
 	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("RIG: phase 1's stop returned %v", err)
 	}
-	checkRule("after the stop")
-	tabs, ok := vcrCursorTables(t, r, s.StreamID)
-	t.Logf("phase 1 stopped mid-copy: persisted=%v cursor=%v, %s target holds %d of %d rows",
-		ok, tabs, big, len(vcrIDs(t, r.tgt(), big)), sourceRows)
+	if tok := cell.persistedPosition(t); tok != "" {
+		t.Fatalf("the stopped copy left a persisted position: %s", tok)
+	}
+	t.Logf("phase 1 stopped mid-copy with no persisted position; %s target holds %d of %d rows",
+		big, len(vcrIDs(t, r.tgt(), big)), sourceRows)
 }
 
-// vcrResumeUnderTraffic runs phase 2 while writing one row a second into
-// traffic (so a quiet source cannot trip the VStream liveness check and
-// stand in for a refusal). It passes on an exact match of every compare
-// table or on a loud exit, and fails on a divergence once the traffic is
-// visibly streaming to the target.
-func vcrResumeUnderTraffic(t *testing.T, r vcrRig, s *Streamer, traffic string, compare []string) {
+// vcrRequireRefusal runs phase 2, a plain re-run, which must exit with an
+// error within three minutes without the stream ever persisting a position.
+func vcrRequireRefusal(t *testing.T, r vcrRig, s *Streamer) {
 	t.Helper()
 	logStart := r.logs.Len()
 	run := startTWFBRun(s)
 	defer func() { _ = run.stop(t) }()
-	defer vcrLogTail(t, r, logStart)
-	const trafficBase = 8_000_000
 	deadline := time.Now().Add(3 * time.Minute)
-	for i := int64(0); time.Now().Before(deadline); i++ {
+	for !run.exited() {
+		if time.Now().After(deadline) {
+			vcrLogTail(t, r, logStart)
+			t.Fatal("the re-run after a stopped copy neither refused nor exited in 3 minutes")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if run.err == nil {
+		t.Fatal("the re-run after a stopped copy exited nil; want a loud refusal")
+	}
+	if tok := (twfbCell{tgt: r.tgt(), streamID: s.StreamID}).persistedPosition(t); tok != "" {
+		t.Fatalf("the refused re-run persisted a position: %s", tok)
+	}
+	t.Logf("REFUSED (loud): %v", run.err)
+}
+
+// vcrRecopyExact runs phase 3, the refusal's remedy (s with
+// RestartFromScratch), writing one row a second into traffic. Every compare
+// table must match the source exactly within five minutes, with the run
+// still going; an exit or a lasting difference fails the cell.
+func vcrRecopyExact(t *testing.T, r vcrRig, s *Streamer, traffic string, compare []string) {
+	t.Helper()
+	if !s.RestartFromScratch {
+		t.Fatal("RIG: phase 3 must run with --restart-from-scratch")
+	}
+	logStart := r.logs.Len()
+	run := startTWFBRun(s)
+	defer func() { _ = run.stop(t) }()
+	const trafficBase = 8_000_000
+	deadline := time.Now().Add(5 * time.Minute)
+	for i := int64(0); ; i++ {
 		if run.exited() {
-			t.Logf("REFUSED (loud): %v", run.err)
-			for _, tbl := range compare {
-				t.Logf("  target at refusal: %s", vcrCompare(t, r, tbl))
-			}
-			return
+			vcrLogTail(t, r, logStart)
+			t.Fatalf("the --restart-from-scratch re-copy exited: %v", run.err)
 		}
 		vcrSeed(t, r.mysqlDSN, traffic, "traffic", []int64{trafficBase + i})
 		exact := true
@@ -482,104 +350,32 @@ func vcrResumeUnderTraffic(t *testing.T, r vcrRig, s *Streamer, traffic string, 
 			}
 			return
 		}
-		time.Sleep(time.Second)
-	}
-	streamed := r.tgt().scalar(t, fmt.Sprintf("SELECT count(*) FROM %s WHERE id >= %d", traffic, trafficBase))
-	if strings.HasPrefix(streamed, "<") || streamed == "0" {
-		for _, tbl := range compare {
-			t.Logf("  target while stalled: %s", vcrCompare(t, r, tbl))
-		}
-		tabs, _ := vcrCursorTables(t, r, s.StreamID)
-		t.Fatalf("STALLED: no traffic row reached the target in 3 minutes and the run neither exited nor errored (traffic on target: %s; persisted cursor names %v)", streamed, tabs)
-	}
-	t.Logf("the stream is live: %s traffic rows reached the target", streamed)
-	for _, tbl := range compare {
-		if d := vcrCompare(t, r, tbl); d.exact() {
-			t.Logf("EXACT: %s", d)
-		} else {
-			t.Errorf("SILENT DIVERGENCE (stream running and applying, no error): %s", d)
-		}
-	}
-}
-
-// vcrResumeAndGrade runs phase 2 and grades it. A refusal (Run exits with an
-// error) passes. Otherwise the run must hand off to CDC; markers are then
-// inserted (one per entry of markers, table -> id) and awaited, and every
-// table in compare must match the source exactly. A table that differs while
-// the stream runs without error is the silent-loss shape and fails the cell.
-func vcrResumeAndGrade(t *testing.T, r vcrRig, s *Streamer, markers map[string]int64, compare []string) {
-	t.Helper()
-	logStart := r.logs.Len()
-	run := startTWFBRun(s)
-	defer func() { _ = run.stop(t) }()
-	defer vcrLogTail(t, r, logStart)
-
-	// Wait for the hand-off to CDC (the cold start's anchor, or a
-	// cursor-less position) or an exit.
-	deadline := time.Now().Add(8 * time.Minute)
-	for {
-		if run.exited() {
-			if !strings.Contains(r.logs.String()[logStart:], vcrResumeLog) {
-				t.Fatalf("RIG: phase 2 exited without taking the mid-COPY resume path: %v", run.err)
-			}
-			if run.err == nil {
-				t.Fatal("phase 2 exited nil before streaming")
-			}
-			t.Logf("REFUSED (loud): %v", run.err)
+		if time.Now().After(deadline) {
+			vcrLogTail(t, r, logStart)
 			for _, tbl := range compare {
-				t.Logf("  target at refusal: %s", vcrCompare(t, r, tbl))
+				if d := vcrCompare(t, r, tbl); !d.exact() {
+					t.Errorf("after the --restart-from-scratch re-copy: %s", d)
+				}
 			}
 			return
 		}
-		if tabs, ok := vcrCursorTables(t, r, s.StreamID); ok && len(tabs) == 0 {
-			break
-		}
-		if strings.Contains(r.logs.String()[logStart:], "cold-start CDC anchor persisted") {
-			tabs, _ := vcrCursorTables(t, r, s.StreamID)
-			t.Logf("phase 2 persisted its CDC anchor; the persisted cursor names %v", tabs)
-			break
-		}
-		if time.Now().After(deadline) {
-			tabs, _ := vcrCursorTables(t, r, s.StreamID)
-			for _, tbl := range compare {
-				t.Logf("  target while stuck: %s", vcrCompare(t, r, tbl))
-			}
-			t.Fatalf("phase 2 never handed off to CDC in 8 minutes and never exited (persisted cursor names %v)", tabs)
-		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(time.Second)
 	}
-	if !strings.Contains(r.logs.String()[logStart:], vcrResumeLog) {
-		t.Fatal("RIG: phase 2 streamed without taking the mid-COPY resume path — it measured nothing")
-	}
-	time.Sleep(3 * time.Second)
+}
 
-	for tbl, id := range markers {
-		vcrSeed(t, r.mysqlDSN, tbl, "marker", []int64{id})
+// vcrStopRefuseRecopy is one cell: phase 1 on mk(), whileStopped against
+// the source, then the refused plain re-run and the exact re-copy.
+func vcrStopRefuseRecopy(t *testing.T, r vcrRig, mk func() *Streamer, big string, sourceRows int, whileStopped func(), traffic string, compare []string) {
+	t.Helper()
+	vcrStopMidCopyPersistingNothing(t, r, mk(), big, sourceRows)
+	if whileStopped != nil {
+		whileStopped()
+		time.Sleep(5 * time.Second) // the schema tracker
 	}
-	for tbl, id := range markers {
-		if !r.tgt().waitRow(t, tbl, int(id), run, 120*time.Second) {
-			if run.exited() {
-				t.Logf("REFUSED (loud) after streaming: %v", run.err)
-				return
-			}
-			t.Errorf("marker %s.%d never reached the target (stream still running)", tbl, id)
-		}
-	}
-	silent := false
-	for _, tbl := range compare {
-		d := vcrCompare(t, r, tbl)
-		if d.exact() {
-			t.Logf("EXACT: %s", d)
-			continue
-		}
-		silent = true
-		t.Errorf("SILENT DIVERGENCE (stream running, no error): %s", d)
-	}
-	if run.exited() {
-		t.Logf("note: the stream exited during grading: %v", run.err)
-	} else if silent {
-		t.Log("the stream is still running without error with the divergence above")
-	}
+	vcrRequireRefusal(t, r, mk())
+	recopy := mk()
+	recopy.RestartFromScratch = true
+	vcrRecopyExact(t, r, recopy, traffic, compare)
 }
 
 func TestStreamer_VStreamCopyResume(t *testing.T) {
@@ -603,201 +399,66 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 	}
 	const single = "&vstream_copy_single_stream=true"
 
-	// VSTREAM-COPY-RESUME-RECREATED-TABLE. Phase 1 copies rc_a (small)
-	// and stops mid-rc_b (even ids). Both tables are then dropped and
-	// re-created with disjoint rows: rc_a with ids 5001.., rc_b with ODD
-	// ids spread over the whole old range and beyond, so some new rows lie
-	// below the old cursor (skipped if the scan continues from it) and the
-	// old even ids are gone (left behind if nothing deletes them).
-	//
-	// MEASURED SILENT (2026-10-20, 3 runs): both re-created tables keep every
-	// old row the first run copied (rc_a: source 501, target 1501; rc_b:
-	// source 701, target 6701), no new row missing. Skipped so the vstream
-	// suite stays green until the fix lands; SLUICE_VCR_MEASURE=1 runs it.
-	t.Run("RecreatedTable/default-autoshard", func(t *testing.T) {
-		vcrSkipConfirmed(t, "VSTREAM-COPY-RESUME-RECREATED-TABLE: confirmed silent (old rows survive on the target); see docs/dev/audit-backlog.md")
-		vcrRecreated(t, r, "rc", "", "")
-	})
-	// The narrower form of the same entry: no re-create, just rows DELETED
-	// from the already-copied table while the stream was stopped, resumed
-	// with the unchanged scope on the default path. MEASURED SILENT: pd_a
-	// source 1156, target 1176 (ids 1..20 survive), stream live and applying.
-	t.Run("RecreatedTable/default-plain-delete-while-stopped", func(t *testing.T) {
-		vcrSkipConfirmed(t, "VSTREAM-COPY-RESUME-RECREATED-TABLE: confirmed silent for a plain stopped-window DELETE too; see docs/dev/audit-backlog.md")
+	// The stopped-window DELETE that a resumed copy kept (pd_a: source
+	// 1156, target 1176 before the withdrawal), on the default path: rows
+	// deleted from the finished small table and from the copied part of the
+	// big one.
+	t.Run("DefaultPath/delete-while-stopped", func(t *testing.T) {
 		const a, b = "pd_a", "pd_b"
 		vcrCreate(t, r, a, b)
 		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
 		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
 		time.Sleep(3 * time.Second)
-		vcrStopMidCopy(t, r, r.streamer("vcrpd", []string{a, b}, ""), b, vcrBigRows)
-		r.src().exec(t, "DELETE FROM "+a+" WHERE id <= 20")
+		vcrStopRefuseRecopy(t, r, func() *Streamer { return r.streamer("vcrpd", []string{a, b}, "") }, b, vcrBigRows,
+			func() {
+				r.src().exec(t, "DELETE FROM "+a+" WHERE id <= 20")
+				r.src().exec(t, "DELETE FROM "+b+" WHERE id <= 20")
+			}, a, []string{a, b})
+	})
+
+	// Both tables dropped and re-created with disjoint ids while stopped:
+	// the resumed copy kept every old row (rc_b: source 701, target 6701).
+	t.Run("RecreatedTable/default-path", func(t *testing.T) {
+		const a, b = "rc_a", "rc_b"
+		vcrCreate(t, r, a, b)
+		vcrSeed(t, r.mysqlDSN, a, "old", vcrRange(1, 1, 1000))
+		vcrSeed(t, r.mysqlDSN, b, "old", vcrRange(2, 2, vcrBigRows)) // even ids 2..600000
 		time.Sleep(3 * time.Second)
-		vcrResumeUnderTraffic(t, r, r.streamer("vcrpd", []string{a, b}, ""), a, []string{a, b})
+		vcrStopRefuseRecopy(t, r, func() *Streamer { return r.streamer("vcrrc", []string{a, b}, "") }, b, vcrBigRows,
+			func() {
+				r.src().exec(t, "DROP TABLE "+a)
+				r.src().exec(t, "DROP TABLE "+b)
+				vcrCreate(t, r, a, b)
+				vcrSeed(t, r.mysqlDSN, a, "new", vcrRange(5001, 1, 500))
+				vcrSeed(t, r.mysqlDSN, b, "new", vcrRange(1, 1000, 700)) // odd ids, none an old one
+			}, a, []string{a, b})
 	})
 
-	// The single-stream arms resume a cursor written by a default
-	// (auto-shard) first run: a single-stream first run with more than one
-	// table never persists a mid-COPY cursor at all (measured; see
-	// SingleStream/stop-mid-copy below), so an operator reaches a
-	// single-stream RESUME only by switching the opt-out on between runs.
-	// MEASURED SILENT: rs_a source 501, target 1501; rs_b source 701,
-	// target 5701.
-	t.Run("RecreatedTable/single-stream-resume", func(t *testing.T) {
-		vcrSkipConfirmed(t, "VSTREAM-COPY-RESUME-RECREATED-TABLE: confirmed silent on this arm too; see docs/dev/audit-backlog.md")
-		vcrRecreated(t, r, "rs", "", single)
-	})
-
-	// VSTREAM-COPY-RESUME-SCOPE-WIDEN arm (a) and the default control:
-	// phase 1 scope {x_a, x_b}, stopped mid-x_b; x_c (pre-populated) is
-	// added to the scope before the resume. MEASURED EXACT on both (the
-	// tablet's uvstreamer builds a copy plan for every filter-matched table
-	// and copies one with no TablePKs entry from the start).
-	t.Run("ScopeWiden/default-autoshard-control", func(t *testing.T) {
-		vcrWiden(t, r, "wd", "", "")
-	})
-	t.Run("ScopeWiden/armA-single-stream-resume", func(t *testing.T) {
-		vcrWiden(t, r, "ws", "", single)
-	})
-
-	// A single-stream run from the start: stopped mid-COPY of the second
-	// table (no cursor is ever persisted on this arm), then started again
-	// with the same scope. MEASURED SILENT before the fix: the re-run warm-resumed the
-	// cursor-less position; ss_b source 300000, target 1000 (298,000+
-	// missing) with the stream live and applying traffic. Fixed: no
-	// checkpoint is persisted, so the re-run refuses on the populated target.
-	t.Run("SingleStream/stop-mid-copy", func(t *testing.T) {
+	// The single-stream path (vstream_copy_single_stream=true) with two
+	// tables, and a one-table scope, which takes the single-stream path too.
+	t.Run("SingleStream/delete-while-stopped", func(t *testing.T) {
 		const a, b = "ss_a", "ss_b"
 		vcrCreate(t, r, a, b)
 		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
 		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
 		time.Sleep(3 * time.Second)
-		s := r.streamer("vcrss", []string{a, b}, single)
-		vcrStopMidCopyHoldingTheCursorRule(t, r, s, b, vcrBigRows)
-		vcrResumeUnderTraffic(t, r, r.streamer("vcrss", []string{a, b}, single), a, []string{a, b})
+		vcrStopRefuseRecopy(t, r, func() *Streamer { return r.streamer("vcrss", []string{a, b}, single) }, b, vcrBigRows,
+			func() { r.src().exec(t, "DELETE FROM "+a+" WHERE id <= 20") }, a, []string{a, b})
 	})
-
-	// A one-table scope takes the single-stream path too (len(tables) ==
-	// 1). Stopped while the persisted position is cursor-less with rows
-	// already on the target. MEASURED SILENT before the fix: st_b source
-	// 300133, target 2133 (ids 2001..300000 missing). Fixed: the stop leaves
-	// a cursor, and the resume is exact.
-	t.Run("SingleTableScope/stop-at-cursorless-checkpoint", func(t *testing.T) {
+	t.Run("SingleTableScope/delete-while-stopped", func(t *testing.T) {
 		const b = "st_b"
 		vcrCreate(t, r, b)
 		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
 		time.Sleep(3 * time.Second)
-		s := r.streamer("vcrst", []string{b}, "")
-		vcrStopMidCopyHoldingTheCursorRule(t, r, s, b, vcrBigRows)
-		vcrResumeUnderTraffic(t, r, r.streamer("vcrst", []string{b}, ""), b, []string{b})
-	})
-
-	// The same shape on the DEFAULT auto-shard path: the first position the
-	// COPY checkpoint persists carries no cursor (it precedes the first
-	// LASTPK), and so does the one between two tables. A stop while such a
-	// position is the persisted one leaves the next start with a
-	// cursor-less position and no established-table record. MEASURED
-	// SILENT before the fix: dp_b source 300000, target 2000 (ids
-	// 2001..300000 missing). Fixed: an earlier cursor or no row (a refusal).
-	t.Run("DefaultPath/stop-at-cursorless-checkpoint", func(t *testing.T) {
-		const a, b = "dp_a", "dp_b"
-		vcrCreate(t, r, a, b)
-		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
-		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
-		time.Sleep(3 * time.Second)
-		s := r.streamer("vcrdp", []string{a, b}, "")
-		vcrStopMidCopyHoldingTheCursorRule(t, r, s, b, vcrBigRows)
-		vcrResumeUnderTraffic(t, r, r.streamer("vcrdp", []string{a, b}, ""), a, []string{a, b})
-	})
-
-	// Arm (b), the entry's own example: phase 1 scope {nb_a, nb_b} stopped
-	// mid-nb_b; resume narrowed to {nb_a}. nb_a was fully copied in phase
-	// 1, so the measurement is whether a change to nb_a made while stopped
-	// arrives, and whether nb_a stays exact. MEASURED SILENT: nb_a is
-	// re-copied (the 50 stopped-window inserts land) but the 20 deleted rows
-	// survive — source 1205, target 1225 — the RECREATED-TABLE mechanism
-	// (re-copy by upsert never removes a row), not a scope defect. Without
-	// write traffic this cell instead sat 8 minutes with no hand-off, no
-	// error and the same divergence.
-	t.Run("ScopeWiden/armB-narrowed-to-copied-table", func(t *testing.T) {
-		vcrSkipConfirmed(t, "VSTREAM-COPY-RESUME-RECREATED-TABLE: confirmed silent on a narrowed resume too (stopped-window DELETEs survive); see docs/dev/audit-backlog.md")
-		const a, b = "nb_a", "nb_b"
-		vcrCreate(t, r, a, b)
-		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
-		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
-		time.Sleep(3 * time.Second)
-		vcrStopMidCopy(t, r, r.streamer("vcrnb", []string{a, b}, ""), b, vcrBigRows)
-		vcrSeed(t, r.mysqlDSN, a, "stopped", vcrRange(1001, 1, 50))
-		r.src().exec(t, "DELETE FROM "+a+" WHERE id <= 20")
-		time.Sleep(3 * time.Second)
-		vcrResumeUnderTraffic(t, r, r.streamer("vcrnb", []string{a}, ""), a, []string{a})
-	})
-
-	// Arm (b), the strongest form: phase 1 scope {nc_a (big), nc_b
-	// (small)} stopped mid-nc_a, so nc_b was never copied; resume narrowed
-	// to {nc_b}. One VStream filters nc_b and carries nc_a's cursor.
-	// MEASURED EXACT under traffic (704 = 704): the tablet copies nc_b from
-	// the start. Without traffic one run ended loud (apply retry budget
-	// exhausted on the VStream no-events liveness check) and another sat 8
-	// minutes with no hand-off, nc_b exact both times.
-	t.Run("ScopeWiden/armB-narrowed-to-uncopied-table", func(t *testing.T) {
-		const a, b = "nc_a", "nc_b"
-		vcrCreate(t, r, a, b)
-		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, vcrBigRows))
-		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, 700))
-		time.Sleep(3 * time.Second)
-		vcrStopMidCopy(t, r, r.streamer("vcrnc", []string{a, b}, ""), a, vcrBigRows)
-		if n := len(vcrIDs(t, r.tgt(), b)); n != 0 {
-			t.Fatalf("RIG: %s already holds %d rows after phase 1; want 0 (never reached)", b, n)
-		}
-		vcrResumeUnderTraffic(t, r, r.streamer("vcrnc", []string{b}, ""), b, []string{b})
+		vcrStopRefuseRecopy(t, r, func() *Streamer { return r.streamer("vcrst", []string{b}, "") }, b, vcrBigRows,
+			func() { r.src().exec(t, "DELETE FROM "+b+" WHERE id <= 20") }, b, []string{b})
 	})
 }
 
-func vcrRecreated(t *testing.T, r vcrRig, p, phase1DSN, phase2DSN string) {
-	a, b := p+"_a", p+"_b"
-	streamID := "vcr" + p
-	vcrCreate(t, r, a, b)
-	vcrSeed(t, r.mysqlDSN, a, "old", vcrRange(1, 1, 1000))
-	vcrSeed(t, r.mysqlDSN, b, "old", vcrRange(2, 2, vcrBigRows)) // even ids 2..600000
-	time.Sleep(3 * time.Second)
-	vcrStopMidCopy(t, r, r.streamer(streamID, []string{a, b}, phase1DSN), b, vcrBigRows)
-
-	r.src().exec(t, "DROP TABLE "+a)
-	r.src().exec(t, "DROP TABLE "+b)
-	vcrCreate(t, r, a, b)
-	vcrSeed(t, r.mysqlDSN, a, "new", vcrRange(5001, 1, 500))
-	// Odd ids, every 1000th: 1, 1001, ..., 699001 — below, around and above
-	// the old cursor, none of them an old id.
-	vcrSeed(t, r.mysqlDSN, b, "new", vcrRange(1, 1000, 700))
-	time.Sleep(5 * time.Second) // the schema tracker
-
-	vcrResumeAndGrade(t, r, r.streamer(streamID, []string{a, b}, phase2DSN),
-		map[string]int64{a: 9_000_001, b: 9_000_001}, []string{a, b})
-}
-
-func vcrWiden(t *testing.T, r vcrRig, p, phase1DSN, phase2DSN string) {
-	a, b, c := p+"_a", p+"_b", p+"_c"
-	streamID := "vcr" + p
-	vcrCreate(t, r, a, b, c)
-	vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
-	vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
-	vcrSeed(t, r.mysqlDSN, c, "v1", vcrRange(1, 1, 500))
-	time.Sleep(3 * time.Second)
-	vcrStopMidCopy(t, r, r.streamer(streamID, []string{a, b}, phase1DSN), b, vcrBigRows)
-	if n := len(vcrIDs(t, r.tgt(), c)); n != 0 {
-		t.Fatalf("RIG: %s holds %d target rows after phase 1; want 0 (out of scope)", c, n)
-	}
-	vcrResumeAndGrade(t, r, r.streamer(streamID, []string{a, b, c}, phase2DSN),
-		map[string]int64{b: 9_000_001, c: 9_000_001}, []string{a, b, c})
-}
-
-// TestStreamer_VStreamCopyResume_TwoShards is the multi-shard arm of
-// VSTREAM-COPY-CURSORLESS-CHECKPOINT-WARM-RESUMES (found by the v0.163.2
-// pre-tag value-fidelity review): Vitess resumes each shard on its own, so a
-// checkpoint in which one shard carries a cursor and another has started
-// without one skipped the second shard's rest of the table. The keyspace has
-// two shards (-80, 80-) and a hash vindex, so every table's rows are spread
-// over both, and each cell holds the per-shard rule throughout the copy.
+// TestStreamer_VStreamCopyResume_TwoShards runs the same phases on a
+// two-shard keyspace (-80, 80-) with a hash vindex, where Vitess resumed
+// each shard on its own (a started shard with no cursor skipped its share:
+// 152,960 of 300,000 rows on the target before v0.163.2).
 func TestStreamer_VStreamCopyResume_TwoShards(t *testing.T) {
 	const keyspace = "commerce"
 	mysqlDSN, grpcEndpoint, _, cleanupSrc := startShardedVTTestServer(t, keyspace, 2)
@@ -827,26 +488,30 @@ func TestStreamer_VStreamCopyResume_TwoShards(t *testing.T) {
 	}
 	// The keys are globally unique (one id space, hash-sharded), so the
 	// shards merge into one target table: the Bug 152 door's opt-out.
-	merged := func(streamID string, include ...string) *Streamer {
-		s := r.streamer(streamID, include, "")
-		s.AllowCrossShardMerge = true
-		return s
+	merged := func(streamID string, include ...string) func() *Streamer {
+		return func() *Streamer {
+			s := r.streamer(streamID, include, "")
+			s.AllowCrossShardMerge = true
+			return s
+		}
 	}
 
-	t.Run("DefaultPath/stop-mid-copy", func(t *testing.T) {
+	t.Run("DefaultPath/delete-while-stopped", func(t *testing.T) {
 		const a, b = "sh_a", "sh_b"
 		createSharded(t, a, b)
 		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
 		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
-		vcrStopMidCopyHoldingTheCursorRule(t, r, merged("vcrsh", a, b), b, vcrBigRows)
-		vcrResumeUnderTraffic(t, r, merged("vcrsh", a, b), a, []string{a, b})
+		vcrStopRefuseRecopy(t, r, merged("vcrsh", a, b), b, vcrBigRows,
+			func() {
+				r.src().exec(t, "DELETE FROM "+a+" WHERE id <= 20")
+				r.src().exec(t, "DELETE FROM "+b+" WHERE id <= 20")
+			}, a, []string{a, b})
 	})
-
-	t.Run("SingleTableScope/stop-mid-copy", func(t *testing.T) {
+	t.Run("SingleTableScope/delete-while-stopped", func(t *testing.T) {
 		const b = "sh_t"
 		createSharded(t, b)
 		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
-		vcrStopMidCopyHoldingTheCursorRule(t, r, merged("vcrsht", b), b, vcrBigRows)
-		vcrResumeUnderTraffic(t, r, merged("vcrsht", b), b, []string{b})
+		vcrStopRefuseRecopy(t, r, merged("vcrsht", b), b, vcrBigRows,
+			func() { r.src().exec(t, "DELETE FROM "+b+" WHERE id <= 20") }, b, []string{b})
 	})
 }

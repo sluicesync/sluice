@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **A PlanetScale/Vitess cold start stopped during its copy is re-copied instead of resumed, because a resumed copy kept rows the source had deleted (VSTREAM-COPY-RESUME-RECREATED-TABLE, HIGH, silent; `VSTREAM-COPY-RESUME-WITHDRAWN`).** On a resume, Vitess copies again from the start every table without a copy cursor, including the tables the stopped run had already finished, and drops their changes from the stopped window, and the copy writes by upsert, which removes nothing. So any row deleted on the source while the stream was stopped stayed on the target, and so did every old row of a table dropped and re-created under its name. Measured on Vitess 24 before this release: 6,701 rows on the target against 701 on the source after a re-create, and a stopped-window `DELETE` of 20 rows that survived. The cold start now saves no position until its copy finishes, so the re-run after a stop finds the copied rows and refuses (`SLUICE-E-COLDSTART-TARGET-NOT-EMPTY`). A mid-copy position saved by an earlier release is refused under `VSTREAM-COPY-RESUME-WITHDRAWN` rather than resumed. The remedy for both is the same command with `--restart-from-scratch`, which clears the in-scope target tables and copies them again. Measured on Vitess 24 with this release, on one and two shards: every stopped copy left no saved position, every plain re-run refused, and every `--restart-from-scratch` re-copy matched the source exactly, the deleted and re-created rows included. A stream that has reached CDC resumes as before. This also explains Bug 325: the saved position never advanced past the first one against a Postgres target, because only the MySQL row writer reported which rows were durable. Pinned by `TestStreamer_InterruptedColdStart_RefusesTheCursor`, `TestStreamer_InterruptedColdStart_RestartFromScratchStillRuns`, `TestColdStartOpenSnapshot_WiresNoCopyCheckpoint` and the vttestserver cells of `TestStreamer_VStreamCopyResume` and `TestStreamer_VStreamCopyResume_TwoShards`.
+
+### Compatibility
+
+- **A PlanetScale/Vitess stream stopped mid-copy on an earlier release now needs `--restart-from-scratch` to continue.** No flag change.
+
 ## [0.163.2] - 2026-10-20
 
 ### Fixed
