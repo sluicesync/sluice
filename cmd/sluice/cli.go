@@ -1276,7 +1276,7 @@ type SyncStartCmd struct {
 	DryRun bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable: ONE result envelope on stdout when the stream exits — status completed/aborted/refused/failed — or, with --dry-run, the stream plan as a JSON object instead of the text plan; the slog stream stays on stderr in both modes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
-	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored on the warm-resume path."`
+	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target without clearing it. Use with caution: a source that copies by upsert (PlanetScale, Vitess) keeps every target row the source has since deleted, silently, and every other source collides on PRIMARY KEY. To re-copy a populated target, use --restart-from-scratch. Ignored on the warm-resume path."`
 
 	ResetTargetData bool `help:"Destructive recovery: DELETE the cdc-state row, DROP every source-schema table on the target, then run a fresh cold-start stream. Use after slot-missing fall-through or a similar wedged-state recovery. Requires confirmation (type 'reset') unless --yes is set. See ADR-0023."`
 
