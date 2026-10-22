@@ -53,6 +53,39 @@ var ErrIncludeTableAddInProgress = errors.New("INCLUDE-TABLE-ADD-IN-PROGRESS")
 // classify.
 var ErrControlTableDDLRequired = errors.New("CONTROL-TABLE-DDL-REQUIRED")
 
+// ControlTableDDLRequiredError is the [ErrControlTableDDLRequired] marker with
+// the engine's remedy for the statement that failed: what an operator runs,
+// and through which channel, to make that statement unnecessary. It exists
+// because the remedy differs by engine and statement — `sluice control-tables
+// ddl` prints CREATE statements, which on a MySQL-family target cannot bring
+// an existing table up to date, so a failed ALTER needs the ALTER itself — and
+// a caller outside the engine must not guess it. Attach with [WithMarker];
+// errors.Is(err, ErrControlTableDDLRequired) holds for it.
+type ControlTableDDLRequiredError struct {
+	// Statement is the DDL that failed, on one line.
+	Statement string
+	// Remedy is the operator action, as a sentence fragment that completes
+	// "Have ..." or stands alone.
+	Remedy string
+}
+
+func (e *ControlTableDDLRequiredError) Error() string { return ErrControlTableDDLRequired.Error() }
+
+// Is makes errors.Is(err, ErrControlTableDDLRequired) hold.
+func (e *ControlTableDDLRequiredError) Is(target error) bool {
+	return target == ErrControlTableDDLRequired
+}
+
+// ControlTableDDLRemedy returns the remedy an engine attached to err, or ""
+// when err carries no [ControlTableDDLRequiredError].
+func ControlTableDDLRemedy(err error) string {
+	var e *ControlTableDDLRequiredError
+	if errors.As(err, &e) {
+		return e.Remedy
+	}
+	return ""
+}
+
 // ControlTimestampClock is the optional [ChangeApplier] surface that says
 // whether the target's sluice_cdc_state.updated_at and
 // sluice_migrate_state.updated_at are on one clock, so the order of two of

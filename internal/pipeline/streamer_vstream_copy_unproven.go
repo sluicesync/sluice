@@ -40,9 +40,15 @@ package pipeline
 //     that window leaves an old complete header beside an emptied target
 //     (F1). A complete header therefore counts only with two more facts:
 //     every in-scope table it records as having copied rows still holds rows
-//     on the target, and the stream's sluice_cdc_state row was written after
-//     the header (the anchor is written after complete, a frozen checkpoint
-//     before), compared on one clock ([ir.ControlTimestampClock]).
+//     on the target — or, where it does not, is empty on the SOURCE too (a
+//     drained table; the source probe is the independent expected value,
+//     [Streamer.headerCopyStillOnTarget]) — and the stream's sluice_cdc_state
+//     row was written after the header (the anchor is written after
+//     complete, a frozen checkpoint before), compared on one clock
+//     ([ir.ControlTimestampClock]; Postgres sessions on UTC year-round only,
+//     never a MySQL-family target, whose updated_at moves on non-position
+//     writes too). A pass on that proof records the established tables, so
+//     it is judged once.
 //
 // A header short of complete, a complete header whose copied table is empty
 // on the target, or a position row older than the header is POSITIVE
@@ -127,7 +133,28 @@ type copyCompletion struct {
 	proven       bool
 	contradicted bool
 	why          string
+	// headerProof: proven by the progress header and the target, with no
+	// established-table record yet.
+	headerProof bool
 }
+
+// recordAfterDoor is what the door asks its caller to record once the scope
+// door has passed ([Streamer.recordAfterCopyDoor]).
+type recordAfterDoor int
+
+const (
+	recordNothing recordAfterDoor = iota
+	// recordAsserted: passed on --assert-copy-finished alone. Records the
+	// in-scope tables that exist on the target and hold rows (F4).
+	recordAsserted
+	// recordHeaderProof: passed on the progress header and the target.
+	// Records the in-scope tables that exist on the target, so later starts
+	// and runOnce retries pass on the record and the header is judged once:
+	// a table drained since (a queue, a replicated TRUNCATE) is legitimately
+	// empty, and a later judgment of it must not depend on the source probe
+	// again.
+	recordHeaderProof
+)
 
 // vstreamCopyDoorApplies reports whether the copy-completion door judges this
 // run: a source that copies through VStream (the only source whose cold start
@@ -137,20 +164,23 @@ func (s *Streamer) vstreamCopyDoorApplies() bool {
 	return s.Source.Capabilities().CDC == ir.CDCVStream && s.PositionFromManifestStore == nil
 }
 
-// phaseRefuseUnprovenVStreamCopy is the door. It returns assertRecord=true
-// when it passed on the operator's --assert-copy-finished alone: the caller
-// then records the stream's tables once the scope door has passed
-// ([Streamer.recordAssertedCopy]), so later resumes pass on the record.
-func (s *Streamer) phaseRefuseUnprovenVStreamCopy(ctx context.Context, applier ir.ChangeApplier, streamID string, persisted ir.Position) (assertRecord bool, err error) {
+// phaseRefuseUnprovenVStreamCopy is the door. On a pass that rests on
+// anything but an established-table record it says what the caller records
+// once the scope door has passed ([Streamer.recordAfterCopyDoor]), so later
+// resumes pass on the record.
+func (s *Streamer) phaseRefuseUnprovenVStreamCopy(ctx context.Context, applier ir.ChangeApplier, streamID string, persisted ir.Position) (recordAfterDoor, error) {
 	if !s.vstreamCopyDoorApplies() {
-		return false, nil
+		return recordNothing, nil
 	}
 	c, err := s.vstreamCopyCompletion(ctx, applier, streamID)
 	if err != nil {
-		return false, err
+		return recordNothing, err
 	}
 	if c.proven {
-		return false, nil
+		if c.headerProof {
+			return recordHeaderProof, nil
+		}
+		return recordNothing, nil
 	}
 	if s.AssertCopyFinished && !c.contradicted {
 		slog.WarnContext(ctx, copyFinishedAssertedMarker+": nothing on the target proves this PlanetScale/Vitess stream's "+
@@ -158,7 +188,7 @@ func (s *Streamer) phaseRefuseUnprovenVStreamCopy(ctx context.Context, applier i
 			"the rows the copy never reached stay missing on the target; re-copy with --restart-from-scratch",
 			slog.String("stream_id", streamID),
 			slog.String("position_token", truncateDryRunToken(persisted.Token, 60)))
-		return true, nil
+		return recordAsserted, nil
 	}
 	slog.ErrorContext(ctx, "resume refused: "+vstreamCopyUnprovenMarker,
 		slog.String("stream_id", streamID),
@@ -166,9 +196,9 @@ func (s *Streamer) phaseRefuseUnprovenVStreamCopy(ctx context.Context, applier i
 		slog.Bool("assert_copy_finished", s.AssertCopyFinished),
 		slog.String("position_token", truncateDryRunToken(persisted.Token, 60)))
 	if c.contradicted && s.AssertCopyFinished {
-		return false, assertContradictedError(streamID, c.why)
+		return recordNothing, assertContradictedError(streamID, c.why)
 	}
-	return false, vstreamCopyUnprovenError(streamID, c.why)
+	return recordNothing, vstreamCopyUnprovenError(streamID, c.why)
 }
 
 // vstreamCopyCompletion reads the evidence of a finished copy, the
@@ -220,10 +250,10 @@ func (s *Streamer) vstreamCopyCompletion(ctx context.Context, applier ir.ChangeA
 	}
 
 	// A complete header alone is not proof (see the file comment).
-	if why, err := s.headerCopyStillOnTarget(ctx, applier, streamID, state); err != nil {
+	if why, contradicted, err := s.headerCopyStillOnTarget(ctx, applier, streamID, state); err != nil {
 		return copyCompletion{}, err
 	} else if why != "" {
-		return unproven(true, why)
+		return unproven(contradicted, why)
 	}
 	verdict, why, err := positionRowAfterHeader(ctx, applier, streamID, state)
 	if err != nil {
@@ -231,7 +261,7 @@ func (s *Streamer) vstreamCopyCompletion(ctx context.Context, applier ir.ChangeA
 	}
 	switch verdict {
 	case orderAfter:
-		return copyCompletion{proven: true}, nil
+		return copyCompletion{proven: true, headerProof: true}, nil
 	case orderBefore:
 		return unproven(true, why)
 	default:
@@ -239,14 +269,23 @@ func (s *Streamer) vstreamCopyCompletion(ctx context.Context, applier ir.ChangeA
 	}
 }
 
-// headerCopyStillOnTarget returns "" when every in-scope table the header
-// records as having copied rows still holds rows on the target, and otherwise
-// names the first that does not (F1: a re-copy that dropped the target and
-// stopped before clearing the header).
-func (s *Streamer) headerCopyStillOnTarget(ctx context.Context, applier ir.ChangeApplier, streamID string, state ir.MigrationState) (string, error) {
+// headerCopyStillOnTarget returns "" when the copy the header describes is
+// still on the target, and otherwise why not (F1: a re-copy that dropped the
+// target and stopped before clearing the header).
+//
+// A table the header records as having copied rows that is now empty or
+// absent on the target is not, by itself, evidence of F1: a healthy finished
+// stream whose source table has been drained since (a queue, a session table,
+// a replicated TRUNCATE) looks the same. The independent expected value is
+// the SOURCE: a read-only probe for one row through the source's own row-read
+// path ([Streamer.sourceTablesHoldRows]). Source empty too — the table was
+// drained, and that is consistent. Source holding rows — the target lost the
+// copy (contradicted, and --assert-copy-finished is refused). Probe that
+// cannot run — unproven but NOT contradicted, so the flag stays an exit.
+func (s *Streamer) headerCopyStillOnTarget(ctx context.Context, applier ir.ChangeApplier, streamID string, state ir.MigrationState) (why string, contradicted bool, err error) {
 	scope, _, err := s.currentScopeKeys(ctx, applier, streamID)
 	if err != nil {
-		return "", controlReadFailure(fmt.Errorf("pipeline: %s: read the stream's scope: %w", vstreamCopyUnprovenMarker, err))
+		return "", false, controlReadFailure(fmt.Errorf("pipeline: %s: read the stream's scope: %w", vstreamCopyUnprovenMarker, err))
 	}
 	var expect []string
 	for _, k := range scope {
@@ -255,21 +294,94 @@ func (s *Streamer) headerCopyStillOnTarget(ctx context.Context, applier ir.Chang
 		}
 	}
 	if len(expect) == 0 {
-		return "", nil
+		return "", false, nil
 	}
 	_, holding, err := s.targetTableFacts(ctx, expect)
 	if err != nil {
-		return "", controlReadFailure(fmt.Errorf("pipeline: %s: check that the recorded copy is still on the target: %w",
+		return "", false, controlReadFailure(fmt.Errorf("pipeline: %s: check that the recorded copy is still on the target: %w",
 			vstreamCopyUnprovenMarker, err))
 	}
+	var emptied []string
 	for _, k := range expect {
 		if !holding[k] {
-			return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, but that target "+
-				"table is empty or absent: the target no longer holds the copy the record describes",
-				state.TableProgress[bareTableOfKey(k)].RowsCopied, displayKey(k)), nil
+			emptied = append(emptied, k)
 		}
 	}
-	return "", nil
+	if len(emptied) == 0 {
+		return "", false, nil
+	}
+	onSource, probeErr := s.sourceTablesHoldRows(ctx, emptied)
+	for _, k := range emptied {
+		copied := state.TableProgress[bareTableOfKey(k)].RowsCopied
+		switch {
+		case probeErr != nil:
+			return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, that target table "+
+				"is empty or absent, and the source could not be probed to tell a drained table from a lost copy (%v)",
+				copied, displayKey(k), probeErr), false, nil
+		case onSource[k]:
+			return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, but that target "+
+				"table is empty or absent while the source table holds rows: the target no longer holds the copy the record "+
+				"describes", copied, displayKey(k)), true, nil
+		}
+	}
+	return "", false, nil // every emptied table is empty on the source too: drained since
+}
+
+// sourceTablesHoldRows probes each key's source table for one row through
+// the source's row-read path ([ir.BatchedRowReader], at most one row read):
+// read-only, and independent of everything the target says. A table the
+// source no longer has, a reader without the batched surface, or a table it
+// cannot read in batches (no primary key) is an error, never an answer.
+func (s *Streamer) sourceTablesHoldRows(ctx context.Context, keys []string) (map[string]bool, error) {
+	names := map[string]string{} // bare name -> key
+	for _, k := range keys {
+		if strings.IndexByte(k, 0) >= 0 {
+			return nil, fmt.Errorf("multi-namespace key %s is not probed", displayKey(k))
+		}
+		names[k] = k
+	}
+	sr, schema, err := s.openScopedSourceSchema(ctx, s.SourceDSN, func(n string) bool { _, ok := names[n]; return ok })
+	if err != nil {
+		return nil, err
+	}
+	migcore.CloseIf(sr)
+	tables := map[string]*ir.Table{}
+	if schema != nil {
+		for _, t := range schema.Tables {
+			if t != nil {
+				tables[t.Name] = t
+			}
+		}
+	}
+	rr, err := s.Source.OpenRowReader(ctx, s.SourceDSN)
+	if err != nil {
+		return nil, connectHint(fmt.Errorf("open source row reader: %w", err))
+	}
+	defer migcore.CloseIf(rr)
+	br, ok := rr.(ir.BatchedRowReader)
+	if !ok {
+		return nil, fmt.Errorf("source engine %q cannot read one row of a table", s.Source.Name())
+	}
+	out := map[string]bool{}
+	for name, k := range names {
+		t := tables[name]
+		if t == nil {
+			return nil, fmt.Errorf("source table %q not found", name)
+		}
+		rows, err := br.ReadRowsBatch(ctx, t, nil, 1)
+		if err != nil {
+			return nil, fmt.Errorf("probe source table %q: %w", name, err)
+		}
+		n := 0
+		for range rows {
+			n++
+		}
+		if err := rr.Err(); err != nil {
+			return nil, fmt.Errorf("probe source table %q: %w", name, err)
+		}
+		out[k] = n > 0
+	}
+	return out, nil
 }
 
 // writeOrder is how the stream's position row's last write stands against
@@ -296,8 +408,9 @@ func positionRowAfterHeader(ctx context.Context, applier ir.ChangeApplier, strea
 		return orderUnknown, "", controlReadFailure(fmt.Errorf("pipeline: %s: %w", vstreamCopyUnprovenMarker, err))
 	}
 	if !same {
-		return orderUnknown, "this target's session is not on UTC, so a position row an older release wrote in local time " +
-			"cannot be ordered against the UTC progress record", nil
+		return orderUnknown, "this target's control-table timestamps cannot order the position against the progress record " +
+			"(on a MySQL-family target sluice_cdc_state.updated_at also moves on stop requests and live-add writes; on " +
+			"Postgres a session not on UTC year-round means older releases wrote it in local time)", nil
 	}
 	streams, err := applier.ListStreams(ctx)
 	if err != nil {
@@ -337,7 +450,8 @@ func vstreamCopyUnprovenError(streamID, why string) error {
 		"applied by this run and no table in the stream's scope was changed on the target. Re-copy the stream: %s. If you "+
 		"have verified, table by table, that the target's row counts match the source's, re-run the same command once with "+
 		"--assert-copy-finished: it records every in-scope table that exists on the target and holds rows as copied, so "+
-		"later resumes pass without it (it is refused when the target shows the copy did not finish)",
+		"later resumes pass without it (it is refused when the target shows the copy did not finish). On a `sluice sync run` "+
+		"leg, take the leg out of the fleet and run `sluice sync start` with the flag: the fleet spec has no key for it", // remedy-partial: the operator's own invocation (the leg's flags) carries their DSNs
 		ir.ErrIncludeTableScopeDrift, vstreamCopyUnprovenMarker, streamID, why, recopyRemedy)
 }
 
@@ -358,10 +472,24 @@ func assertContradictedError(streamID, why string) error {
 func controlTableDDLRefusal(streamID string, err error) error {
 	return fmt.Errorf("pipeline: resume refused: %w: %s: stream %q's cold-start progress record cannot be read, because "+
 		"the target's sluice_migrate_state control table is missing or out of date and this role cannot run the DDL that "+
-		"fixes it. Have the statements `sluice control-tables ddl --engine <target engine>` prints applied by a role that "+
-		"can (on a PlanetScale branch with safe migrations, ship each with `sluice deploy-ddl`), then re-run the same "+
-		"command. No change has been applied by this run: %w",
-		ir.ErrIncludeTableScopeDrift, vstreamCopyUnprovenMarker, streamID, err)
+		"fixes it. %s, then re-run the same command. No change has been applied by this run: %w",
+		ir.ErrIncludeTableScopeDrift, vstreamCopyUnprovenMarker, streamID, controlTableDDLRemedy(err), err)
+}
+
+// controlTableDDLRemedy is the operator action for a control-table statement
+// this role cannot run: the engine's own ([ir.ControlTableDDLRemedy]), which
+// knows whether the statement printed by `sluice control-tables ddl` fixes it
+// (on a MySQL-family target it prints CREATE statements only, so a failed
+// ALTER names the ALTER), or, when the engine attached none, the general
+// recipe with that caveat.
+func controlTableDDLRemedy(err error) string {
+	if r := ir.ControlTableDDLRemedy(err); r != "" {
+		return "Have " + r
+	}
+	return "Have the DDL the error names applied by a role that can run it (on Postgres, the statements `sluice " +
+		"control-tables ddl --engine postgres` prints; on a MySQL-family target `sluice control-tables ddl` prints CREATE " +
+		"statements only, so an existing table needs the ALTER itself, shipped with `sluice deploy-ddl` on a PlanetScale " +
+		"branch with safe migrations)"
 }
 
 // recordAssertedCopy records, after a resume the operator let through with
@@ -375,25 +503,49 @@ func controlTableDDLRefusal(streamID string, err error) error {
 // passing without the record would ask for the flag again on every resume
 // while saying nothing.
 func (s *Streamer) recordAssertedCopy(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+	return s.recordAfterCopyDoor(ctx, applier, streamID, recordAsserted)
+}
+
+// recordAfterCopyDoor writes the established-table record a door pass asked
+// for, through the same write a cold start makes ([recordEstablishedAfterCopy]),
+// with each table's engine id where the source has one:
+//
+//   - recordAsserted (--assert-copy-finished): the in-scope tables that exist
+//     on the target AND hold rows. An absent or empty one was not copied
+//     whatever the operator believes; recording it would hide it from the
+//     INCLUDE-TABLE-SCOPE-DRIFT door, so it is left out and named (F4).
+//   - recordHeaderProof (the progress header and the target proved the copy):
+//     the in-scope tables that exist on the target, empty ones included — the
+//     door has already shown each empty copied table is empty on the source
+//     too (drained), and recording it now is what keeps a later start from
+//     judging the header again.
+//
+// It runs once the scope door has passed. A failure refuses: passing without
+// the record would leave the judgment to be repeated, or ask for the flag
+// again, on every resume while saying nothing.
+func (s *Streamer) recordAfterCopyDoor(ctx context.Context, applier ir.ChangeApplier, streamID string, kind recordAfterDoor) error {
+	marker, why := copyFinishedAssertedMarker, "--assert-copy-finished"
+	if kind == recordHeaderProof {
+		marker, why = vstreamCopyUnprovenMarker, "the copy proven by its progress record"
+	}
 	store, ok := applier.(ir.EstablishedTablesStore)
 	if !ok {
-		slog.WarnContext(ctx, copyFinishedAssertedMarker+": this target keeps no established-table record, so the "+
-			"acknowledgement cannot be recorded; every resume of this stream needs --assert-copy-finished",
-			slog.String("stream_id", streamID))
+		slog.WarnContext(ctx, marker+": this target keeps no established-table record, so "+why+" cannot be recorded; "+
+			"every resume of this stream is judged again", slog.String("stream_id", streamID))
 		return nil
 	}
 	scope, _, err := s.currentScopeKeys(ctx, applier, streamID)
 	if err != nil {
-		return controlReadFailure(fmt.Errorf("pipeline: %s: %w", copyFinishedAssertedMarker, err))
+		return controlReadFailure(fmt.Errorf("pipeline: %s: %w", marker, err))
 	}
-	_, holding, err := s.targetTableFacts(ctx, scope)
+	exists, holding, err := s.targetTableFacts(ctx, scope)
 	if err != nil {
-		return controlReadFailure(fmt.Errorf("pipeline: %s: read which in-scope tables hold rows on the target: %w",
-			copyFinishedAssertedMarker, err))
+		return controlReadFailure(fmt.Errorf("pipeline: %s: read which in-scope tables exist and hold rows on the target: %w",
+			marker, err))
 	}
 	var keys, names, skipped []string
 	for _, k := range scope {
-		if holding[k] {
+		if holding[k] || (kind == recordHeaderProof && exists[k]) {
 			keys = append(keys, k)
 			names = append(names, displayKey(k))
 		} else {
@@ -402,23 +554,27 @@ func (s *Streamer) recordAssertedCopy(ctx context.Context, applier ir.ChangeAppl
 	}
 	if err := recordEstablishedAfterCopy(ctx, store, streamID, keys, s.establishedIDs(ctx, keys), s.sourceTableKeys); err != nil {
 		if errors.Is(err, ir.ErrControlTableDDLRequired) {
-			return fmt.Errorf("pipeline: resume refused: %w: %s: --assert-copy-finished could not record this stream's tables, "+
-				"because this role cannot bring the sluice_cdc_state control table up to date. Have the statements `sluice "+
-				"control-tables ddl --engine <target engine>` prints applied by a role that can (on a PlanetScale branch with "+
-				"safe migrations, ship each with `sluice deploy-ddl`), then re-run the same command. No change has been "+
-				"applied by this run: %w", ir.ErrIncludeTableScopeDrift, copyFinishedAssertedMarker, err)
+			return fmt.Errorf("pipeline: resume refused: %w: %s: %s could not record this stream's tables, because this role "+
+				"cannot bring the sluice_cdc_state control table up to date. %s, then re-run the same command. No change has "+
+				"been applied by this run: %w", ir.ErrIncludeTableScopeDrift, marker, why, controlTableDDLRemedy(err), err)
 		}
-		return controlReadFailure(fmt.Errorf("pipeline: resume refused: %s: --assert-copy-finished could not record this "+
-			"stream's tables as copied (no change has been applied by this run); fix what the error names and re-run the "+
-			"same command: %w", copyFinishedAssertedMarker, err))
+		return controlReadFailure(fmt.Errorf("pipeline: resume refused: %s: %s could not record this stream's tables as "+
+			"copied (no change has been applied by this run); fix what the error names and re-run the same command: %w",
+			marker, why, err))
 	}
-	slog.WarnContext(ctx, copyFinishedAssertedMarker+": recorded the in-scope tables that hold rows on the target as copied, "+
-		"on the operator's --assert-copy-finished; later resumes pass without the flag",
-		slog.String("stream_id", streamID), slog.String("tables", strings.Join(names, ", ")))
+	if kind == recordHeaderProof {
+		slog.InfoContext(ctx, "copy proven by its progress record and the target; recorded the in-scope tables that exist "+
+			"on the target as established, so later resumes pass on the record",
+			slog.String("stream_id", streamID), slog.String("tables", strings.Join(names, ", ")))
+	} else {
+		slog.WarnContext(ctx, copyFinishedAssertedMarker+": recorded the in-scope tables that hold rows on the target as copied, "+
+			"on the operator's --assert-copy-finished; later resumes pass without the flag",
+			slog.String("stream_id", streamID), slog.String("tables", strings.Join(names, ", ")))
+	}
 	if len(skipped) > 0 {
-		slog.WarnContext(ctx, copyFinishedAssertedMarker+": in-scope tables that are absent or empty on the target were NOT "+
-			"recorded as copied; the next start judges each as never copied (INCLUDE-TABLE-SCOPE-DRIFT) — empty its target "+
-			"table if it has one and bring it in with `sluice schema add-table`, or take it out of scope",
+		slog.WarnContext(ctx, marker+": in-scope tables that are absent (or, under --assert-copy-finished, empty) on the "+
+			"target were NOT recorded as copied; the next start judges each as never copied (INCLUDE-TABLE-SCOPE-DRIFT) — "+
+			"empty its target table if it has one and bring it in with `sluice schema add-table`, or take it out of scope",
 			slog.String("stream_id", streamID), slog.String("tables", strings.Join(skipped, ", ")))
 	}
 	return nil

@@ -138,16 +138,56 @@ func anchoredAfter() *clockedApplier {
 	return &clockedApplier{scopeDriftApplier: &scopeDriftApplier{}, rowAt: headerTime.Add(time.Hour), sameClock: true}
 }
 
-// vstreamDoorStreamer is a VStream (planetscale) source holding two tables,
-// against target.
+// probeSource is a ukDoorEngine source whose row reader answers the door's
+// one-row probe: a table in empty reads no row, every other table one row;
+// probeErr fails the probe.
+type probeSource struct {
+	*ukDoorEngine
+	empty    map[string]bool
+	probeErr error
+	probes   int
+}
+
+func (e *probeSource) OpenRowReader(context.Context, string) (ir.RowReader, error) {
+	return &probeReader{src: e}, nil
+}
+
+type probeReader struct{ src *probeSource }
+
+func (r *probeReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {
+	return nil, errors.New("not used")
+}
+
+func (r *probeReader) ReadRowsBatch(_ context.Context, t *ir.Table, _ []any, limit int) (<-chan ir.Row, error) {
+	r.src.probes++
+	if r.src.probeErr != nil {
+		return nil, r.src.probeErr
+	}
+	if limit != 1 {
+		return nil, errors.New("the probe must read at most one row")
+	}
+	ch := make(chan ir.Row, 1)
+	if !r.src.empty[t.Name] {
+		ch <- ir.Row{"id": int64(1)}
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (r *probeReader) Err() error { return nil }
+
+// vstreamDoorStreamer is a VStream (planetscale) source holding two tables
+// (both holding rows, per its probe), against target.
 func vstreamDoorStreamer(t *testing.T, target ir.Engine) *Streamer {
 	t.Helper()
-	src := &ukDoorEngine{
+	src := &probeSource{ukDoorEngine: &ukDoorEngine{
 		resumeDispatchEngine: &resumeDispatchEngine{name: "planetscale", caps: ir.Capabilities{CDC: ir.CDCVStream}},
 		schemas:              map[string]*ir.Schema{"src-dsn": driftSchema("t1_small", "t2_big")},
-	}
+	}}
 	return driftStreamer(t, src, target)
 }
+
+func probeOf(s *Streamer) *probeSource { return s.Source.(*probeSource) }
 
 // proofTargetWith is a target holding targetTables (both source tables when
 // none are named) with migrate-state store.
@@ -227,17 +267,103 @@ func TestVStreamCopyDoor_EraFixtures(t *testing.T) {
 			tgt := proofTargetWith(tc.store)
 			tgt.empty = tc.empty
 			s := vstreamDoorStreamer(t, tgt)
-			assertRecord, err := s.phaseRefuseUnprovenVStreamCopy(ctx, tc.app, "st", cursorless)
+			kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, tc.app, "st", cursorless)
 			if tc.refused {
 				requireUnproven(t, err)
 			} else if err != nil {
 				t.Fatalf("want a pass, got %v", err)
 			}
-			if assertRecord {
-				t.Error("assertRecord without --assert-copy-finished")
+			want := recordNothing
+			if strings.HasPrefix(tc.name, "v0.150-era") {
+				want = recordHeaderProof // a header-only pass records, so it is judged once
+			}
+			if kind != want {
+				t.Errorf("record kind = %v, want %v", kind, want)
 			}
 		})
 	}
+}
+
+// TestVStreamCopyDoor_DrainedTable (round 3, 1a/1b): a complete header whose
+// copied table is empty on the target is judged against the SOURCE. Empty
+// there too (a drained queue, a replicated TRUNCATE): the copy is proven, and
+// the record is written, so a retry after the table drains mid-run passes on
+// the record. Holding rows there: contradicted, and the flag is refused. The
+// source cannot be probed: unproven but not contradicted, so the flag passes.
+func TestVStreamCopyDoor_DrainedTable(t *testing.T) {
+	ctx := context.Background()
+	t.Run("empty on source and target: passes, records the table", func(t *testing.T) {
+		tgt := proofTargetWith(header(ir.MigrationPhaseComplete, "t1_small", "t2_big"))
+		tgt.empty = map[string]bool{"t2_big": true}
+		s := vstreamDoorStreamer(t, tgt)
+		probeOf(s).empty = map[string]bool{"t2_big": true}
+		app := anchoredAfter()
+		kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless)
+		if err != nil || kind != recordHeaderProof {
+			t.Fatalf("kind=%v err=%v; want a header-proof pass", kind, err)
+		}
+		if err := s.recordAfterCopyDoor(ctx, app, "st", kind); err != nil {
+			t.Fatal(err)
+		}
+		if !app.rec.Recorded || !sameSet(app.rec.Established, []string{"t1_small", "t2_big"}) {
+			t.Fatalf("record = %+v; want both tables (the drained one exists on the target)", app.rec)
+		}
+	})
+	t.Run("target empty, source holds rows: contradicted", func(t *testing.T) {
+		tgt := proofTargetWith(header(ir.MigrationPhaseComplete, "t2_big"))
+		tgt.empty = map[string]bool{"t2_big": true}
+		s := vstreamDoorStreamer(t, tgt)
+		_, err := s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless)
+		requireUnproven(t, err)
+		s.AssertCopyFinished = true
+		_, err = s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless)
+		requireContradicted(t, err, "while the source table holds rows")
+	})
+	t.Run("source probe errors: unproven, flag accepted", func(t *testing.T) {
+		tgt := proofTargetWith(header(ir.MigrationPhaseComplete, "t2_big"))
+		tgt.empty = map[string]bool{"t2_big": true}
+		s := vstreamDoorStreamer(t, tgt)
+		probeOf(s).probeErr = errors.New("vtgate: connection refused")
+		_, err := s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless)
+		requireUnproven(t, err)
+		if !strings.Contains(err.Error(), "could not be probed") || strings.Contains(err.Error(), "cannot be accepted") {
+			t.Fatalf("want the unproven (not contradicted) refusal naming the probe, got %v", err)
+		}
+		s.AssertCopyFinished = true
+		if kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless); err != nil || kind != recordAsserted {
+			t.Fatalf("kind=%v err=%v; want the flag accepted", kind, err)
+		}
+	})
+	t.Run("retry after a header-only pass, table drained mid-run: passes on the record", func(t *testing.T) {
+		tgt := proofTargetWith(header(ir.MigrationPhaseComplete, "t1_small", "t2_big"))
+		s := vstreamDoorStreamer(t, tgt)
+		app := anchoredAfter()
+		kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless)
+		if err != nil || kind != recordHeaderProof {
+			t.Fatalf("first pass: kind=%v err=%v", kind, err)
+		}
+		if err := s.recordAfterCopyDoor(ctx, app, "st", kind); err != nil {
+			t.Fatal(err)
+		}
+		tgt.empty = map[string]bool{"t2_big": true}            // drained on the target mid-run …
+		probeOf(s).probeErr = errors.New("source unreachable") // … and the source probe would not even answer
+		probes := probeOf(s).probes
+		if kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless); err != nil || kind != recordNothing {
+			t.Fatalf("retry: kind=%v err=%v; want a pass on the record", kind, err)
+		}
+		if probeOf(s).probes != probes {
+			t.Error("the retry judged the header again (probed the source) despite the record")
+		}
+	})
+	t.Run("record write needing DDL refuses terminally", func(t *testing.T) {
+		app := anchoredAfter()
+		app.recordErr = ir.WithMarker(errors.New("permission denied"), &ir.ControlTableDDLRequiredError{Statement: "ALTER TABLE x", Remedy: "REMEDY-TEXT"})
+		s := vstreamDoorStreamer(t, proofTargetWith(header(ir.MigrationPhaseComplete)))
+		err := s.recordAfterCopyDoor(ctx, app, "st", recordHeaderProof)
+		if err == nil || refusalARestartRepeats(err) == nil || !strings.Contains(err.Error(), "Have REMEDY-TEXT") {
+			t.Fatalf("want the terminal refusal carrying the engine's remedy, got %v", err)
+		}
+	})
 }
 
 // TestVStreamCopyDoor_HeaderKeyedByStream: a complete header under another
@@ -334,6 +460,21 @@ func TestVStreamCopyDoor_ControlTableDDLRefusal(t *testing.T) {
 			t.Fatalf("assert=%v: want the terminal control-tables refusal, got %v", assert, err)
 		}
 	}
+
+	// A MySQL-family target's refused ALTER: the headline must carry the
+	// engine's remedy (the ALTER itself), never `control-tables ddl`, which
+	// prints CREATE statements only and cannot fix an existing table.
+	const alter = "ALTER TABLE sluice_migrate_state ADD COLUMN source_identity TEXT NULL"
+	mysqlErr := ir.WithMarker(errors.New("Error 1105: direct DDL is disabled"), &ir.ControlTableDDLRequiredError{
+		Statement: alter,
+		Remedy:    "this statement shipped through a deploy request with `sluice deploy-ddl --ddl '" + alter + "'`",
+	})
+	s := vstreamDoorStreamer(t, proofTargetWith(failingReadStateStore{fakeStateStore: newFakeStateStore(), ensureErr: mysqlErr}))
+	_, err := s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless)
+	if err == nil || refusalARestartRepeats(err) == nil || !strings.Contains(err.Error(), "sluice deploy-ddl --ddl '"+alter+"'") ||
+		strings.Contains(err.Error(), "control-tables ddl") {
+		t.Fatalf("want the terminal refusal naming the ALTER and not control-tables ddl, got %v", err)
+	}
 }
 
 // TestVStreamCopyDoor_AssertCopyFinished: the flag passes the door where
@@ -347,9 +488,9 @@ func TestVStreamCopyDoor_AssertCopyFinished(t *testing.T) {
 	tgt := proofTargetWith(newFakeStateStore()) // v0.148-era: no header
 	s := vstreamDoorStreamer(t, tgt)
 	s.AssertCopyFinished = true
-	assertRecord, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless)
-	if err != nil || !assertRecord {
-		t.Fatalf("with --assert-copy-finished: assertRecord=%v err=%v; want a pass that asks for the record", assertRecord, err)
+	kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless)
+	if err != nil || kind != recordAsserted {
+		t.Fatalf("with --assert-copy-finished: kind=%v err=%v; want a pass that asks for the record", kind, err)
 	}
 	if err := s.recordAssertedCopy(ctx, app, "st"); err != nil {
 		t.Fatalf("recordAssertedCopy: %v", err)
@@ -409,7 +550,7 @@ func TestVStreamCopyDoor_AssertCopyFinished(t *testing.T) {
 		app.sameClock = false
 		s := vstreamDoorStreamer(t, proofTargetWith(header(ir.MigrationPhaseComplete)))
 		s.AssertCopyFinished = true
-		if rec, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless); err != nil || !rec {
+		if rec, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless); err != nil || rec != recordAsserted {
 			t.Fatalf("rec=%v err=%v; want the flag accepted", rec, err)
 		}
 	})

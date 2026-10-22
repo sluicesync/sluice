@@ -39,6 +39,14 @@ const manifestHandoffUnrecordedMarker = "MANIFEST-HANDOFF-UNRECORDED"
 // that door at the next start. A chain whose table set cannot be read
 // refuses rather than falling back to the scope.
 //
+// A restored table that is EMPTY on the target is recorded, unlike under
+// --assert-copy-finished ([Streamer.recordAfterCopyDoor], F4), which records
+// only tables that hold rows. The asymmetry is deliberate: here the backup
+// chain is independent evidence that the table was restored, and an empty
+// table in a backup is legitimate (it was empty on the source when the
+// backup was taken); the flag has no such evidence, only the operator's word,
+// so an empty table there is as likely a copy that never reached it.
+//
 // VStream sources only (the door's predicate): every other source keeps the
 // behaviour it had, the smallest change the door needs. It runs once the
 // handoff's CDC reader has opened, so a handoff that fails to start leaves
@@ -129,10 +137,9 @@ func (s *Streamer) recordManifestHandoff(ctx context.Context, applier ir.ChangeA
 func handoffDDLRefusal(err error) error {
 	return fmt.Errorf("pipeline: %w: %s: the --position-from-manifest handoff could not record the tables it brings in, "+
 		"because this role cannot bring the sluice_cdc_state control table up to date (the stream's position may already "+
-		"be written; a plain start refuses VSTREAM-COPY-COMPLETION-UNPROVEN until the record exists). Have the statements "+
-		"`sluice control-tables ddl --engine <target engine>` prints applied by a role that can (on a PlanetScale branch "+
-		"with safe migrations, ship each with `sluice deploy-ddl`), then re-run the same command. No change has been "+
-		"applied by this run: %w", ir.ErrIncludeTableScopeDrift, manifestHandoffUnrecordedMarker, err)
+		"be written; a plain start refuses VSTREAM-COPY-COMPLETION-UNPROVEN until the record exists). %s, then re-run the "+
+		"same command. No change has been applied by this run: %w",
+		ir.ErrIncludeTableScopeDrift, manifestHandoffUnrecordedMarker, controlTableDDLRemedy(err), err)
 }
 
 func handoffUnrecordedError(what string, err error) error {

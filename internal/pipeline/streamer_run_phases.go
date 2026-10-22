@@ -768,15 +768,15 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			// No VStream source reaches here today (its multi-database
 			// snapshot refuses), so the door is a fail-closed no-op that
 			// keeps the two warm-resume branches judged alike.
-			assertRecord, doorErr := s.phaseRefuseUnprovenVStreamCopy(ctx, applier, streamID, persisted)
+			recordKind, doorErr := s.phaseRefuseUnprovenVStreamCopy(ctx, applier, streamID, persisted)
 			if doorErr != nil {
 				return nil, func() {}, false, doorErr
 			}
 			if err := s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID); err != nil {
 				return nil, func() {}, false, err
 			}
-			if assertRecord {
-				if err := s.recordAssertedCopy(ctx, applier, streamID); err != nil {
+			if recordKind != recordNothing {
+				if err := s.recordAfterCopyDoor(ctx, applier, streamID, recordKind); err != nil {
 					return nil, func() {}, false, err
 				}
 			}
@@ -860,7 +860,7 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 		// on a VStream source is a finished copy's anchor OR a pre-v0.163.2
 		// mid-copy checkpoint; only the target's record of a finished copy
 		// tells them apart. First, before anything below reads or writes.
-		assertRecord, doorErr := s.phaseRefuseUnprovenVStreamCopy(ctx, applier, streamID, persisted)
+		recordKind, doorErr := s.phaseRefuseUnprovenVStreamCopy(ctx, applier, streamID, persisted)
 		if doorErr != nil {
 			return nil, func() {}, false, doorErr
 		}
@@ -888,10 +888,11 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 		if err := s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID); err != nil {
 			return nil, func() {}, false, err
 		}
-		// --assert-copy-finished: recorded only once the scope door has
+		// What the copy door passed on (--assert-copy-finished, or the progress
+		// header without a record) is recorded only once the scope door has
 		// passed, so a table it refuses is never recorded as copied.
-		if assertRecord {
-			if err := s.recordAssertedCopy(ctx, applier, streamID); err != nil {
+		if recordKind != recordNothing {
+			if err := s.recordAfterCopyDoor(ctx, applier, streamID, recordKind); err != nil {
 				return nil, func() {}, false, err
 			}
 		}
