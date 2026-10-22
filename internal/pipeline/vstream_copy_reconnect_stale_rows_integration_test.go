@@ -81,6 +81,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/logcapture"
 )
 
@@ -390,7 +391,17 @@ type vrsMode struct {
 	// re-copy of it, which must refuse COLD-START-INCOMPLETE and then land
 	// exact under its remedy.
 	recopy bool
+	// saa runs the cold start under --schema-already-applied onto target
+	// tables created here. The retry cannot clear them, so it must refuse
+	// RESTART-FROM-SCRATCH-TARGET-NOT-CLEARED naming the fault
+	// (SAA-COLD-COPY-RETRY-UNCLEARED), never upsert over the partial copy;
+	// the remedy, emptying the tables and re-running, must land exact.
+	saa bool
 }
+
+// vrsFaultRefusal is the start of the SAA refusal's wording when a fault,
+// not the operator's --restart-from-scratch, restarted the copy.
+const vrsFaultRefusal = "a fault during the copy made this run restart the copy"
 
 // vrsAwaitHandoff waits for run to persist a CDC position other than prev,
 // and reports whether it did.
@@ -433,6 +444,33 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func() *S
 	}
 	vcrSeed(t, r.mysqlDSN, big, "v1", vcrRange(1, 1, vrsBigRows))
 	time.Sleep(3 * time.Second) // the schema tracker
+	if m.saa {
+		// The operator's pre-created control table and tables, matching the
+		// source's shape.
+		tgtEng, ok := engines.Get(r.targetEngine())
+		if !ok {
+			t.Fatalf("engine not registered: %s", r.targetEngine())
+		}
+		ap, err := tgtEng.OpenChangeApplier(context.Background(), r.tgtDSN)
+		if err != nil {
+			t.Fatalf("open target applier: %v", err)
+		}
+		if err := ap.EnsureControlTable(context.Background()); err != nil {
+			t.Fatalf("pre-create the control table: %v", err)
+		}
+		if c, ok := ap.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+		for _, tbl := range tables {
+			r.tgt().exec(t, "CREATE TABLE "+tbl+" (id BIGINT NOT NULL, payload VARCHAR(255) NOT NULL, PRIMARY KEY (id))")
+		}
+		plainMk := mk
+		mk = func() *Streamer {
+			s := plainMk()
+			s.SchemaAlreadyApplied = true
+			return s
+		}
+	}
 
 	var res vrsCellResult
 	res.byteTrigger = m.byteTrigger
@@ -577,9 +615,16 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func() *S
 	res.handedOff = vrsAwaitHandoff(t, cell, run, prevPos, 5*time.Minute)
 	if !res.handedOff && run.exited() {
 		res.refusal = run.err
-		if m.recopy {
+		if m.recopy || m.saa {
 			remedy := mk()
-			remedy.RestartFromScratch = true
+			if m.saa {
+				// The SAA remedy: empty the pre-created tables, re-run.
+				for _, tbl := range tables {
+					r.tgt().exec(t, "TRUNCATE TABLE "+tbl)
+				}
+			} else {
+				remedy.RestartFromScratch = true
+			}
 			live = startTWFBRun(remedy)
 			defer func() { _ = live.stop(t) }()
 			res.remedied = true
@@ -666,7 +711,7 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func() *S
 			t.Logf("  %s: %d source rows missing or different on the target outside the arms, e.g. %v", tbl, len(missing), missing[:min(5, len(missing))])
 		}
 	}
-	if res.diverged() || (res.refusal != nil && !m.recopy) {
+	if res.diverged() || (res.refusal != nil && !m.recopy && !m.saa) {
 		vcrLogTail(t, r, logStart)
 	}
 	return res
@@ -678,7 +723,10 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func() *S
 //   - a faulted first cold start: no in-place reconnect, the fault reached
 //     runWithRetry, the run kept going, and the target is exact;
 //   - a faulted re-copy: the run refused COLD-START-INCOMPLETE, and its
-//     remedy (--restart-from-scratch) left the target exact.
+//     remedy (--restart-from-scratch) left the target exact;
+//   - a faulted --schema-already-applied cold start: the retry refused
+//     RESTART-FROM-SCRATCH-TARGET-NOT-CLEARED naming the fault, and its
+//     remedy (empty the tables, re-run) left the target exact.
 func vrsCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func(streamID string, include []string) *Streamer, sharded func(t *testing.T, tables ...string)) {
 	t.Helper()
 	runs := vrsRuns()
@@ -698,6 +746,15 @@ func vrsCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func(streamI
 		case m.noFault:
 			if res.retries != 0 {
 				t.Errorf("RUN %d: RIG: the no-fault control retried (%d)", i, res.retries)
+			}
+		case m.saa:
+			if res.retries == 0 {
+				t.Errorf("RUN %d: RIG: the fault never reached runWithRetry", i)
+			}
+			if res.refusal == nil || !strings.Contains(res.refusal.Error(), restartUnclearedMarker) ||
+				!strings.Contains(res.refusal.Error(), vrsFaultRefusal) {
+				t.Errorf("RUN %d: a faulted --schema-already-applied cold start must refuse %s naming the fault (%q); got refusal=%v",
+					i, restartUnclearedMarker, vrsFaultRefusal, res.refusal)
 			}
 		case m.recopy:
 			if res.refusal == nil || !strings.Contains(res.refusal.Error(), vrsColdStartIncomplete) {
@@ -769,6 +826,15 @@ func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
 		})
 		t.Run("Recopy/SingleStream", func(t *testing.T) {
 			vrsCell(t, r, proxy, vrsMode{prefix: "qs", layout: vrsSmallFirst, byteTrigger: true, recopy: true}, plain(single), nil)
+		})
+		// The concurrent copy (K = 2, copyStream.pumpTable) restarts the same
+		// way.
+		t.Run("ConcurrentCopy", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "rk", layout: vrsSmallFirst}, plain("&vstream_copy_table_parallelism=2"), nil)
+		})
+		// --schema-already-applied: the restart cannot clear the tables.
+		t.Run("SchemaAlreadyApplied", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "ra", layout: vrsBigOnly, saa: true}, plain(""), nil)
 		})
 		// Controls: the same changes at the same point with no fault.
 		t.Run("NoFaultControl/FirstTable", func(t *testing.T) {
