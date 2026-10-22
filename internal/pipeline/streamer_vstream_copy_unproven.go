@@ -328,27 +328,43 @@ func (s *Streamer) headerCopyStillOnTarget(ctx context.Context, applier ir.Chang
 	// the flag too, a dead end. Unproven, not contradicted, keeps the flag the
 	// exit; plumbing the predicate into the probe would buy a sharper answer
 	// for a narrow case at the cost of a second predicate path.
+	//
+	// The other emptied tables are still probed, and a contradiction on any of
+	// them outranks an unproven answer on another: a filtered table, or a probe
+	// that failed for one table, must not mask a lost copy the probe did see —
+	// that would let --assert-copy-finished through over positive evidence.
+	var filtered, probed []string
 	for _, k := range emptied {
 		if s.RowFilters[bareTableOfKey(k)] != "" {
-			return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, that target table "+
-				"is empty or absent, and the table carries a --where row filter, so an unfiltered source probe cannot tell "+
-				"a table whose matching rows have gone from a lost copy",
-				state.TableProgress[bareTableOfKey(k)].RowsCopied, displayKey(k)), false, nil
+			filtered = append(filtered, k)
+		} else {
+			probed = append(probed, k)
 		}
 	}
-	onSource, probeErr := s.sourceTablesHoldRows(ctx, emptied)
-	for _, k := range emptied {
-		copied := state.TableProgress[bareTableOfKey(k)].RowsCopied
-		switch {
-		case probeErr != nil:
-			return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, that target table "+
-				"is empty or absent, and the source could not be probed to tell a drained table from a lost copy (%v)",
-				copied, displayKey(k), probeErr), false, nil
-		case onSource[k]:
+	var onSource map[string]bool
+	var probeErr error
+	if len(probed) > 0 {
+		onSource, probeErr = s.sourceTablesHoldRows(ctx, probed)
+	}
+	for _, k := range probed {
+		if onSource[k] {
 			return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, but that target "+
 				"table is empty or absent while the source table holds rows: the target no longer holds the copy the record "+
-				"describes", copied, displayKey(k)), true, nil
+				"describes", state.TableProgress[bareTableOfKey(k)].RowsCopied, displayKey(k)), true, nil
 		}
+	}
+	if probeErr != nil {
+		k := probed[0]
+		return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, that target table "+
+			"is empty or absent, and the source could not be probed to tell a drained table from a lost copy (%v)",
+			state.TableProgress[bareTableOfKey(k)].RowsCopied, displayKey(k), probeErr), false, nil
+	}
+	if len(filtered) > 0 {
+		k := filtered[0]
+		return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, that target table "+
+			"is empty or absent, and the table carries a --where row filter, so an unfiltered source probe cannot tell "+
+			"a table whose matching rows have gone from a lost copy",
+			state.TableProgress[bareTableOfKey(k)].RowsCopied, displayKey(k)), false, nil
 	}
 	return "", false, nil // every emptied table is empty on the source too: drained since
 }
