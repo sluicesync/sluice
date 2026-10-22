@@ -88,6 +88,18 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 163, 4},
+		fixedIn:     semver{0, 163, 5},
+		claimMarker: "after you have compared the target's row count with the source's, table by table, and they match",
+		why: "a refused stream has applied none of the source's writes since it stopped, so on a source that " +
+			"kept taking writes its counts differ even when its copy finished (measured 4,992 vs 4,989 on a " +
+			"complete handoff stream); the remedy as written re-copies healthy streams. The measured order is " +
+			"the flag, catch-up, paused writes, then `sluice verify --depth count` (an incomplete copy reported " +
+			"MISMATCH 299500 vs 149000; complete copies reported OK). The same release's list of streams refused " +
+			"once omitted v0.163.3-or-earlier --position-from-manifest handoffs. fixedIn is the release that " +
+			"corrects the flag help and the refusal message. Found by the v0.163.4 regression cycle (Bug 328)",
+	},
+	{
 		amended:     semver{0, 163, 3},
 		fixedIn:     semver{0, 163, 4},
 		claimMarker: "A mid-copy position saved by an earlier release is refused under `VSTREAM-COPY-RESUME-WITHDRAWN`",

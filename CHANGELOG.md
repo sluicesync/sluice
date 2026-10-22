@@ -7,12 +7,15 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 ### Fixed
 
 - **`sync start --force-cold-start` help no longer says a populated target always collides on PRIMARY KEY (FORCE-COLD-START-HELP-STALE).** On a source that copies by upsert (PlanetScale, Vitess) it collides on nothing and keeps every target row the source has since deleted, silently; v0.163.3 corrected the refusal's hint and the error-code row but not the flag's own help. The help now states both cases and points at `--restart-from-scratch`. `sluice migrate --force-cold-start` is unchanged and correct: `migrate` copies by INSERT from every source.
+- **The `VSTREAM-COPY-COMPLETION-UNPROVEN` refusal and the `--assert-copy-finished` help no longer tell you to compare row counts before passing the flag (Bug 328, loud).** A refused stream has applied none of the source's writes since it stopped, so on a source that kept taking writes the counts differ even when the copy finished, and following the advice re-copied healthy streams. Both now give the measured order: the flag once, let the stream catch up, pause source writes, then `sluice verify --depth count` (`--depth sample` refuses a PlanetScale/Vitess source), re-copying with `--restart-from-scratch` any table it reports short. They also say the check is mandatory, because the flag records the tables at once and nothing refuses the stream afterwards. Measured on the v0.163.4 rig: an incomplete copy reported `t2_big MISMATCH source=299500 target=149000` and matched after the re-copy; complete copies, including one whose stopped counts read 4,992 against 4,989, reported every table `OK`.
 
 ### Changed
 
 - **modernc.org/sqlite 1.58.0 → 1.60.1** (Dependabot #360), held out of v0.163.3 and v0.163.4 so each shipped alone.
 
 ## [0.163.4] - 2026-10-21
+
+**Correction (2026-10-22).** The Compatibility entry's remedy for a stream refused once though healthy, comparing row counts and then passing `--assert-copy-finished`, cannot work on a source that kept taking writes while the stream was stopped: the stream has applied none of them, so the counts differ even for a finished copy. Pass the flag once, let the stream catch up, pause source writes, then run `sluice verify --depth count` and re-copy any table it reports short; that check is mandatory, since nothing refuses the stream after the flag. The list of streams refused once also omits a PlanetScale/Vitess stream handed off with `--position-from-manifest` on v0.163.3 or earlier. v0.163.5 corrects the flag's help and the refusal's message (sluice-testing Bug 328).
 
 ### Fixed
 

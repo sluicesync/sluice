@@ -489,10 +489,14 @@ func vstreamCopyUnprovenError(streamID, why string) error {
 		"a position that looks exactly like a finished copy's, and resuming from it would never copy the rest of the "+
 		"tables, while the stream reported healthy. A copy that finished on v0.149.0 or later normally leaves a record "+
 		"proving it (unless that run could not record its progress); this stream's does not hold up. No change has been "+
-		"applied by this run and no table in the stream's scope was changed on the target. Re-copy the stream: %s. If you "+
-		"have verified, table by table, that the target's row counts match the source's, re-run the same command once with "+
-		"--assert-copy-finished: it records every in-scope table that exists on the target and holds rows as copied, so "+
-		"later resumes pass without it (it is refused when the target shows the copy did not finish). On a `sluice sync run` "+
+		"applied by this run and no table in the stream's scope was changed on the target. Re-copy the stream: %s. Row counts "+
+		"taken now cannot settle it: this stream has applied none of the source's writes since it stopped, so they differ "+
+		"even for a finished copy. To keep the stream instead, re-run the same command once with --assert-copy-finished "+
+		"(it records every in-scope table that exists on the target and holds rows as copied, so later resumes pass without "+
+		"it, and it is refused when the target shows the copy did not finish), let the stream catch up, pause writes on the "+
+		"source, and run `sluice verify --depth count` against the same source and target: a table it reports short was "+
+		"never fully copied, and the remedy is then the re-copy above. Do not skip that check: once the flag is accepted, "+
+		"nothing refuses this stream again. On a `sluice sync run` "+
 		"leg, take the leg out of the fleet and run `sluice sync start` with the flag: the fleet spec has no key for it", // remedy-partial: the operator's own invocation (the leg's flags) carries their DSNs
 		ir.ErrIncludeTableScopeDrift, vstreamCopyUnprovenMarker, streamID, why, recopyRemedy)
 }
