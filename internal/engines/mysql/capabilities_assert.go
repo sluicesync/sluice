@@ -49,6 +49,10 @@ var (
 	_ ir.TargetConnectionBudgetProber          = Engine{}
 	_ irbackup.TableScopedBackupSnapshotOpener = Engine{}
 	_ ir.TableScopedSnapshotOpener             = Engine{}
+	// VSTREAM-SINGLE-STREAM-MULTI-TABLE: the pipeline's pre-write check. A
+	// drift here would move the refusal to the snapshot open, after the cold
+	// start has cleared its apply marks and a backup has fallen back.
+	_ ir.SnapshotScopeChecker = Engine{}
 	// ADR-0174 Piece 2 — continuous filtered sync (`sync --where`) pushes
 	// the predicate into the VStream COPY at OPEN time (a post-open
 	// RowFilterSetter is too late for the eager COPY). A method-set drift

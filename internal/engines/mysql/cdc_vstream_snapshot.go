@@ -135,8 +135,9 @@ func vstreamCopyFilterRules(tables []string, filters map[string]string) []*binlo
 // after it fresh ([resolveResumeAutoShard]). This is the fix for the bug
 // where a resume of a large multi-table keyspace fell back to the legacy
 // single keyspace-wide interleaved stream and crash-looped on the ADR-0071
-// buffer cap. A single-table scope (or the opt-out) keeps the legacy
-// single-stream resume path.
+// buffer cap. A single-table scope keeps the legacy single-stream resume
+// path; the opt-out with more than one table is refused before the open
+// ([refuseSingleStreamMultiTable]).
 //
 // A non-nil start is REQUIRED to carry a TablePKs cursor on at least one
 // shard (the caller is resuming an interrupted COPY); seeding a bulk
@@ -171,6 +172,12 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	}
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql/vstream: snapshot: DSN has no database name (vitess keyspace expected)")
+	}
+	// VSTREAM-SINGLE-STREAM-MULTI-TABLE, before anything dials: every VStream
+	// snapshot opener funnels through here, so this is the door the pipeline's
+	// earlier ir.SnapshotScopeChecker call mirrors, not a second rule.
+	if err := refuseSingleStreamMultiTable(cfg, tables); err != nil {
+		return nil, err
 	}
 	// Per-sync zero-date policy (ADR-0127); invalid zero_date refuses loudly.
 	// The DSN param wins; absent, the engine's --zero-date default applies.
@@ -268,6 +275,10 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	// the per-table loop re-copies the tables before it idempotently
 	// (Bug-125 upsert absorbs the overlap), resumes that table from its
 	// cursor, and copies the tables after it fresh. See resolveResumeAutoShard.
+	//
+	// The opt-out operand is now always false here when len(tables) > 1: that
+	// combination was refused above (VSTREAM-SINGLE-STREAM-MULTI-TABLE). It is
+	// kept so the gate still reads as the rule it is.
 	autoShard := len(tables) > 1 && !vstreamCopySingleStreamFromDSN(cfg)
 
 	// ADR-0099: cross-table COPY concurrency. When auto-shard is engaged and
@@ -544,7 +555,10 @@ func logAutoShardCopyMode(ctx context.Context, keyspace string, tables []string,
 // `vstream_copy_single_stream=true`, restoring the legacy single
 // keyspace-wide interleaved COPY stream (and its ADR-0071 multi-table
 // loud-refusal floor). Default false — auto-shard is on by default so the
-// full-keyspace cold-copy just works at bounded memory.
+// full-keyspace cold-copy just works at bounded memory. Since the
+// VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED fix the opt-out is refused
+// for more than one listed table ([refuseSingleStreamMultiTable]), so the
+// only scope it still reaches is one table, where it changes nothing.
 func vstreamCopySingleStreamFromDSN(cfg *gomysql.Config) bool {
 	return cfg.Params["vstream_copy_single_stream"] == "true"
 }
@@ -1244,8 +1258,9 @@ func resolveResumeAutoShard(start []shardGtid, tables []string) (string, error) 
 		return "", fmt.Errorf(
 			"mysql/vstream: snapshot resume: auto-shard: persisted cursor names %d tables (%v); "+
 				"auto-shard resume expects a single in-progress table cursor. This token was written by the legacy "+
-				"single keyspace-wide COPY (pre-ADR-0098) or is corrupt — re-run with vstream_copy_single_stream=true "+
-				"to resume it on the legacy path, or restart the cold-start (the idempotent COPY writer absorbs the re-copy)",
+				"single keyspace-wide COPY (pre-ADR-0098) or is corrupt. A stopped VStream copy is no longer resumed "+
+				"(VSTREAM-COPY-RESUME-WITHDRAWN): re-copy it with `sluice sync start --restart-from-scratch`, which clears "+
+				"the in-scope target tables first",
 			len(cursorTables), names,
 		)
 	}
@@ -1258,7 +1273,8 @@ func resolveResumeAutoShard(start []shardGtid, tables []string) (string, error) 
 		return "", fmt.Errorf(
 			"mysql/vstream: snapshot resume: auto-shard: persisted cursor names in-progress table %q, "+
 				"which is not in the current in-scope table set %v (an --include-table change since the checkpoint, "+
-				"or a stale token). Restore the original table scope to resume, or restart the cold-start",
+				"or a stale token). A stopped VStream copy is no longer resumed (VSTREAM-COPY-RESUME-WITHDRAWN): re-copy it "+
+				"with `sluice sync start --restart-from-scratch`, which clears the in-scope target tables first",
 			seedTable, tables,
 		)
 	}

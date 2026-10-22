@@ -489,6 +489,16 @@ func (b *Backup) Run(ctx context.Context) error {
 		}
 	}
 
+	// 2.6. A copy scope the source's snapshot cannot copy faithfully under
+	// this DSN (VSTREAM-SINGLE-STREAM-MULTI-TABLE). Asked here because the
+	// snapshot open's own refusal would not stop the backup: an open error
+	// takes the non-snapshot fallback below with a WARN, a different copy
+	// from the one the parameter asked for, at exit 0. The scope is the one
+	// openBackupSnapshotScoped hands the opener.
+	if err := migcore.PreflightSnapshotScope(b.Source, b.SourceDSN, migcore.TableNamesForPublication(schema)); err != nil {
+		return fmt.Errorf("backup: %w", err)
+	}
+
 	// 3. Open the row reader. v0.18.0: prefer the snapshot-anchored
 	// path that captures EndPosition at snapshot START and pins all
 	// table reads to a cross-table consistent view, closing the

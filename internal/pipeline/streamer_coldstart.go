@@ -64,21 +64,25 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	const resumingCopy = false
 	stop = func() {}
 
-	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
-	// first. (The established-table record is NOT touched here: it is marked
-	// in progress at the cold start's point of no return, inside
-	// coldStartGatePreflight — see [beginColdStartRecord].)
-	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
-		return nil, stop, err
-	}
-
 	// Read + gate the source schema: open the source SchemaReader, read
 	// + filter the schema, and run every source-side preflight against
 	// the still-open reader. A nil schema with nil error is the
 	// empty-source case — nothing to stream (the (nil, nil) contract
-	// runOnce checks for).
+	// runOnce checks for). It writes nothing, so a refusal here leaves the
+	// target exactly as it was.
 	schema, snapshotTables, err := s.coldStartReadSourceSchema(ctx, resumingCopy)
 	if err != nil {
+		return nil, stop, err
+	}
+
+	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
+	// before it. After the source read, not before it, so that a source-side
+	// refusal (VSTREAM-SINGLE-STREAM-MULTI-TABLE among them) does not take an
+	// established stream's marks with it: a warm resume after the refusal
+	// relies on them. (The established-table record is NOT touched here: it
+	// is marked in progress at the cold start's point of no return, inside
+	// coldStartGatePreflight — see [beginColdStartRecord].)
+	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
 		return nil, stop, err
 	}
 	if schema == nil {
@@ -467,6 +471,16 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	// gets streamed/buffered and overflows --max-buffer-bytes (ADR-0071).
 	// Unqualified names — matches the VStream filter rule's Match scope.
 	snapshotTables := migcore.TableNamesForPublication(schema)
+
+	// A copy scope the source's snapshot cannot copy faithfully under this
+	// DSN (VSTREAM-SINGLE-STREAM-MULTI-TABLE: `vstream_copy_single_stream=true`
+	// with more than one table loses deletes). Here, before coldStart clears
+	// the apply marks and before any target write; the snapshot open raises
+	// the same refusal for a caller that skips this.
+	if err := migcore.PreflightSnapshotScope(s.Source, s.SourceDSN, snapshotTables); err != nil {
+		migcore.CloseIf(sr)
+		return nil, nil, err
+	}
 
 	// Source-side RLS preflight (task #52 sub-deliverable 1). Refuses
 	// loudly when any in-scope source table has RLS enabled AND the

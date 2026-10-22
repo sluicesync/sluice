@@ -4,6 +4,10 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vstream_copy_single_stream=true` in a PlanetScale/Vitess source DSN is now refused when more than one table is in the copy scope (VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED, HIGH, silent; marker `VSTREAM-SINGLE-STREAM-MULTI-TABLE`).** The parameter copies every table in one VStream instead of one per table. Such a copy does not stay at one snapshot: before each table after the first, Vitess replays the changes made to the tables already copied inside the copy, sluice's copy kept only the inserted and updated rows of that replay, and the change stream started after it, so a row deleted from an already-copied table while a later table was copying stayed on the target at exit 0. Measured on Vitess 24 with no fault: 60 of 60 such deletes stayed, updates were exact, and the default per-table copy was exact under the same changes. `sync start` (every cold start, including `--restart-from-scratch`, `--reset-target-data` and the automatic re-snapshot) refuses after reading the source schema and before it writes to the stream's tables, clears its apply marks or saves a position; a cold-start `--dry-run` plan refuses the same scope; `backup full` refuses before its snapshot opens instead of falling back to its non-snapshot copy; and a `sync run` leg that hits it is not restarted. The remedy is to remove the parameter; a one-table scope keeps it. A multi-table copy that used the parameter on an earlier release may have kept rows the source deleted during the copy, as may any multi-table PlanetScale/Vitess cold start before v0.99.63, when the single stream was the default (not measured); compare the tables against the source or re-copy them. `TestStreamer_VStreamCopyReconnectStaleRows` now requires the refusal, with the target and position untouched, and then the remedy exact, including the cell that measured the loss. The legacy-cursor resume refusals no longer advise setting the parameter.
+
 ## [0.163.6] - 2026-10-22
 
 ### Fixed

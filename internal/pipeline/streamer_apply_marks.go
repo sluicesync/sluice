@@ -12,7 +12,9 @@ import (
 
 // clearApplyMarksForColdStart deletes the stream's ADR-0190 apply marks
 // before a cold start copies anything. Every cold-start entry point calls it
-// first — [Streamer.coldStart], [Streamer.coldStartMultiDatabase] and the
+// before its first target write ([Streamer.coldStart] after its read-only
+// source-side preflights, so a refusal there leaves the marks a warm resume
+// needs) — [Streamer.coldStart], [Streamer.coldStartMultiDatabase] and the
 // stopped-cold-start resume ([Streamer.resumeStoppedColdStart]), which
 // together are every path that re-seeds the target (the fresh stream,
 // --reset-target-data, --restart-from-scratch, the automatic re-snapshot, the

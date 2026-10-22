@@ -21,6 +21,7 @@ func TestRestartRefusalSentinelsAreTheMarkers(t *testing.T) {
 		{ir.ErrShardedTargetVindexUpdate, shardedTargetVindexUpdateMarker},
 		{ir.ErrCharsetNotDecodable, charsetNotDecodableMarker},
 		{ir.ErrDSNTimeZoneNotUTC, "DSN-TIME-ZONE-NOT-UTC"},
+		{ir.ErrVStreamSingleStreamMultiTable, "VSTREAM-SINGLE-STREAM-MULTI-TABLE"},
 		{ir.ErrColumnIdentityChanged, "COLUMN-IDENTITY-CHANGED"},
 		{ir.ErrUniqueKeyConflictOtherRow, uniqueKeyConflictMarker},
 	} {

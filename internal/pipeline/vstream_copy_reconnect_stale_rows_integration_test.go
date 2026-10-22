@@ -55,6 +55,14 @@
 // stream refused COLD-START-INCOMPLETE, and its remedy, --restart-from-scratch,
 // landed exact. The cells below require exactly that.
 //
+// The single-stream opt-out with more than one table lost deletes with no
+// fault at all (VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED: vtgate's
+// catch-up before each later table replays the copied tables' changes as
+// copy-phase rows), so it is now refused before anything is written
+// (VSTREAM-SINGLE-STREAM-MULTI-TABLE). Its cells require that refusal with
+// the target untouched, then the remedy (the parameter dropped) exact; the
+// opt-out's remaining scope, one table, is measured like the others.
+//
 // Usage (Windows; see CLAUDE.md for the Rancher Desktop env):
 //
 //	SLUICE_VRS_RUNS=3 go test -tags='integration vstream' \
@@ -67,9 +75,11 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -82,6 +92,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
 )
 
@@ -397,6 +408,55 @@ type vrsMode struct {
 	// (SAA-COLD-COPY-RETRY-UNCLEARED), never upsert over the partial copy;
 	// the remedy, emptying the tables and re-running, must land exact.
 	saa bool
+	// singleStreamFirst runs the cell's stream once under
+	// vstream_copy_single_stream=true before the measured run (after the
+	// establishing cold start, for a re-copy, with --restart-from-scratch).
+	// With two tables it must refuse VSTREAM-SINGLE-STREAM-MULTI-TABLE having
+	// changed nothing on the target; the measured run is its remedy, the same
+	// stream with the parameter dropped.
+	singleStreamFirst bool
+}
+
+// vrsSingleStreamParam is the single-stream opt-out's DSN parameter.
+const vrsSingleStreamParam = "&vstream_copy_single_stream=true"
+
+// vssRequireRefusal runs s, a cold start of every table in tables under
+// vstream_copy_single_stream=true, which must exit with
+// VSTREAM-SINGLE-STREAM-MULTI-TABLE within two minutes having changed no
+// in-scope target table (each holds exactly what it held before, or is still
+// absent) and with the stream's persisted position still prevPos.
+func vssRequireRefusal(t *testing.T, r vcrRig, s *Streamer, tables []string, prevPos string) {
+	t.Helper()
+	before := map[string]map[int64]string{}
+	for _, tbl := range tables {
+		before[tbl] = vrsRows(t, r.tgt(), tbl)
+	}
+	logStart := r.logs.Len()
+	run := startTWFBRun(s)
+	defer func() { _ = run.stop(t) }()
+	deadline := time.Now().Add(2 * time.Minute)
+	for !run.exited() {
+		if time.Now().After(deadline) {
+			vcrLogTail(t, r, logStart)
+			t.Fatalf("a %d-table cold start under vstream_copy_single_stream=true neither refused nor exited in 2 minutes", len(tables))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !errors.Is(run.err, ir.ErrVStreamSingleStreamMultiTable) || !strings.Contains(fmt.Sprint(run.err), "VSTREAM-SINGLE-STREAM-MULTI-TABLE") {
+		vcrLogTail(t, r, logStart)
+		t.Fatalf("a %d-table cold start under vstream_copy_single_stream=true exited with %v; want the VSTREAM-SINGLE-STREAM-MULTI-TABLE refusal", len(tables), run.err)
+	}
+	for _, tbl := range tables {
+		after := vrsRows(t, r.tgt(), tbl)
+		if (after == nil) != (before[tbl] == nil) || !maps.Equal(after, before[tbl]) {
+			t.Fatalf("the refused run changed target table %s: %d rows before (absent=%v), %d after (absent=%v)",
+				tbl, len(before[tbl]), before[tbl] == nil, len(after), after == nil)
+		}
+	}
+	if got := (twfbCell{tgt: r.tgt(), streamID: s.StreamID}).persistedPosition(t); got != prevPos {
+		t.Fatalf("the refused run moved the persisted position from %q to %q", prevPos, got)
+	}
+	t.Logf("REFUSED (loud, target untouched): %v", run.err)
 }
 
 // vrsFaultRefusal is the start of the SAA refusal's wording when a fault,
@@ -488,6 +548,12 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func() *S
 		_ = first.stop(t)
 		prevPos = cell.persistedPosition(t)
 		s.RestartFromScratch = true
+	}
+	if m.singleStreamFirst {
+		refused := mk()
+		refused.SourceDSN += vrsSingleStreamParam
+		refused.RestartFromScratch = m.recopy
+		vssRequireRefusal(t, r, refused, tables, prevPos)
 	}
 
 	proxy.down.Store(0)
@@ -789,7 +855,7 @@ func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	const keyspace = "commerce"
-	const single = "&vstream_copy_single_stream=true"
+	const single = vrsSingleStreamParam
 
 	t.Run("OneShard", func(t *testing.T) {
 		mysqlDSN, grpcEndpoint, _, cleanupSrc := startShardedVTTestServer(t, keyspace, 1)
@@ -816,16 +882,19 @@ func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
 		t.Run("SingleTableScope", func(t *testing.T) {
 			vrsCell(t, r, proxy, vrsMode{prefix: "ro", layout: vrsBigOnly}, plain(""), nil)
 		})
-		t.Run("SingleStream", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "rs", layout: vrsSmallFirst, byteTrigger: true}, plain(single), nil)
+		// The single-stream opt-out with one table (the only scope it still
+		// reaches): the fault restarts the copy like any other.
+		t.Run("SingleStream/OneTable", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "rs", layout: vrsBigOnly}, plain(single), nil)
 		})
 		// A re-copy refuses in the pipeline, whichever pump faulted; one cell
-		// per pump family (per-table auto-shard, single-stream).
+		// per pump family (per-table auto-shard, single-stream). The
+		// single-stream pump is reached only by a one-table scope now.
 		t.Run("Recopy/DefaultPath", func(t *testing.T) {
 			vrsCell(t, r, proxy, vrsMode{prefix: "qd", layout: vrsSmallFirst, recopy: true}, plain(""), nil)
 		})
-		t.Run("Recopy/SingleStream", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "qs", layout: vrsSmallFirst, byteTrigger: true, recopy: true}, plain(single), nil)
+		t.Run("Recopy/SingleStreamOneTable", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "qs", layout: vrsBigOnly, recopy: true}, plain(single), nil)
 		})
 		// The concurrent copy (K = 2, copyStream.pumpTable) restarts the same
 		// way.
@@ -843,8 +912,28 @@ func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
 		t.Run("NoFaultControl/SingleTableScope", func(t *testing.T) {
 			vrsCell(t, r, proxy, vrsMode{prefix: "co", layout: vrsBigOnly, noFault: true}, plain(""), nil)
 		})
-		t.Run("NoFaultControl/SingleStream", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "cs", layout: vrsSmallFirst, byteTrigger: true, noFault: true}, plain(single), nil)
+		t.Run("NoFaultControl/SingleStreamOneTable", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "cs", layout: vrsBigOnly, noFault: true}, plain(single), nil)
+		})
+		// VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED: with NO fault, a
+		// multi-table single-stream copy lost 60 of 60 deletes made to the big
+		// first table while the second copied (measured 2026-10-22, the cell
+		// {layout: vrsBigFirst, byteTrigger: true, noFault: true} over the
+		// parameter): vtgate's catch-up before the second table replayed them
+		// as copy-phase rows, which keep only after images. That copy is now
+		// refused before it writes anything; each cell requires the refusal,
+		// then runs its remedy, the parameter dropped, under the same changes,
+		// and requires it exact. Both layouts, and the re-copy of an
+		// established stream, whose target and position must survive the
+		// refusal unchanged.
+		t.Run("SingleStream/MultiTableRefused/BigFirst", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "ms", layout: vrsBigFirst, noFault: true, singleStreamFirst: true}, plain(""), nil)
+		})
+		t.Run("SingleStream/MultiTableRefused/SmallFirst", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "mt", layout: vrsSmallFirst, noFault: true, singleStreamFirst: true}, plain(""), nil)
+		})
+		t.Run("SingleStream/MultiTableRefused/Recopy", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "mq", layout: vrsSmallFirst, noFault: true, recopy: true, singleStreamFirst: true}, plain(""), nil)
 		})
 	})
 
@@ -882,8 +971,8 @@ func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
 		t.Run("SingleTableScope", func(t *testing.T) {
 			vrsCell(t, r, proxy, vrsMode{prefix: "to", layout: vrsBigOnly}, merged(""), sharded)
 		})
-		t.Run("SingleStream", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "ts", layout: vrsSmallFirst, byteTrigger: true}, merged(single), sharded)
+		t.Run("SingleStream/MultiTableRefused", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "ts", layout: vrsSmallFirst, noFault: true, singleStreamFirst: true}, merged(""), sharded)
 		})
 	})
 }

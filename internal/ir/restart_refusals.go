@@ -43,6 +43,14 @@ var ErrCharsetNotDecodable = errors.New("CHARSET-NOT-DECODABLE")
 // reads the same one.
 var ErrDSNTimeZoneNotUTC = errors.New("DSN-TIME-ZONE-NOT-UTC")
 
+// ErrVStreamSingleStreamMultiTable classifies the VStream-family refusal of
+// a copy of more than one table under the `vstream_copy_single_stream=true`
+// DSN parameter (VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED): one VStream
+// copying several tables loses the deletes made to a table it has finished
+// while it copies the next. The DSN and the copy scope are configuration; a
+// restart reads the same ones.
+var ErrVStreamSingleStreamMultiTable = errors.New("VSTREAM-SINGLE-STREAM-MULTI-TABLE")
+
 // ErrKeyScopedWriteMatchedMultipleRows classifies the apply refusal of an
 // UPDATE or DELETE that names its row by key and matched more than one target
 // row (GC-42, SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS). The apply transaction is

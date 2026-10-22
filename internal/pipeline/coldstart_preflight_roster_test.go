@@ -98,6 +98,10 @@ var coldStartPreflightMultiDatabaseExempt = map[string]coldStartPreflightExempti
 		"the spanning snapshot open — inside the copy loop it would count sluice's own freshly-created slot and refuse falsely."},
 	"preflightSourceXIDWraparound": {exemptFiledGap, "audit 2026-09-01 A2-2 roster sweep: a database-level probe; applies once per run " +
 		"(all selected PG schemas share one database), not per namespace."},
+	"PreflightSnapshotScope": {exemptArchitectural, "its only implementor today refuses for the VStream flavors " +
+		"(VSTREAM-SINGLE-STREAM-MULTI-TABLE), and the multi-namespace cold start never opens a VStream snapshot: " +
+		"mysql.Engine.OpenMultiDatabaseSnapshotStream refuses every VStream flavor before it copies anything. A " +
+		"future checker on a spanning-capable source must be wired into coldStartMultiDatabase first."},
 }
 
 func TestColdStartPreflightRoster_MultiDatabaseReachesEverySibling(t *testing.T) {
