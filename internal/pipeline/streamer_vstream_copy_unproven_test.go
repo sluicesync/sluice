@@ -26,6 +26,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -33,6 +34,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 	irbackup "sluicesync.dev/sluice/internal/ir/backup"
+	"sluicesync.dev/sluice/internal/logcapture"
 )
 
 // cursorlessVStreamToken is the 93-byte shape Bug 327's cells persisted.
@@ -290,6 +292,59 @@ func TestVStreamCopyDoor_EraFixtures(t *testing.T) {
 // the record is written, so a retry after the table drains mid-run passes on
 // the record. Holding rows there: contradicted, and the flag is refused. The
 // source cannot be probed: unproven but not contradicted, so the flag passes.
+// TestVStreamCopyDoor_HeaderProofRecordsOnlyCoveredTables (round 4, item 1):
+// a header-only pass certifies only the tables the header's copy covered. A
+// table admitted to the scope since, which already exists on the target, is
+// not recorded — it stays judged by the INCLUDE-TABLE-SCOPE-DRIFT door — and
+// is named in the WARN.
+func TestVStreamCopyDoor_HeaderProofRecordsOnlyCoveredTables(t *testing.T) {
+	ctx := context.Background()
+	var logs logcapture.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	s := vstreamDoorStreamer(t, proofTargetWith(header(ir.MigrationPhaseComplete, "t1_small"))) // t2_big on target, not in the header
+	app := anchoredAfter()
+	kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, app, "st", cursorless)
+	if err != nil || kind != recordHeaderProof {
+		t.Fatalf("kind=%v err=%v; want a header-proof pass", kind, err)
+	}
+	if err := s.recordAfterCopyDoor(ctx, app, "st", kind); err != nil {
+		t.Fatal(err)
+	}
+	if !sameSet(app.rec.Established, []string{"t1_small"}) {
+		t.Fatalf("established = %v; want only the table the header covered (t1_small)", app.rec.Established)
+	}
+	if !strings.Contains(logs.String(), "NOT recorded") || !strings.Contains(logs.String(), "t2_big") {
+		t.Errorf("the uncovered table was not named in the WARN:\n%s", logs.String())
+	}
+}
+
+// TestVStreamCopyDoor_FilteredTableNotProbed (round 4, item 2): a table under
+// a `--where` row filter that is empty on the target is not probed (the probe
+// is unfiltered, and would find the excluded rows): unproven, not
+// contradicted, and the flag is accepted.
+func TestVStreamCopyDoor_FilteredTableNotProbed(t *testing.T) {
+	ctx := context.Background()
+	tgt := proofTargetWith(header(ir.MigrationPhaseComplete, "t2_big"))
+	tgt.empty = map[string]bool{"t2_big": true}
+	s := vstreamDoorStreamer(t, tgt) // the source probe would find rows
+	s.RowFilters = map[string]string{"t2_big": "region = 'EU'"}
+	_, err := s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless)
+	requireUnproven(t, err)
+	if !strings.Contains(err.Error(), "--where row filter") || strings.Contains(err.Error(), "cannot be accepted") {
+		t.Fatalf("want the unproven (not contradicted) refusal naming the filter, got %v", err)
+	}
+	if probeOf(s).probes != 0 {
+		t.Errorf("a filtered table was probed %d times", probeOf(s).probes)
+	}
+	s.AssertCopyFinished = true
+	if kind, err := s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless); err != nil || kind != recordAsserted {
+		t.Fatalf("kind=%v err=%v; want the flag accepted", kind, err)
+	}
+}
+
 func TestVStreamCopyDoor_DrainedTable(t *testing.T) {
 	ctx := context.Background()
 	t.Run("empty on source and target: passes, records the table", func(t *testing.T) {

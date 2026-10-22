@@ -59,7 +59,11 @@ package pipeline
 // UNVERIFIED PREMISES, written down rather than implied: (1) a ≤v0.163.1
 // stream stopped in the F2 window and then warm-resumed by v0.163.2/v0.163.3
 // (a Bug 327 victim already) has a position row rewritten since, which the
-// clock comparison reads as finished; (2) a ≤v0.163.1 re-copy with inert
+// clock comparison reads as finished — and since a header-only pass now
+// records the established tables, that verdict is permanent for the stream
+// (its later starts pass on the record). The outcome is unchanged by that:
+// the rows the stopped copy never reached were already lost by the earlier
+// warm resume, and a re-copy is the remedy either way; (2) a ≤v0.163.1 re-copy with inert
 // recording stopped after writing some rows (F1) leaves every copied table
 // non-empty, which the emptiness check reads as finished; (3) on Postgres the
 // clock answer is this session's UTC offset, standing in for the offset of
@@ -172,6 +176,7 @@ func (s *Streamer) phaseRefuseUnprovenVStreamCopy(ctx context.Context, applier i
 	if !s.vstreamCopyDoorApplies() {
 		return recordNothing, nil
 	}
+	s.copyDoorHeaderTables = nil
 	c, err := s.vstreamCopyCompletion(ctx, applier, streamID)
 	if err != nil {
 		return recordNothing, err
@@ -261,6 +266,11 @@ func (s *Streamer) vstreamCopyCompletion(ctx context.Context, applier ir.ChangeA
 	}
 	switch verdict {
 	case orderAfter:
+		tables := make(map[string]bool, len(state.TableProgress))
+		for name := range state.TableProgress {
+			tables[name] = true // RowsCopied == 0 entries included: the copy covered them
+		}
+		s.copyDoorHeaderTables = tables
 		return copyCompletion{proven: true, headerProof: true}, nil
 	case orderBefore:
 		return unproven(true, why)
@@ -281,7 +291,9 @@ func (s *Streamer) vstreamCopyCompletion(ctx context.Context, applier ir.ChangeA
 // path ([Streamer.sourceTablesHoldRows]). Source empty too — the table was
 // drained, and that is consistent. Source holding rows — the target lost the
 // copy (contradicted, and --assert-copy-finished is refused). Probe that
-// cannot run — unproven but NOT contradicted, so the flag stays an exit.
+// cannot run — unproven but NOT contradicted, so the flag stays an exit. A
+// table under a `--where` row filter is never probed (the probe is
+// unfiltered) and is unproven but NOT contradicted for the same reason.
 func (s *Streamer) headerCopyStillOnTarget(ctx context.Context, applier ir.ChangeApplier, streamID string, state ir.MigrationState) (why string, contradicted bool, err error) {
 	scope, _, err := s.currentScopeKeys(ctx, applier, streamID)
 	if err != nil {
@@ -309,6 +321,20 @@ func (s *Streamer) headerCopyStillOnTarget(ctx context.Context, applier ir.Chang
 	}
 	if len(emptied) == 0 {
 		return "", false, nil
+	}
+	// A table the stream filters (`--where`) is not probed: the probe reads
+	// the source unfiltered, so it would find the rows the filter excludes and
+	// call a stream whose matching rows have since gone a lost copy — refusing
+	// the flag too, a dead end. Unproven, not contradicted, keeps the flag the
+	// exit; plumbing the predicate into the probe would buy a sharper answer
+	// for a narrow case at the cost of a second predicate path.
+	for _, k := range emptied {
+		if s.RowFilters[bareTableOfKey(k)] != "" {
+			return fmt.Sprintf("its cold-start progress record reads complete with %d rows copied into %s, that target table "+
+				"is empty or absent, and the table carries a --where row filter, so an unfiltered source probe cannot tell "+
+				"a table whose matching rows have gone from a lost copy",
+				state.TableProgress[bareTableOfKey(k)].RowsCopied, displayKey(k)), false, nil
+		}
 	}
 	onSource, probeErr := s.sourceTablesHoldRows(ctx, emptied)
 	for _, k := range emptied {
@@ -515,10 +541,13 @@ func (s *Streamer) recordAssertedCopy(ctx context.Context, applier ir.ChangeAppl
 //     whatever the operator believes; recording it would hide it from the
 //     INCLUDE-TABLE-SCOPE-DRIFT door, so it is left out and named (F4).
 //   - recordHeaderProof (the progress header and the target proved the copy):
-//     the in-scope tables that exist on the target, empty ones included — the
-//     door has already shown each empty copied table is empty on the source
-//     too (drained), and recording it now is what keeps a later start from
-//     judging the header again.
+//     the in-scope tables that the header's copy covered (its TableProgress,
+//     RowsCopied == 0 entries included) AND that exist on the target, empty
+//     ones included — the door has already shown each empty copied table is
+//     empty on the source too (drained), and recording it now is what keeps
+//     a later start from judging the header again. An in-scope table the
+//     header never covered (admitted to the scope after that cold start) is
+//     left out and named, whatever the target holds.
 //
 // It runs once the scope door has passed. A failure refuses: passing without
 // the record would leave the judgment to be repeated, or ask for the flag
@@ -545,7 +574,21 @@ func (s *Streamer) recordAfterCopyDoor(ctx context.Context, applier ir.ChangeApp
 	}
 	var keys, names, skipped []string
 	for _, k := range scope {
-		if holding[k] || (kind == recordHeaderProof && exists[k]) {
+		if kind == recordHeaderProof {
+			// Only a table the header's copy covered (its TableProgress,
+			// RowsCopied == 0 included) is certified. A table admitted to the
+			// scope since, which exists on the target (pre-created, or filled by
+			// CDC on an older release), was never copied by that run; recording
+			// it would hide it from the INCLUDE-TABLE-SCOPE-DRIFT door for good.
+			if exists[k] && s.copyDoorHeaderTables[bareTableOfKey(k)] {
+				keys = append(keys, k)
+				names = append(names, displayKey(k))
+			} else {
+				skipped = append(skipped, displayKey(k))
+			}
+			continue
+		}
+		if holding[k] {
 			keys = append(keys, k)
 			names = append(names, displayKey(k))
 		} else {
@@ -572,8 +615,8 @@ func (s *Streamer) recordAfterCopyDoor(ctx context.Context, applier ir.ChangeApp
 			slog.String("stream_id", streamID), slog.String("tables", strings.Join(names, ", ")))
 	}
 	if len(skipped) > 0 {
-		slog.WarnContext(ctx, marker+": in-scope tables that are absent (or, under --assert-copy-finished, empty) on the "+
-			"target were NOT recorded as copied; the next start judges each as never copied (INCLUDE-TABLE-SCOPE-DRIFT) — "+
+		slog.WarnContext(ctx, marker+": in-scope tables that are absent on the target, that are empty there (under "+
+			"--assert-copy-finished), or that the progress record's copy did not cover were NOT recorded as copied; the next start judges each as never copied (INCLUDE-TABLE-SCOPE-DRIFT) — "+
 			"empty its target table if it has one and bring it in with `sluice schema add-table`, or take it out of scope",
 			slog.String("stream_id", streamID), slog.String("tables", strings.Join(skipped, ", ")))
 	}
