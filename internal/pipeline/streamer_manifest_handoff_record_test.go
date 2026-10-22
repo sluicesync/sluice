@@ -111,7 +111,7 @@ func runHandoff(t *testing.T, cdcMethod ir.CDCMethod, applier *handoffApplier, c
 	defer cancel()
 	s := &Streamer{
 		Source:        source,
-		Target:        &proofTarget{Engine: &copyResumeEngine{name: "postgres"}, store: newFakeStateStore()},
+		Target:        &proofTarget{Engine: &copyResumeEngine{name: "postgres", schemaOneTable: true}, store: newFakeStateStore()},
 		SourceDSN:     "src",
 		TargetDSN:     "tgt",
 		StreamID:      "st",
@@ -213,6 +213,51 @@ func TestRecordManifestHandoff_ScopeIntersectsTheChain(t *testing.T) {
 	}
 	next := vstreamDoorStreamer(t, proofTargetWith(newFakeStateStore())) // the next plain start
 	requireDrift(t, next.phaseRefuseIncludeTableScopeDrift(ctx, app, "st"), "t2_big", reasonTargetPresent)
+}
+
+// TestRecordManifestHandoff_TargetIntersection (F5): a chain table the target
+// does not hold (a restore filtered by `restore --include-table`) is not
+// recorded either.
+func TestRecordManifestHandoff_TargetIntersection(t *testing.T) {
+	s := vstreamDoorStreamer(t, proofTargetWith(newFakeStateStore(), "t1_small"))
+	s.PositionFromManifestStore = vstreamChainStore(t, false, "t1_small", "t2_big")
+	app := &anchorDriftApplier{scopeDriftApplier: &scopeDriftApplier{}}
+	if err := s.recordManifestHandoff(context.Background(), app, "st", cursorless); err != nil {
+		t.Fatal(err)
+	}
+	if len(app.anchors) != 1 || app.anchors[0] != "copied=t1_small" {
+		t.Fatalf("anchors = %v; want only the table the target holds (t1_small) recorded", app.anchors)
+	}
+}
+
+// silentAnchorApplier writes the anchor and records nothing, returning nil:
+// what a control table with no record columns this role cannot ALTER does
+// (COLD-START-ANCHOR-UNRECORDED).
+type silentAnchorApplier struct {
+	*scopeDriftApplier
+	anchors int
+}
+
+func (a *silentAnchorApplier) WriteColdStartAnchor(context.Context, string, ir.Position, []string, map[string]string) error {
+	a.anchors++
+	return nil
+}
+
+// TestRecordManifestHandoff_AnchorUnrecordedRefuses (F6): an anchor write
+// that silently recorded nothing refuses, under the no-restart sentinel,
+// naming the control-tables remedy — never a false "recorded" INFO.
+func TestRecordManifestHandoff_AnchorUnrecordedRefuses(t *testing.T) {
+	s := vstreamDoorStreamer(t, proofTargetWith(newFakeStateStore()))
+	s.PositionFromManifestStore = vstreamChainStore(t, false, "t1_small", "t2_big")
+	app := &silentAnchorApplier{scopeDriftApplier: &scopeDriftApplier{}}
+	err := s.recordManifestHandoff(context.Background(), app, "st", cursorless)
+	if app.anchors != 1 {
+		t.Fatalf("RIG: anchor writes = %d", app.anchors)
+	}
+	if err == nil || !strings.Contains(err.Error(), manifestHandoffUnrecordedMarker) || refusalARestartRepeats(err) == nil ||
+		!strings.Contains(err.Error(), "sluice control-tables ddl") {
+		t.Fatalf("want the terminal %s refusal naming control-tables ddl, got %v", manifestHandoffUnrecordedMarker, err)
+	}
 }
 
 // TestRecordManifestHandoff_Arms: the helper's other arms.

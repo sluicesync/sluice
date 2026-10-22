@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -29,7 +30,9 @@ const manifestHandoffUnrecordedMarker = "MANIFEST-HANDOFF-UNRECORDED"
 // VSTREAM-COPY-COMPLETION-UNPROVEN door refuses (Bug 327).
 //
 // What is recorded is the stream's current scope INTERSECTED with the
-// chain's table set ([LoadChainTerminalTables]), never the scope alone: a
+// chain's table set ([LoadChainTerminalTables]) and with the tables that
+// exist on the target (a restore filtered by `restore --include-table` left
+// the rest out, and nothing else records that), never the scope alone: a
 // table in scope that the backup never held was never copied, and recording
 // it would disable the INCLUDE-TABLE-SCOPE-DRIFT door for exactly the table
 // it exists to catch. Such a table stays not established and is judged by
@@ -75,27 +78,61 @@ func (s *Streamer) recordManifestHandoff(ctx context.Context, applier ir.ChangeA
 	if err != nil {
 		return handoffUnrecordedError("could not read the stream's scope", err)
 	}
-	var keys, names, notInChain []string
+	onTarget, _, err := s.targetTableFacts(ctx, scope)
+	if err != nil {
+		return handoffUnrecordedError("could not read which tables exist on the target", err)
+	}
+	var keys, names, left []string
 	for _, k := range scope {
-		if restored[bareTableOfKey(k)] {
+		if restored[bareTableOfKey(k)] && onTarget[k] {
 			keys = append(keys, k)
 			names = append(names, displayKey(k))
 		} else {
-			notInChain = append(notInChain, displayKey(k))
+			left = append(left, displayKey(k))
 		}
 	}
 	if err := aw.WriteColdStartAnchor(ctx, streamID, pos, keys, s.establishedIDs(ctx, keys)); err != nil {
+		if errors.Is(err, ir.ErrControlTableDDLRequired) {
+			return handoffDDLRefusal(err)
+		}
 		return handoffUnrecordedError("could not record the tables it brings in", err)
+	}
+	// The anchor write records the set only where the record's columns exist:
+	// on a control table this role cannot ALTER it writes the position, WARNs
+	// COLD-START-ANCHOR-UNRECORDED and returns nil. Read the record back
+	// rather than report what was asked for.
+	if store, ok := applier.(ir.EstablishedTablesStore); ok {
+		rec, err := store.ReadEstablishedRecord(ctx, streamID)
+		if err != nil {
+			return handoffUnrecordedError("could not read back the record it wrote", err)
+		}
+		if !rec.Recorded {
+			return handoffDDLRefusal(errors.New(ir.ColdStartAnchorUnrecordedMarker +
+				": the anchor was written without the established-table record"))
+		}
 	}
 	slog.InfoContext(ctx, "position-from-manifest: recorded the handoff's anchor and the restored tables as established",
 		slog.String("stream_id", streamID), slog.String("tables", strings.Join(names, ", ")))
-	if len(notInChain) > 0 {
-		slog.WarnContext(ctx, "position-from-manifest: tables in the stream's scope that the backup chain does not hold were "+
-			"not recorded as copied; the next start judges them as never copied (INCLUDE-TABLE-SCOPE-DRIFT) — bring each "+
-			"in with `sluice schema add-table`, or take it out of scope",
-			slog.String("stream_id", streamID), slog.String("tables", strings.Join(notInChain, ", ")))
+	if len(left) > 0 {
+		slog.WarnContext(ctx, "position-from-manifest: tables in the stream's scope that the backup chain does not hold, or "+
+			"that do not exist on the target, were not recorded as copied; the next start judges them as never copied "+
+			"(INCLUDE-TABLE-SCOPE-DRIFT) — bring each in with `sluice schema add-table`, or take it out of scope",
+			slog.String("stream_id", streamID), slog.String("tables", strings.Join(left, ", ")))
 	}
 	return nil
+}
+
+// handoffDDLRefusal refuses a handoff whose record cannot be written because
+// this role cannot bring sluice_cdc_state up to date. The position may already
+// be written; the next plain start then refuses VSTREAM-COPY-COMPLETION-UNPROVEN
+// rather than resume silently.
+func handoffDDLRefusal(err error) error {
+	return fmt.Errorf("pipeline: %w: %s: the --position-from-manifest handoff could not record the tables it brings in, "+
+		"because this role cannot bring the sluice_cdc_state control table up to date (the stream's position may already "+
+		"be written; a plain start refuses VSTREAM-COPY-COMPLETION-UNPROVEN until the record exists). Have the statements "+
+		"`sluice control-tables ddl --engine <target engine>` prints applied by a role that can (on a PlanetScale branch "+
+		"with safe migrations, ship each with `sluice deploy-ddl`), then re-run the same command. No change has been "+
+		"applied by this run: %w", ir.ErrIncludeTableScopeDrift, manifestHandoffUnrecordedMarker, err)
 }
 
 func handoffUnrecordedError(what string, err error) error {

@@ -51,7 +51,7 @@ func wrapControlTableBootstrapError(err error, statement string) error {
 		return err
 	}
 	oneLine := strings.Join(strings.Fields(statement), " ")
-	return sluicecode.Wrap(
+	return ir.WithMarker(sluicecode.Wrap(
 		sluicecode.CodePSDirectDDLBlocked,
 		"ship sluice's control-table DDL through a PlanetScale deploy request: `sluice control-tables ddl` prints the statements, `sluice deploy-ddl --ddl '<statement>'` deploys each one; then re-run",
 		fmt.Errorf("%w: %w | "+
@@ -61,7 +61,7 @@ func wrapControlTableBootstrapError(err error, statement string) error {
 			"`sluice deploy-ddl --ddl '<statement>'` deploys one statement; then re-run. "+
 			"The statement that failed here is: %s",
 			ErrSafeMigrationsBlocked, err, oneLine),
-	)
+	), ir.ErrControlTableDDLRequired)
 }
 
 // ControlTableDDLGuidance implements [ir.ControlTableDDLProvider]: the
