@@ -1307,7 +1307,7 @@ func tabletTypeSuffix(t topodata.TabletType) string {
 //     PRIMARY also took the snapshot (cdc_vstream_snapshot.go:115),
 //     so resuming there keeps the COPY read consistent with the
 //     snapshot's GTID anchor. This mirrors the snapshot cold-start
-//     and reconnectCopy paths, which already target PRIMARY.
+//     path, which already targets PRIMARY.
 //
 // vstreamCDCTailFilterRules builds the steady-state (CDC-tail / warm-resume)
 // VStream filter rules for a continuous filtered sync (ADR-0174 Piece 2, audit

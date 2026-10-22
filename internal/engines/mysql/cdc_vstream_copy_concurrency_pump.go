@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"time"
 
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/proto/query"
@@ -32,8 +31,8 @@ import (
 // gapless CDC-resume position.
 //
 // Why a separate pump (not a parameterization of copyPumpAutoShard): the
-// sequential path's per-table helpers (pumpOneTableCopy, reopenForTable,
-// reconnectCopy) read+write the SHARED s.grpcStream / s.currentVgtid /
+// sequential path's per-table helpers (pumpOneTableCopy, reopenForTable)
+// read+write the SHARED s.grpcStream / s.currentVgtid /
 // s.fields / s.posBreadcrumbs directly — single-pump state. Running K of
 // them concurrently would race on those fields. The concurrent pump gives
 // each stream its OWN copyStream (gRPC stream + cursor + field cache), so
@@ -63,7 +62,7 @@ type copyStream struct {
 	// gRPC stream over the parent's shared *grpc.ClientConn — gRPC
 	// multiplexes K concurrent streams over one HTTP/2 connection, so K
 	// streams cost one TCP/TLS connection, K logical streams). Replaced in
-	// place by reopenStreamForTable / reconnectStream; this goroutine is
+	// place by openStreamForTable as the stream advances; this goroutine is
 	// the sole Recv caller, so it needs no lock for its own access, but
 	// close() never touches it (only the parent grpcCancel tears the whole
 	// conn down).
@@ -198,8 +197,9 @@ func (s *vstreamSnapshotStream) copyPumpAutoShardConcurrent(ctx context.Context,
 	// The K sub-goroutines are tracked TWICE: on the local wg (so this driver
 	// blocks until they finish before it stitches + writes the position) AND on
 	// the parent's copyWG (so [close] joins them before it tears down the shared
-	// conn — each sub-stream Recv's on the shared gRPC conn and reconnectStream
-	// re-opens on the shared client, so a straggler must not outlive close()).
+	// conn — each sub-stream Recv's on the shared gRPC conn and opens its next
+	// table's stream on the shared client, so a straggler must not outlive
+	// close()).
 	// The local Add is what goPump can't express (it only knows copyWG), hence
 	// the inline dual Add/Done rather than routing these through goPump.
 	var wg sync.WaitGroup
@@ -327,7 +327,9 @@ func (cs *copyStream) openStreamForTable(ctx context.Context, table string, seed
 
 // pumpTable Recv-drives this stream's currently-open single-table COPY
 // until its (global) COPY_COMPLETED, returning the table's snapshot VGTID.
-// It mirrors pumpOneTableCopy's liveness watchdog + in-place reconnect, but
+// It mirrors pumpOneTableCopy's liveness watchdog and Recv-error handling (a
+// Recv error ends the copy; no in-place reconnect,
+// VSTREAM-COPY-RECONNECT-STALE-ROWS), but
 // operates on PER-STREAM state (cs.grpcStream / cs.cur / cs.fields) and
 // enqueues into the parent's SHARED rowBuffer.
 //
@@ -359,7 +361,6 @@ func (cs *copyStream) pumpTable(ctx context.Context, cancel context.CancelFunc, 
 		})
 	defer live.stop()
 
-	reconnectAttempts := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -371,25 +372,12 @@ func (cs *copyStream) pumpTable(ctx context.Context, cancel context.CancelFunc, 
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, err
 			}
-			classified := classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: concurrent copy recv (stream %d, table %q): %w", cs.idx, table, err))
-			var re ir.RetriableError
-			if errors.As(classified, &re) && reconnectAttempts < s.reconnectMax {
-				reconnectAttempts++
-				if rerr := cs.reconnectStream(ctx, table, reconnectAttempts); rerr != nil {
-					return nil, rerr
-				}
-				continue
-			}
-			return nil, classified
+			return nil, classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: concurrent copy recv (stream %d, table %q): %w", cs.idx, table, err))
 		}
 		if evs := resp.GetEvents(); len(evs) > 0 {
 			live.observe(eventsProveLiveness(evs))
 		}
-		copiedRow := false
 		for _, ev := range resp.GetEvents() {
-			if ev.GetType() == binlogdata.VEventType_ROW {
-				copiedRow = true
-			}
 			done, derr := cs.dispatchCopyEvent(table, ev)
 			if derr != nil {
 				return nil, derr
@@ -403,35 +391,7 @@ func (cs *copyStream) pumpTable(ctx context.Context, cancel context.CancelFunc, 
 				return snap, nil
 			}
 		}
-		if copiedRow {
-			reconnectAttempts = 0
-		}
 	}
-}
-
-// reconnectStream re-opens this stream's VStream IN PLACE after a retriable
-// Recv error, resuming from cs.cur (the last-observed cursor for the table
-// in flight). Mirrors reconnectCopy but on per-stream state. Backoff is
-// exponential, bounded, and ctx-interruptible.
-func (cs *copyStream) reconnectStream(ctx context.Context, table string, attempt int) error {
-	s := cs.parent
-	backoff := s.reconnectBackoffBase << (attempt - 1)
-	if backoff <= 0 || backoff > s.reconnectBackoffCap {
-		backoff = s.reconnectBackoffCap
-	}
-	select {
-	case <-time.After(backoff):
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	resume := cs.cur
-	if len(resume) == 0 {
-		resume = fromBeginningVStreamPos(s.keyspace, s.shards)
-	}
-	slog.WarnContext(ctx, "mysql/vstream: snapshot: concurrent COPY stream dropped; reconnecting in place from cursor",
-		slog.Int("stream", cs.idx), slog.String("table", table),
-		slog.Int("attempt", attempt), slog.Int("max_attempts", s.reconnectMax))
-	return cs.openStreamForTable(ctx, table, resume)
 }
 
 // dispatchCopyEvent routes one COPY-phase VEvent for this stream. Returns
@@ -525,7 +485,7 @@ func (cs *copyStream) dispatchCopyEvent(table string, ev *binlogdata.VEvent) (bo
 // broadcasts — so a blocked ReadRows consumer surfaces it to the operator
 // rather than it dying inside the pump goroutine. It deliberately does NOT
 // pass through classifyReaderError: a statement-logged write is not
-// retriable, and the reconnect loop sits upstream of this return.
+// retriable, so the Streamer's runWithRetry must not restart the copy on it.
 func (cs *copyStream) statementDMLRefusal(ev *binlogdata.VEvent) error {
 	pos, _ := cs.positionFor() // a position that fails to encode still refuses; the coordinate is diagnostic only
 	return vstreamStatementDMLError(ev, pos)

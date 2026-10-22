@@ -103,6 +103,11 @@ durable frontier). Three cases:
    4`) takes.
 
 2. **Idempotent (UPSERT) read path (VStream snapshot / warm-resume / add-table).**
+   **CORRECTED (VSTREAM-COPY-RECONNECT-STALE-ROWS):** the claim below is false for
+   deletes. An UPSERT re-copy removes nothing, so any resume of a VStream copy kept the
+   rows the source deleted meanwhile; the cross-process resume was withdrawn in v0.163.3
+   and the in-place reconnect after it. A mid-COPY VStream fault now takes §B: the cold
+   start restarts with the in-scope target tables cleared.
    Resume from the durable frontier; the UPSERT (`ON DUPLICATE KEY UPDATE`) absorbs
    any re-emitted overlap (ADR-0010). Loss-safe because the persisted COPY position is
    gated at-or-behind the durable frontier (ADR-0007). If a precise mid-table durable

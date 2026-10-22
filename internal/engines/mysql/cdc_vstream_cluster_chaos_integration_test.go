@@ -199,23 +199,21 @@ func TestVitessChaos_PrimaryFailover_PRS_and_ERS(t *testing.T) {
 // the real-crash analog of the SIGKILL simulation — then EmergencyReparents
 // onto the surviving replica (the VTOrc/operator action a real deployment
 // takes; this minimal harness runs no VTOrc). Asserts the COPY either
-// resumes across the reparent with zero loss (v0.99.5 in-place reconnect +
-// v0.99.8/9 durable-watermark resume carrying the cursor onto the new
-// primary) or fails LOUD — never a silent partial.
+// completes with zero loss or fails LOUD — never a silent partial. Since
+// VSTREAM-COPY-RECONNECT-STALE-ROWS the snapshot has no in-place reconnect,
+// so a kill that surfaces as a Recv error ends the COPY loudly here (the
+// Streamer's retry, not exercised by this reader-level test, restarts the
+// cold start from scratch).
 // ----------------------------------------------------------------------
 
 func TestVitessChaos_TabletKill_MidColdStart(t *testing.T) {
-	// RECONNECT-BUDGET BACKGROUND: the COPY pump's in-place reconnect budget
-	// originally reset on ANY event (cdc_vstream_snapshot.go), so an
-	// unproductive reconnect loop after a tablet death (reconnect →
-	// non-progress events → error → repeat) never exhausted reconnectMax and
-	// never failed loud — it churned. FIXED by gating the budget reset on
-	// actual COPY progress (a ROW buffered) so an unproductive loop burns its
-	// budget and surfaces a LOUD failCopy (~reconnectMax × backoff), which the
-	// invariant accepts. This scenario exercises the recovery path: if the
-	// reparent restores a serving primary before the budget exhausts the COPY
-	// resumes (zero-loss); if not, it fails loud. Both are acceptable; a
-	// silent partial is not (commit 68c7486).
+	// HISTORY: the COPY pump used to reconnect in place (ADR-0072 Phase C),
+	// and its budget once churned forever after a tablet death (commit
+	// 68c7486 gated it on copy progress). The reconnect is withdrawn
+	// (VSTREAM-COPY-RECONNECT-STALE-ROWS: it kept rows deleted during the
+	// reconnect window), so a Recv error now ends the COPY at once, which the
+	// invariant accepts as loud. A kill that does not surface as a Recv error
+	// must still complete with zero loss; a silent partial is never accepted.
 	//
 	// Two variants: kill the whole tablet container, and kill only mysqld
 	// underneath a live vttablet. Both recover via the same ERS.
@@ -296,15 +294,12 @@ func TestVitessChaos_TabletKill_MidColdStart(t *testing.T) {
 					// Recover the shard the way a real deployment (VTOrc / an
 					// operator) would: EmergencyReparentShard the dead primary's
 					// duties onto the surviving replica (uid 101, fully replicated
-					// before the kill). This both (a) gives the COPY pump a primary
-					// to resume its in-place reconnect against — the v0.99.5
-					// reconnect + v0.99.8/9 durable-watermark resume must carry the
-					// cursor across the reparent — and (b) restores a writable
-					// primary for the final source-count read. The invariant then
-					// holds either way: the COPY resumes to zero-loss across the
-					// reparent, or the reconnect budget exhausts first and it fails
-					// LOUD (the churn the progress-gated reset, commit 68c7486,
-					// converts into failCopy). It must never silently partial.
+					// before the kill). This restores a writable primary for the
+					// final source-count read. The invariant then holds either way:
+					// the COPY completes with zero loss, or its Recv error ends it
+					// LOUD (no in-place reconnect since
+					// VSTREAM-COPY-RECONNECT-STALE-ROWS). It must never silently
+					// partial.
 					cc.emergencyReparent(t, tabletAliasReplica)
 					cc.waitForPrimaryAlias(t, tabletAliasReplica, 4*time.Minute)
 					cc.waitForWritablePrimaryHandle(t, 3*time.Minute)

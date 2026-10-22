@@ -3,19 +3,17 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Measurement of VSTREAM-COPY-RECONNECT-STALE-ROWS (docs/dev/audit-backlog.md):
-// does the in-place mid-COPY reconnect (reconnectCopy, ADR-0072 Phase C),
-// which re-opens the VStream from the last-observed VGTID and its TablePKs,
-// leave rows on the target that the source deleted during the reconnect
-// window?
+// The pin for VSTREAM-COPY-RECONNECT-STALE-ROWS (docs/dev/audit-backlog.md):
+// a genuine mid-COPY gRPC fault on a PlanetScale/Vitess cold start must
+// leave the target exactly matching the source, or refuse loudly. It must
+// never leave a row the source deleted while the copy recovered.
 //
 // The fault is real and needs no product hook: the Streamer reaches vtgate's
 // gRPC port through a TCP proxy defined here, which severs every open
-// connection mid-copy. Recv fails with gRPC Unavailable (retriable), and
-// reconnectCopy re-opens on the same ClientConn, which redials through the
-// proxy. The proxy HOLDS that redial (accepts the TCP connection, forwards
-// nothing) until the source changes are made, so every change lands after
-// the resume position and before the resumed stream exists. It also caps
+// connection mid-copy. Recv fails with gRPC Unavailable (retriable). The
+// proxy then HOLDS the next connection the Streamer opens (accepts it,
+// forwards nothing) until the source changes are made, so every change lands
+// after the fault and before any recovery can read the source. It also caps
 // vtgate→sluice throughput: unthrottled, a local vtgate pushes the whole copy
 // into the client's gRPC buffers within seconds, and a severed connection
 // then surfaces no Recv error at all.
@@ -36,34 +34,33 @@
 // TARGET's, after the CDC hand-off and after a marker written behind the
 // changes reached every table. It never consults sluice's own state.
 //
-// MEASURED 2026-10-22 (vttestserver mysql80 = Vitess 24, Postgres 16 target,
-// 3 runs per cell, reconnect window 2.2s: 200ms backoff + the held redial).
-// Exact in every run: the default path with the small table finished first
-// (one and two shards), and every no-fault control. Stale (deleted on the
-// source, still on the target, at exit 0) in every run, updates always exact:
+// HISTORY. Until the fix, the COPY pumps re-opened the stream in place
+// (reconnectCopy, ADR-0072 Phase C) from the last VGTID and its TablePKs.
+// Measured 2026-10-22 (vttestserver mysql80 = Vitess 24, Postgres 16 target,
+// 3 runs per cell, reconnect window 2.2s): every window delete stayed on the
+// target (20 of 20 per arm, updates exact) on the single-stream opt-out, on
+// the default path with the fault in the first table, and on a one-table
+// scope, one and two shards. The mechanism, confirmed with debug logging:
+// vtgate replays the window's changes as catch-up ROW events inside the copy
+// phase; bufferCopyRow keeps only after images, so each catch-up DELETE was
+// dropped; the rest of the table is copied under a NEW snapshot, and the CDC
+// tail resumes from that later position. An uninterrupted copy has no
+// catch-up (each table is one snapshot) and its CDC tail replays the deletes.
 //
-//   - single-stream opt-out, one shard: 1-finished 20/20, 2-below 20/20,
-//     2-frontier 20/20, 2-above 0 (the finished table was re-received from
-//     the start: 1,980 rows for a 1,000-row table);
-//   - single-stream opt-out, two shards: 20/20, 20/20, 11-12/20 or 0, 0;
-//   - default path, fault in the FIRST table: 2-below 20/20, 2-frontier
-//     20/20 (two shards: 12-20/20), 2-above 0;
-//   - one-table scope: 2-below 20/20, 2-frontier 20/20 (two shards: 8-20/20),
-//     2-above 0.
-//
-// So the in-progress table's catch-up deletes are lost too (arm 2), not only
-// a finished table's. The default path's small-first cell is exact only
-// because the CDC tail resumes from the stitched minimum of the per-table
-// snapshots (the finished table's, from before the fault), which replays the
-// window's deletes.
+// THE FIX removes the in-place reconnect: a Recv error ends the copy and the
+// Streamer's runWithRetry takes it. Measured the same way with the reconnect
+// disabled, before the removal: a first cold start restarted from scratch
+// (ADR-0109 §B: the in-scope target tables cleared, then copied again) and
+// was exact in every cell, one and two shards; a re-copy of an existing
+// stream refused COLD-START-INCOMPLETE, and its remedy, --restart-from-scratch,
+// landed exact. The cells below require exactly that.
 //
 // Usage (Windows; see CLAUDE.md for the Rancher Desktop env):
 //
-//	SLUICE_VRS_MEASURE=1 SLUICE_VRS_RUNS=3 go test -tags='integration vstream' \
+//	SLUICE_VRS_RUNS=3 go test -tags='integration vstream' \
 //	  -count=1 -timeout=120m -v -run 'TestStreamer_VStreamCopyReconnectStaleRows' ./internal/pipeline/
 //
-// The reproducing cells skip unless SLUICE_VRS_MEASURE=1 (the item is open);
-// each cell runs SLUICE_VRS_RUNS times (default 1).
+// Each cell runs SLUICE_VRS_RUNS times (default 1).
 
 package pipeline
 
@@ -105,8 +102,8 @@ const (
 	vrsWireBytesPerRow = 160 // default path: 3.43-3.62 MB sent at 20,000 target rows (rows buffered past the target included)
 )
 
-// vrsHold is how long the proxy holds the reconnect's redial after it
-// arrives, on top of the time the source changes take.
+// vrsHold is how long the proxy holds the recovery's first connection after
+// it arrives, on top of the time the source changes take.
 const vrsHold = 2 * time.Second
 
 // vrsProxy is a TCP proxy to vtgate's gRPC port that can sever every open
@@ -178,7 +175,7 @@ func (p *vrsProxy) serve(c net.Conn, hold chan struct{}) {
 // client's gRPC buffers (BDP-sized windows) within seconds, so a severed
 // connection surfaces no Recv error: the buffered stream, COPY_COMPLETED
 // included, drains first (measured: the first cut faulted at 20,000 rows
-// and the copy completed without a reconnect).
+// and the copy completed with no Recv error).
 const vrsDownstreamBytesPerSec = 512 << 10
 
 func vrsThrottledCopy(dst io.Writer, src io.Reader, counter *atomic.Int64) {
@@ -306,9 +303,15 @@ type vrsCellResult struct {
 	byteTrigger              bool
 	redialAfter, window      time.Duration
 	changesTook              time.Duration
-	reconnects               int
-	handedOff                bool
-	note                     string
+	// reconnects counts the withdrawn in-place reconnect's WARN; retries
+	// counts runWithRetry's, the recovery that replaced it.
+	reconnects, retries int
+	// refusal is the error the faulted run exited with (nil while it ran);
+	// remedied reports that a --restart-from-scratch re-run followed it.
+	refusal   error
+	remedied  bool
+	handedOff bool
+	note      string
 }
 
 func (r vrsCellResult) String() string {
@@ -317,8 +320,9 @@ func (r vrsCellResult) String() string {
 	if r.byteTrigger {
 		frontier = "b-received-at-fault(estimated)"
 	}
-	fmt.Fprintf(&b, "%s=%d wire-bytes-at-fault=%d reconnect-WARNs=%d changes-took=%v redial-after-fault=%v window(fault->release)=%v handed-off=%v",
-		frontier, r.bAtFault, r.downAtFault, r.reconnects, r.changesTook.Round(time.Millisecond), r.redialAfter.Round(time.Millisecond), r.window.Round(time.Millisecond), r.handedOff)
+	fmt.Fprintf(&b, "%s=%d wire-bytes-at-fault=%d reconnect-WARNs=%d retry-lines=%d changes-took=%v redial-after-fault=%v window(fault->release)=%v refusal=%v remedied=%v handed-off=%v",
+		frontier, r.bAtFault, r.downAtFault, r.reconnects, r.retries, r.changesTook.Round(time.Millisecond), r.redialAfter.Round(time.Millisecond),
+		r.window.Round(time.Millisecond), r.refusal != nil, r.remedied, r.handedOff)
 	for _, a := range r.arms {
 		fmt.Fprintf(&b, "\n    %-14s stale-rows=%d (e.g. %v) stale-values=%d (e.g. %v)", a.arm, a.staleRows, a.staleRowEx, a.staleVals, a.staleValEx)
 	}
@@ -348,7 +352,15 @@ func (r vrsCellResult) diverged() bool {
 	return !r.handedOff
 }
 
+// vrsReconnectLine is the withdrawn in-place reconnect's WARN. Nothing emits
+// it now; a run that logs it is running a reinstated reconnect.
 const vrsReconnectLine = "COPY stream dropped; reconnecting in place from cursor"
+
+// vrsRetryLine is runWithRetry's per-retry line (streamer_retry.go).
+const vrsRetryLine = "applier: transient error; retrying"
+
+// vrsColdStartIncomplete is the marker a faulted re-copy must refuse with.
+const vrsColdStartIncomplete = "COLD-START-INCOMPLETE"
 
 // vrsLayout is where the small (1,000-row) table sits relative to the big
 // one in the copy order (tables copy in name order, _a before _b).
@@ -366,12 +378,43 @@ const (
 	vrsBigOnly
 )
 
-// vrsRunCell runs one cold start with a fault mid-copy of the big table and
-// measures the target against the source.
-func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a, b string, layout vrsLayout, byteTrigger, noFault bool, sharded func(t *testing.T, tables ...string)) vrsCellResult {
+// vrsMode is one cell's shape.
+type vrsMode struct {
+	prefix string
+	layout vrsLayout
+	// byteTrigger faults on vtgate's sent bytes (the single-stream cells).
+	byteTrigger bool
+	// noFault is the control: the same changes at the same point, no fault.
+	noFault bool
+	// recopy establishes the stream first and faults a --restart-from-scratch
+	// re-copy of it, which must refuse COLD-START-INCOMPLETE and then land
+	// exact under its remedy.
+	recopy bool
+}
+
+// vrsAwaitHandoff waits for run to persist a CDC position other than prev,
+// and reports whether it did.
+func vrsAwaitHandoff(t *testing.T, cell twfbCell, run *twfbRun, prev string, within time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		if p := cell.persistedPosition(t); p != "" && p != prev {
+			return true
+		}
+		if run.exited() || time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// vrsRunCell runs one cold start with a fault mid-copy of the big table (or,
+// for a control, the same changes with no fault) and measures the target
+// against the source.
+func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func() *Streamer, a, b string, sharded func(t *testing.T, tables ...string)) vrsCellResult {
 	t.Helper()
 	small, big := a, b
-	switch layout {
+	switch m.layout {
 	case vrsBigFirst:
 		small, big = b, a
 	case vrsBigOnly:
@@ -392,12 +435,41 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a,
 	time.Sleep(3 * time.Second) // the schema tracker
 
 	var res vrsCellResult
-	res.byteTrigger = byteTrigger
+	res.byteTrigger = m.byteTrigger
 	s := mk()
+	cell := twfbCell{tgt: r.tgt(), streamID: s.StreamID}
+
+	// A re-copy cell first establishes the stream: a whole cold start, handed
+	// off to CDC, then stopped.
+	prevPos := ""
+	if m.recopy {
+		first := startTWFBRun(mk())
+		if !vrsAwaitHandoff(t, cell, first, "", 8*time.Minute) {
+			t.Fatalf("RIG: the establishing cold start never handed off (exited=%v err=%v)", first.exited(), first.err)
+		}
+		_ = first.stop(t)
+		prevPos = cell.persistedPosition(t)
+		s.RestartFromScratch = true
+	}
+
 	proxy.down.Store(0)
 	logStart := r.logs.Len()
 	run := startTWFBRun(s)
 	defer func() { _ = run.stop(t) }()
+	if m.recopy {
+		// --restart-from-scratch clears the target first; fault the copy that
+		// follows, not the old target.
+		cleared := time.Now().Add(3 * time.Minute)
+		for {
+			if nb, _ := strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+big)); nb < vrsFaultAtRows {
+				break
+			}
+			if run.exited() || time.Now().After(cleared) {
+				t.Fatalf("RIG: the re-copy never cleared %s (exited=%v err=%v)", big, run.exited(), run.err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 
 	// Wait until a is fully copied and b is mid-copy. On the default path
 	// the target shows it. On the single-stream path it does not: sluice
@@ -412,10 +484,10 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a,
 			vcrLogTail(t, r, logStart)
 			t.Fatalf("RIG: the copy exited or timed out before the fault point (%v)", run.err)
 		}
-		if byteTrigger {
+		if m.byteTrigger {
 			if down := proxy.down.Load(); down >= vrsFaultBytes {
 				res.bAtFault = int(down / vrsWireBytesPerRow)
-				if layout == vrsSmallFirst {
+				if m.layout == vrsSmallFirst {
 					res.bAtFault -= 1000
 				}
 				break
@@ -424,7 +496,7 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a,
 			continue
 		}
 		smallDone := true
-		if layout == vrsSmallFirst {
+		if m.layout == vrsSmallFirst {
 			ns, _ := strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+small))
 			smallDone = ns == 1000
 		}
@@ -442,7 +514,7 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a,
 	front := int64(res.bAtFault)
 
 	var bands []vrsBand
-	switch layout {
+	switch m.layout {
 	case vrsSmallFirst:
 		bands = append(bands, vrsBand{arm: "1-finished", table: small, deleted: vcrRange(1, 1, 20), updated: vcrRange(101, 1, 10)})
 	case vrsBigFirst:
@@ -455,10 +527,11 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a,
 		vrsBand{arm: "2-above", table: big, deleted: vcrRange(vrsAboveBase+1, 1, 20), updated: vcrRange(vrsAboveBase+101, 1, 10)},
 	)
 
-	// The fault, then the changes while the redial is held. A control run
-	// (noFault) makes the same changes at the same point with no fault.
+	// The fault, then the changes while the recovery's connection is held.
+	// A control run (noFault) makes the same changes at the same point with
+	// no fault.
 	faultAt := time.Now()
-	if !noFault {
+	if !m.noFault {
 		proxy.faultAndHold()
 	}
 	db, err := sql.Open("mysql", r.mysqlDSN)
@@ -479,49 +552,59 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a,
 	}
 	_ = db.Close()
 	res.changesTook = time.Since(faultAt)
-	// Wait for the reconnect's redial to arrive, then hold it vrsHold more.
-	for !noFault && proxy.firstHeld().IsZero() {
-		if time.Since(faultAt) > 60*time.Second || run.exited() {
+	// Wait for the recovery's first connection, then hold it vrsHold more.
+	// A run that refuses instead never opens one: it exits.
+	for !m.noFault && proxy.firstHeld().IsZero() && !run.exited() {
+		if time.Since(faultAt) > 60*time.Second {
 			proxy.release()
 			vcrLogTail(t, r, logStart)
-			t.Fatalf("RIG: no reconnect redial within 60s of the fault (exited=%v err=%v)", run.exited(), run.err)
+			t.Fatalf("RIG: the run neither reconnected nor exited within 60s of the fault")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !noFault {
-		res.redialAfter = proxy.firstHeld().Sub(faultAt)
-		time.Sleep(vrsHold)
+	if !m.noFault {
+		if !proxy.firstHeld().IsZero() {
+			res.redialAfter = proxy.firstHeld().Sub(faultAt)
+			time.Sleep(vrsHold)
+		}
 		proxy.release()
 		res.window = time.Since(faultAt)
 	}
 
-	// Hand-off, then a marker in each table written after the changes.
-	cell := twfbCell{tgt: r.tgt(), streamID: s.StreamID}
-	handoff := time.Now().Add(5 * time.Minute)
-	for cell.persistedPosition(t) == "" {
-		if run.exited() || time.Now().After(handoff) {
-			break
+	// Hand-off, then a marker in each table written after the changes. A run
+	// that refused gets its remedy first: --restart-from-scratch, no fault.
+	live := run
+	res.handedOff = vrsAwaitHandoff(t, cell, run, prevPos, 5*time.Minute)
+	if !res.handedOff && run.exited() {
+		res.refusal = run.err
+		if m.recopy {
+			remedy := mk()
+			remedy.RestartFromScratch = true
+			live = startTWFBRun(remedy)
+			defer func() { _ = live.stop(t) }()
+			res.remedied = true
+			res.handedOff = vrsAwaitHandoff(t, cell, live, prevPos, 8*time.Minute)
 		}
-		time.Sleep(250 * time.Millisecond)
 	}
-	res.handedOff = cell.persistedPosition(t) != ""
 	if res.handedOff {
 		for _, tbl := range tables {
 			vcrSeed(t, r.mysqlDSN, tbl, "marker", []int64{9_000_001})
 		}
 		for _, tbl := range tables {
-			if !r.tgt().waitRow(t, tbl, 9_000_001, run, 120*time.Second) {
-				res.note = fmt.Sprintf("%s's marker never reached the target (exited=%v err=%v)", tbl, run.exited(), run.err)
+			if !r.tgt().waitRow(t, tbl, 9_000_001, live, 120*time.Second) {
+				res.note += fmt.Sprintf("%s's marker never reached the target (exited=%v err=%v); ", tbl, live.exited(), live.err)
 			}
 		}
 		time.Sleep(2 * time.Second)
 	} else {
-		res.note = fmt.Sprintf("no CDC hand-off within 5 minutes of the release (exited=%v err=%v); %s on target=%s of %d",
-			run.exited(), run.err, big, r.tgt().scalar(t, "SELECT count(*) FROM "+big), vrsBigRows-40)
+		res.note += fmt.Sprintf("no CDC hand-off (exited=%v err=%v); %s on target=%s of %d; ",
+			live.exited(), live.err, big, r.tgt().scalar(t, "SELECT count(*) FROM "+big), vrsBigRows-40)
 	}
-	res.reconnects = strings.Count(r.logs.String()[logStart:], vrsReconnectLine)
+	logs := r.logs.String()[logStart:]
+	res.reconnects = strings.Count(logs, vrsReconnectLine)
+	res.retries = strings.Count(logs, vrsRetryLine)
 	if dir := os.Getenv("SLUICE_VRS_LOGDIR"); dir != "" {
-		_ = os.WriteFile(filepath.Join(dir, s.StreamID+".log"), []byte(r.logs.String()[logStart:]), 0o600)
+		_ = os.WriteFile(filepath.Join(dir, s.StreamID+".log"), []byte(logs), 0o600)
 	}
 
 	// The verdict, from the source and the target only.
@@ -583,20 +666,21 @@ func vrsRunCell(t *testing.T, r vcrRig, proxy *vrsProxy, mk func() *Streamer, a,
 			t.Logf("  %s: %d source rows missing or different on the target outside the arms, e.g. %v", tbl, len(missing), missing[:min(5, len(missing))])
 		}
 	}
-	if res.reconnects == 0 && !noFault {
+	if res.diverged() || (res.refusal != nil && !m.recopy) {
 		vcrLogTail(t, r, logStart)
 	}
 	return res
 }
 
-// vrsCell runs one mode vrsRuns times and reports per run. A cell whose runs
-// reproduce a divergence fails, or skips (pointing at the item) unless
-// SLUICE_VRS_MEASURE=1 — decided by the measurement recorded in knownStale.
+// vrsCell runs one mode vrsRuns times and holds each run to its contract:
+//
+//   - a control: no retry, and an exact target;
+//   - a faulted first cold start: no in-place reconnect, the fault reached
+//     runWithRetry, the run kept going, and the target is exact;
+//   - a faulted re-copy: the run refused COLD-START-INCOMPLETE, and its
+//     remedy (--restart-from-scratch) left the target exact.
 func vrsCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func(streamID string, include []string) *Streamer, sharded func(t *testing.T, tables ...string)) {
 	t.Helper()
-	if m.knownStale && os.Getenv("SLUICE_VRS_MEASURE") != "1" {
-		t.Skip("reproduces VSTREAM-COPY-RECONNECT-STALE-ROWS (docs/dev/audit-backlog.md); set SLUICE_VRS_MEASURE=1 to measure")
-	}
 	runs := vrsRuns()
 	for i := 1; i <= runs; i++ {
 		a, b := fmt.Sprintf("%s%d_a", m.prefix, i), fmt.Sprintf("%s%d_b", m.prefix, i)
@@ -605,40 +689,41 @@ func vrsCell(t *testing.T, r vcrRig, proxy *vrsProxy, m vrsMode, mk func(streamI
 			include = []string{b}
 		}
 		streamID := fmt.Sprintf("%s%d", m.prefix, i)
-		res := vrsRunCell(t, r, proxy, func() *Streamer { return mk(streamID, include) }, a, b, m.layout, m.byteTrigger, m.noFault, sharded)
+		res := vrsRunCell(t, r, proxy, m, func() *Streamer { return mk(streamID, include) }, a, b, sharded)
 		t.Logf("RUN %d/%d: %s", i, runs, res)
+		if res.reconnects != 0 {
+			t.Errorf("RUN %d: the copy resumed IN PLACE after the fault (%d reconnect WARNs); a mid-copy fault must end the copy (VSTREAM-COPY-RECONNECT-STALE-ROWS)", i, res.reconnects)
+		}
 		switch {
-		case m.noFault && res.reconnects != 0:
-			t.Errorf("RUN %d: RIG: the no-fault control reconnected", i)
-		case !m.noFault && res.reconnects == 0:
-			t.Errorf("RUN %d: RIG: no in-place reconnect was logged, so the run did not measure reconnectCopy", i)
+		case m.noFault:
+			if res.retries != 0 {
+				t.Errorf("RUN %d: RIG: the no-fault control retried (%d)", i, res.retries)
+			}
+		case m.recopy:
+			if res.refusal == nil || !strings.Contains(res.refusal.Error(), vrsColdStartIncomplete) {
+				t.Errorf("RUN %d: a faulted re-copy of an established stream must refuse %s; got refusal=%v", i, vrsColdStartIncomplete, res.refusal)
+			}
+		default:
+			if res.retries == 0 {
+				t.Errorf("RUN %d: RIG: the fault never reached runWithRetry, so the run did not measure its restart", i)
+			}
+			if res.refusal != nil {
+				t.Errorf("RUN %d: a faulted first cold start must restart and finish, not exit: %v", i, res.refusal)
+			}
 		}
 		if res.diverged() {
-			t.Errorf("RUN %d: SILENT DIVERGENCE (stream running, no-fault control=%v): %s", i, m.noFault, res)
+			t.Errorf("RUN %d: SILENT DIVERGENCE (no-fault control=%v, re-copy=%v): %s", i, m.noFault, m.recopy, res)
 		}
 	}
 }
 
 // vrsRuns is how many times each cell runs: SLUICE_VRS_RUNS, default 1 (the
-// weekly leg's budget); the measurement recorded in the item used 3.
+// weekly leg's budget); the measurements recorded in the item used 3.
 func vrsRuns() int {
 	if n, err := strconv.Atoi(os.Getenv("SLUICE_VRS_RUNS")); err == nil && n > 0 {
 		return n
 	}
 	return 1
-}
-
-// vrsMode is one cell's shape.
-type vrsMode struct {
-	prefix string
-	layout vrsLayout
-	// knownStale skips the cell (unless SLUICE_VRS_MEASURE=1): it reproduced
-	// the item in every measured run.
-	knownStale bool
-	// byteTrigger faults on vtgate's sent bytes (the single-stream cells).
-	byteTrigger bool
-	// noFault is the control: the same changes at the same point, no fault.
-	noFault bool
 }
 
 func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
@@ -669,13 +754,21 @@ func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
 			vrsCell(t, r, proxy, vrsMode{prefix: "rd", layout: vrsSmallFirst}, plain(""), nil)
 		})
 		t.Run("FaultInFirstTable", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "rf", layout: vrsBigFirst, knownStale: true}, plain(""), nil)
+			vrsCell(t, r, proxy, vrsMode{prefix: "rf", layout: vrsBigFirst}, plain(""), nil)
 		})
 		t.Run("SingleTableScope", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "ro", layout: vrsBigOnly, knownStale: true}, plain(""), nil)
+			vrsCell(t, r, proxy, vrsMode{prefix: "ro", layout: vrsBigOnly}, plain(""), nil)
 		})
 		t.Run("SingleStream", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "rs", layout: vrsSmallFirst, knownStale: true, byteTrigger: true}, plain(single), nil)
+			vrsCell(t, r, proxy, vrsMode{prefix: "rs", layout: vrsSmallFirst, byteTrigger: true}, plain(single), nil)
+		})
+		// A re-copy refuses in the pipeline, whichever pump faulted; one cell
+		// per pump family (per-table auto-shard, single-stream).
+		t.Run("Recopy/DefaultPath", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "qd", layout: vrsSmallFirst, recopy: true}, plain(""), nil)
+		})
+		t.Run("Recopy/SingleStream", func(t *testing.T) {
+			vrsCell(t, r, proxy, vrsMode{prefix: "qs", layout: vrsSmallFirst, byteTrigger: true, recopy: true}, plain(single), nil)
 		})
 		// Controls: the same changes at the same point with no fault.
 		t.Run("NoFaultControl/FirstTable", func(t *testing.T) {
@@ -718,13 +811,13 @@ func TestStreamer_VStreamCopyReconnectStaleRows(t *testing.T) {
 			vrsCell(t, r, proxy, vrsMode{prefix: "td", layout: vrsSmallFirst}, merged(""), sharded)
 		})
 		t.Run("FaultInFirstTable", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "tf", layout: vrsBigFirst, knownStale: true}, merged(""), sharded)
+			vrsCell(t, r, proxy, vrsMode{prefix: "tf", layout: vrsBigFirst}, merged(""), sharded)
 		})
 		t.Run("SingleTableScope", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "to", layout: vrsBigOnly, knownStale: true}, merged(""), sharded)
+			vrsCell(t, r, proxy, vrsMode{prefix: "to", layout: vrsBigOnly}, merged(""), sharded)
 		})
 		t.Run("SingleStream", func(t *testing.T) {
-			vrsCell(t, r, proxy, vrsMode{prefix: "ts", layout: vrsSmallFirst, knownStale: true, byteTrigger: true}, merged(single), sharded)
+			vrsCell(t, r, proxy, vrsMode{prefix: "ts", layout: vrsSmallFirst, byteTrigger: true}, merged(single), sharded)
 		})
 	})
 }

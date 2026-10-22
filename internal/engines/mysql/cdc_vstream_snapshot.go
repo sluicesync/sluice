@@ -119,8 +119,7 @@ func vstreamCopyFilterRules(tables []string, filters map[string]string) []*binlo
 // a non-nil []shardGtid carrying Vitess's per-shard TablePKs cursor it
 // seeds the COPY to RESUME from that cursor (the process-restart
 // interrupted-cold-start path, v0.99.8). Seeding from a cursor makes
-// vtgate continue the COPY scan from the last-copied PK — the SAME
-// machinery the in-place [reconnectCopy] uses — so the resumed COPY rows
+// vtgate continue the COPY scan from the last-copied PK, so the resumed COPY rows
 // flow through the bulk [copyPump]/ReadRows path (batched bulk-COPY
 // writer) rather than the per-row CDC apply path the plain CDC reader
 // would use. On COPY completion it transitions to CDC exactly as a fresh
@@ -152,8 +151,8 @@ func vstreamCopyFilterRules(tables []string, filters map[string]string) []*binlo
 // every table in the keyspace; a non-empty allowlist makes vtgate's COPY
 // scan only those tables so a large unrelated table in the same keyspace
 // is never streamed/buffered (the ADR-0071 multi-table-interleaving
-// overflow). The scope is captured on the stream (copyTables) so an
-// in-place [reconnectCopy] re-applies it.
+// overflow). The scope is captured on the stream (copyTables) so the
+// reshard reopen ([openReshardCDCStream]) re-applies it.
 //
 // rowFilters (ADR-0174 Piece 2) maps SOURCE table name to a native-SQL
 // `--where` predicate; it is captured on the stream (rowFilters) and woven
@@ -365,46 +364,43 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		}
 	}
 
-	// copyTables is the scope the in-place reconnect re-applies: in
-	// auto-shard mode that is the currently-open single table; otherwise
-	// the full scope.
-	reconnectScope := tables
+	// copyTables is the scope of the stream just opened: in auto-shard
+	// mode that is the currently-open single table; otherwise the full
+	// scope.
+	openScope := tables
 	var seq []string
 	if autoShard {
-		reconnectScope = []string{tables[0]}
+		openScope = []string{tables[0]}
 		seq = tables
 		logAutoShardCopyMode(ctx, keyspace, tables, concurrent, resumeSeedTable, concurrentGroups)
 	}
 
 	snap := &vstreamSnapshotStream{
-		keyspace:             keyspace,
-		zeroDate:             zeroDate,
-		client:               client,
-		shards:               shards,
-		rowFilters:           rowFilters,
-		copyTables:           reconnectScope,
-		copyTablesSeq:        seq,
-		concurrentCopy:       concurrent,
-		concurrentGroups:     concurrentGroups,
-		resumeSeed:           resumeSeed,
-		resumeSeedTable:      resumeSeedTable,
-		tableCopyComplete:    make(map[string]bool),
-		reconnectMax:         defaultCopyReconnectMax,
-		reconnectBackoffBase: defaultCopyReconnectBackoffBase,
-		reconnectBackoffCap:  defaultCopyReconnectBackoffCap,
-		fields:               make(map[string][]*query.Field),
-		rowBuffer:            make(map[string][]ir.Row),
-		copyCompletedShards:  make(map[string]bool),
-		maxBufferBytes:       defaultSnapshotMaxBufferBytes,
-		checkpointRows:       defaultCopyCheckpointRows,
-		checkpointInterval:   defaultCopyCheckpointInterval,
-		livenessWindow:       tuning.livenessWindow,
-		progressWindow:       tuning.progressWindow,
-		copyProgressWindow:   tuning.copyProgressWindow,
-		idleWarnWindow:       tuning.idleWarnWindow,
-		conn:                 conn,
-		grpcStream:           grpcStream,
-		grpcCancel:           streamCancel,
+		keyspace:            keyspace,
+		zeroDate:            zeroDate,
+		client:              client,
+		shards:              shards,
+		rowFilters:          rowFilters,
+		copyTables:          openScope,
+		copyTablesSeq:       seq,
+		concurrentCopy:      concurrent,
+		concurrentGroups:    concurrentGroups,
+		resumeSeed:          resumeSeed,
+		resumeSeedTable:     resumeSeedTable,
+		tableCopyComplete:   make(map[string]bool),
+		fields:              make(map[string][]*query.Field),
+		rowBuffer:           make(map[string][]ir.Row),
+		copyCompletedShards: make(map[string]bool),
+		maxBufferBytes:      defaultSnapshotMaxBufferBytes,
+		checkpointRows:      defaultCopyCheckpointRows,
+		checkpointInterval:  defaultCopyCheckpointInterval,
+		livenessWindow:      tuning.livenessWindow,
+		progressWindow:      tuning.progressWindow,
+		copyProgressWindow:  tuning.copyProgressWindow,
+		idleWarnWindow:      tuning.idleWarnWindow,
+		conn:                conn,
+		grpcStream:          grpcStream,
+		grpcCancel:          streamCancel,
 	}
 	snap.cond = sync.NewCond(&snap.mu)
 
@@ -619,7 +615,7 @@ type vstreamSnapshotStream struct {
 	// → native-SQL predicate. Captured at open (it must be known before the
 	// first stream's COPY filter rules are sent to vtgate) and woven into
 	// EVERY subsequent filter-rule build — the per-table auto-shard reopens,
-	// the in-place reconnect, the reshard reopen, and the auto-shard CDC
+	// the reshard reopen, and the auto-shard CDC
 	// handoff — via [vstreamCopyFilterRules], so the server-side WHERE is
 	// applied uniformly across the COPY and the streaming phase. Nil (the
 	// default) leaves every rule unfiltered. Read-only after construction.
@@ -627,17 +623,16 @@ type vstreamSnapshotStream struct {
 
 	// copyTables is the COPY filter scope captured at open: empty means
 	// keyspace-wide (every table), non-empty restricts the COPY to those
-	// unqualified table names (vstreamCopyFilterRules). Held so an
-	// in-place [reconnectCopy] re-applies the SAME scope — otherwise a
-	// reconnect would silently widen the COPY back to the whole keyspace
-	// and start streaming the large unrelated table the original scope
-	// excluded (the ADR-0071 overflow this feature avoids).
+	// unqualified table names (vstreamCopyFilterRules). Held so the
+	// reshard reopen ([openReshardCDCStream]) re-applies the SAME scope —
+	// otherwise it would silently widen the stream back to the whole
+	// keyspace and start streaming the large unrelated table the original
+	// scope excluded (the ADR-0071 overflow this feature avoids).
 	//
 	// In auto-shard-by-table mode (ADR-0095, copyTablesSeq non-empty)
 	// copyTables is the SINGLE table the currently-open per-table COPY
-	// stream is scoped to (so [reconnectCopy] re-applies that one table's
-	// scope on an in-place reconnect). The pump rewrites it as it advances
-	// from table to table.
+	// stream is scoped to. The pump rewrites it as it advances from table
+	// to table.
 	copyTables []string
 
 	// copyTablesSeq is the auto-shard-by-table COPY iteration order
@@ -739,15 +734,6 @@ type vstreamSnapshotStream struct {
 	// once at construction; read-only thereafter (surfaced via
 	// [vstreamSnapshotRows.ConcurrentCopyGroups]).
 	concurrentGroups [][]string
-
-	// reconnectMax is the in-place COPY-reconnect budget (Phase C):
-	// consecutive retriable Recv failures the pump absorbs before giving
-	// up and failing the COPY (the outer runWithRetry then becomes the
-	// backstop). reconnectBackoffBase/Cap bound the exponential backoff
-	// between attempts. Seeded with safe defaults by the constructor.
-	reconnectMax         int
-	reconnectBackoffBase time.Duration
-	reconnectBackoffCap  time.Duration
 
 	// livenessWindow is the Phase-1 watchdog window for both pumps (COPY
 	// and post-COPY CDC): how long to wait for the FIRST NON-HEARTBEAT
@@ -1014,8 +1000,8 @@ type vstreamSnapshotStream struct {
 	// copyPumpAutoShard / copyPumpAutoShardConcurrent), and on the concurrent
 	// path the per-stream sub-goroutines plus the ctx-cancel waker. Without
 	// the join, close() cancelled the gRPC context and closed+niled s.conn
-	// while a straggling pump could still Recv on the stream or reconnectCopy
-	// re-open on the shared client — a use-after-close on s.conn the -race
+	// while a straggling pump could still Recv on the stream or open its next
+	// table's stream on the shared client — a use-after-close on s.conn the -race
 	// Integration gate grades (2026-08-08 sibling sweep; the COPY-phase
 	// analogue of vstreamCDCReader.pumpDone/startPump/joinPump). Every launch
 	// goes through [goPump]; close() waits via [joinPumps]. The post-COPY CDC
@@ -1069,18 +1055,28 @@ const (
 	defaultCopyCheckpointInterval = 10 * time.Second
 )
 
-// defaultCopyReconnect* tune the in-place COPY-reconnect (ADR-0072
-// Phase C): on a retriable Recv error the COPY pump re-opens the VStream
-// from the last-observed cursor up to defaultCopyReconnectMax times,
-// with exponential backoff bounded by base/cap, before surfacing the
-// error to the outer runWithRetry backstop. The budget is generous
-// because each in-place reconnect is cheap (no pipeline teardown) and
-// the reported failure mode is sustained link flakiness on a large copy.
-const (
-	defaultCopyReconnectMax         = 10
-	defaultCopyReconnectBackoffBase = 200 * time.Millisecond
-	defaultCopyReconnectBackoffCap  = 10 * time.Second
-)
+// A Recv error during COPY ends the copy: none of the three COPY pumps
+// ([copyPump], [pumpOneTableCopy], [copyStream.pumpTable]) re-opens the
+// VStream in place (VSTREAM-COPY-RECONNECT-STALE-ROWS; the ADR-0072
+// Phase C reconnect is WITHDRAWN). A re-open from the last VGTID and its
+// TablePKs makes vtgate replay the source's changes since that position
+// as catch-up ROW events INSIDE the copy phase, and then copy the rest
+// under a new snapshot. [bufferCopyRow] keeps only after images, so every
+// catch-up DELETE was dropped, and the CDC tail then resumed from a
+// position past it: each row deleted on the source during the reconnect
+// window stayed on the target, at exit 0. The single-stream path also
+// copied every finished table again from its first row. Measured on
+// vttestserver (TestStreamer_VStreamCopyReconnectStaleRows): 20 of 20
+// window deletes stale per arm.
+//
+// So the error is classified ([classifyReaderError]) and recorded with
+// failCopy, and a retriable one reaches the Streamer's runWithRetry. On a
+// first cold start that restarts the cold start from scratch, clearing
+// the in-scope target tables before copying again (ADR-0109 §B); a
+// re-copy of an existing stream refuses COLD-START-INCOMPLETE instead.
+// Both were measured exact or loud through the same fault rig. The cost
+// is a full re-copy per mid-copy fault, which is the price of a copy the
+// target can be trusted to match.
 
 // copyPump is the background COPY-phase goroutine (ADR-0071). It Recv's
 // the gRPC stream and dispatches each VEvent until the global
@@ -1135,13 +1131,6 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 	// so it needs no lock.
 	lastCheckpoint := time.Now()
 
-	// reconnectAttempts counts consecutive in-place reconnects (Phase C)
-	// since the last successful Recv. Reset to 0 on any successful Recv so
-	// a copy that survives one blip gets the full budget again for the
-	// next; exhausting it surfaces the error to the outer runWithRetry
-	// backstop. Owned by this goroutine.
-	reconnectAttempts := 0
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -1155,24 +1144,9 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 				s.failCopy(err)
 				return
 			}
-			classified := classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv: %w", err))
-			// Phase C: a retriable mid-COPY Recv error reconnects the
-			// VStream IN PLACE from the last-observed cursor (currentVgtid,
-			// carrying TablePKs) rather than failing the whole cold-start.
-			// In-place reconnect keeps the bulk-copy goroutines warm and
-			// skips schema-apply / pre-flight; runWithRetry stays the outer
-			// backstop for budget exhaustion or non-retriable shapes.
-			var re ir.RetriableError
-			if errors.As(classified, &re) && reconnectAttempts < s.reconnectMax {
-				reconnectAttempts++
-				if rerr := s.reconnectCopy(ctx, reconnectAttempts); rerr != nil {
-					s.failCopy(rerr)
-					return
-				}
-				// Fresh stream installed; loop and Recv from it.
-				continue
-			}
-			s.failCopy(classified)
+			// No in-place reconnect: see VSTREAM-COPY-RECONNECT-STALE-ROWS
+			// above [copyPump].
+			s.failCopy(classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv: %w", err)))
 			return
 		}
 		// Feed the watchdog: a non-heartbeat event clears Phase 1 (serving
@@ -1181,21 +1155,7 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 		if evs := resp.GetEvents(); len(evs) > 0 {
 			live.observe(eventsProveLiveness(evs))
 		}
-		// Reset the in-place reconnect budget only on actual COPY PROGRESS (a
-		// ROW buffered), NOT on any received event. Otherwise a reconnect that
-		// re-establishes the stream but then yields only non-progress events —
-		// heartbeats, or a stale VGTID when the cursor is unresumable after a
-		// tablet death + reparent — resets reconnectAttempts every cycle, so
-		// the reconnect loop churns forever: it never exhausts reconnectMax and
-		// never fails loud (the mid-COPY tablet-kill finding). Gating the reset
-		// on a copied row means an unproductive reconnect loop burns its budget
-		// and surfaces a LOUD failCopy (~reconnectMax × backoff), which the
-		// pipeline's retry can then act on.
-		copiedRow := false
 		for _, ev := range resp.GetEvents() {
-			if ev.GetType() == binlogdata.VEventType_ROW {
-				copiedRow = true
-			}
 			done, err := s.dispatchCopyEvent(ev)
 			if err != nil {
 				s.failCopy(err)
@@ -1205,9 +1165,6 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 				s.finishCopy(stream)
 				return
 			}
-		}
-		if copiedRow {
-			reconnectAttempts = 0
 		}
 		// Bounded-cadence COPY checkpoint (ADR-0072 Phase B), between
 		// Recv batches so the DB write never holds the dispatch lock. A
@@ -1400,8 +1357,9 @@ func (s *vstreamSnapshotStream) copyPumpAutoShard(ctx context.Context, cancel co
 // pumpOneTableCopy Recv-drives the currently-open single-table COPY
 // stream until its (global) COPY_COMPLETED, returning that table's
 // snapshot VGTID (a copy of s.currentVgtid at completion). It reuses the
-// single-stream pump's liveness watchdog, in-place reconnect, and
-// bounded-cadence checkpoint verbatim — only the terminal action differs
+// single-stream pump's liveness watchdog, Recv-error handling (no in-place
+// reconnect, VSTREAM-COPY-RECONNECT-STALE-ROWS), and bounded-cadence
+// checkpoint verbatim — only the terminal action differs
 // (return the snapshot instead of finishing the whole copy). table is the
 // unqualified name, used only for log/error context.
 //
@@ -1424,7 +1382,6 @@ func (s *vstreamSnapshotStream) pumpOneTableCopy(ctx context.Context, cancel con
 	defer live.stop()
 
 	lastCheckpoint := time.Now()
-	reconnectAttempts := 0
 
 	for {
 		select {
@@ -1437,25 +1394,12 @@ func (s *vstreamSnapshotStream) pumpOneTableCopy(ctx context.Context, cancel con
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, err
 			}
-			classified := classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv (table %q): %w", table, err))
-			var re ir.RetriableError
-			if errors.As(classified, &re) && reconnectAttempts < s.reconnectMax {
-				reconnectAttempts++
-				if rerr := s.reconnectCopy(ctx, reconnectAttempts); rerr != nil {
-					return nil, rerr
-				}
-				continue
-			}
-			return nil, classified
+			return nil, classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv (table %q): %w", table, err))
 		}
 		if evs := resp.GetEvents(); len(evs) > 0 {
 			live.observe(eventsProveLiveness(evs))
 		}
-		copiedRow := false
 		for _, ev := range resp.GetEvents() {
-			if ev.GetType() == binlogdata.VEventType_ROW {
-				copiedRow = true
-			}
 			done, derr := s.dispatchCopyEvent(ev)
 			if derr != nil {
 				return nil, derr
@@ -1480,20 +1424,15 @@ func (s *vstreamSnapshotStream) pumpOneTableCopy(ctx context.Context, cancel con
 				return snap, nil
 			}
 		}
-		if copiedRow {
-			reconnectAttempts = 0
-		}
 		lastCheckpoint = s.maybeCheckpoint(ctx, lastCheckpoint)
 	}
 }
 
 // reopenForTable closes the current per-table COPY stream and opens a
 // fresh one scoped to the next table (auto-shard, ADR-0095). The gRPC
-// CONNECTION is reused; only the stream is replaced — the same in-place
-// pattern [reconnectCopy] uses, but seeded from-beginning for the new
-// table (each single-table COPY is independent) rather than from a resume
-// cursor. copyTables is rewritten to the new single table so a subsequent
-// [reconnectCopy] re-applies the correct (one-table) scope.
+// CONNECTION is reused; only the stream is replaced, seeded from-beginning
+// for the new table (each single-table COPY is independent). copyTables is
+// rewritten to the new single table.
 func (s *vstreamSnapshotStream) reopenForTable(ctx context.Context, table string) error {
 	return s.reopenForTableSeeded(ctx, table, nil)
 }
@@ -1583,83 +1522,6 @@ func (s *vstreamSnapshotStream) finishCopyAutoShard(stream *ir.SnapshotStream) {
 	}
 	s.copyComplete = true
 	s.broadcast()
-}
-
-// reconnectCopy re-opens the VStream IN PLACE after a retriable mid-COPY
-// Recv error (ADR-0072 Phase C), resuming from the last-observed cursor
-// (currentVgtid, carrying TablePKs) so vtgate continues the COPY scan
-// from the last-copied PK rather than restarting from row 0. The
-// underlying gRPC conn is reused; only the stream is replaced.
-//
-// The resume request carries each shard's Gtid AND TablePKs as observed
-// so far. When no VGTID has been seen yet (a fault before the first
-// LASTPK), currentVgtid is empty and we fall back to the from-beginning
-// sentinel — i.e. restart the COPY, which is the only correct option
-// when there's no cursor to resume from.
-//
-// Backoff is exponential, bounded by reconnectBackoffBase/Cap, and
-// interruptible by ctx (CloseFn cancels the stream ctx; a parked
-// reconnect must unwedge). attempt is 1-based for the backoff scaling
-// and the log line.
-//
-// The new stream is installed on s.grpcStream under mu — the field is
-// read by this same pump goroutine (the only Recv caller during COPY),
-// but ReadRows/close may observe it, so the write is guarded.
-func (s *vstreamSnapshotStream) reconnectCopy(ctx context.Context, attempt int) error {
-	// Backoff before re-dialing. Exponential on the attempt count,
-	// capped. Interruptible so close() during a flaky window doesn't hang.
-	backoff := s.reconnectBackoffBase << (attempt - 1)
-	if backoff <= 0 || backoff > s.reconnectBackoffCap {
-		backoff = s.reconnectBackoffCap
-	}
-	select {
-	case <-time.After(backoff):
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Snapshot the resume cursor under mu (the pump is the sole writer of
-	// currentVgtid, but reading it under the same lock keeps the contract
-	// uniform).
-	s.mu.Lock()
-	resume := make([]shardGtid, len(s.currentVgtid))
-	copy(resume, s.currentVgtid)
-	s.mu.Unlock()
-
-	if len(resume) == 0 {
-		// No cursor observed yet — the only correct resume is a full
-		// restart from the beginning of the configured shard layout.
-		resume = fromBeginningVStreamPos(s.keyspace, s.shards)
-	}
-
-	protoShardGtids, err := toProtoShardGtids(resume)
-	if err != nil {
-		return fmt.Errorf("mysql/vstream: snapshot: copy reconnect: build resume position: %w", err)
-	}
-	req := &vtgate.VStreamRequest{
-		TabletType: topodata.TabletType_PRIMARY,
-		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables, s.rowFilters)},
-		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
-			StopOnReshard:     true,
-			HeartbeatInterval: 5,
-		},
-	}
-
-	slog.WarnContext(ctx, "mysql/vstream: snapshot: COPY stream dropped; reconnecting in place from cursor",
-		slog.Int("attempt", attempt),
-		slog.Int("max_attempts", s.reconnectMax),
-		slog.Duration("backoff", backoff))
-
-	grpcStream, err := s.client.VStream(ctx, req)
-	if err != nil {
-		return fmt.Errorf("mysql/vstream: snapshot: copy reconnect: open stream: %w", err)
-	}
-	s.mu.Lock()
-	s.grpcStream = grpcStream
-	s.mu.Unlock()
-	return nil
 }
 
 // reopenAfterReshard rebuilds the post-COPY CDC stream against the new
@@ -2394,15 +2256,15 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 			HeartbeatInterval: 5,
 		},
 	}
-	// Fresh Background-derived streamCtx + cancel (like the COPY streams and
-	// reconnectCopy), stored as s.grpcCancel — so the liveness watchdog's
+	// Fresh Background-derived streamCtx + cancel (like the COPY streams),
+	// stored as s.grpcCancel — so the liveness watchdog's
 	// cancelGRPCStream and CloseFn actually cancel THIS CDC tail. Binding the
 	// tail to the caller's ctx while leaving s.grpcCancel pointed at the finished
 	// COPY stream was the audit-2026-08-19 wedge: a fired watchdog cancelled the
 	// dead COPY context and the tail's Recv parked forever, freezing the sync on
-	// the default auto-shard cold-start after a tablet failover. The three other
-	// stream-open sites (Open, reconnectCopy) keep this convention; this one had
-	// skipped it.
+	// the default auto-shard cold-start after a tablet failover. The other
+	// stream-open sites (Open, the reshard reopen) keep this convention; this
+	// one had skipped it.
 	streamCtx, streamCancel := context.WithCancel(context.Background())
 	grpcStream, err := s.client.VStream(streamCtx, req)
 	if err != nil {
@@ -3054,12 +2916,12 @@ func (s *vstreamSnapshotStream) cancelCopyForShutdown() {
 // counterpart of vstreamCDCReader.Close's pump join. Cancelling the gRPC
 // context alone was not enough: cancellation is asynchronous, so a close()
 // that closed+niled s.conn could race a straggling COPY pump still Recv'ing
-// on the stream or reconnectCopy re-opening on the shared client — a
+// on the stream or opening its next table's stream on the shared client — a
 // use-after-close the -race Integration gate grades.
 //
 // Ordering matters and each step covers a distinct park:
-//  1. cancel() cancels streamCtx — unblocks a pump parked in Recv, in a
-//     select on ctx.Done, or in reconnectCopy's interruptible backoff.
+//  1. cancel() cancels streamCtx — unblocks a pump parked in Recv or
+//     in a select on ctx.Done.
 //  2. cancelCopyForShutdown() flips the terminal state — unblocks a pump
 //     parked in enqueue-backpressure cond.Wait, which ctx-cancel can't see.
 //  3. joinPumps() waits for every COPY goroutine to exit. NOT under mu (the
