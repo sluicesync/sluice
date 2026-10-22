@@ -130,10 +130,10 @@ const defaultVStreamIdleWarnWindow = 30 * time.Second
 // warmup with generous margin, rather than risk a false LOUD failure that
 // aborts a healthy cold-start. 10 min ≈ 4× the measured ~2.5 min warmup.
 //
-// The COPY pump also has its own in-place reconnect machinery
-// (reconnectCopy, ADR-0072 Phase C) for retriable Recv errors; this
-// watchdog is the backstop for the SILENT case where Recv neither errors
-// nor returns — the same failover-wedge class the CDC tail's Phase 2
+// A Recv error ends the COPY (it has no in-place reconnect,
+// VSTREAM-COPY-RECONNECT-STALE-ROWS; the Streamer's retry restarts the
+// cold start); this watchdog is the backstop for the SILENT case where
+// Recv neither errors nor returns — the same failover-wedge class the CDC tail's Phase 2
 // guards, but with the COPY warmup tolerance baked in.
 //
 // Overridable per-DSN via vstream_copy_progress_timeout (a Go duration

@@ -23,8 +23,8 @@ import (
 // driver opens K per-table streams from K goroutines in NON-deterministic
 // order, so the fake must serve a scripted stream keyed by the Match TABLE
 // in the request filter. A keyspace-wide "/.*/" request (the CDC handoff)
-// serves the "" key. Each per-table key may be requested more than once (a
-// reconnect); the fake serves the same script each time.
+// serves the "" key. Each per-table key may be requested more than once (the
+// CDC handoff); the fake serves the same script each time.
 type tableKeyedVitessClient struct {
 	vtgateservice.VitessClient
 
@@ -101,9 +101,6 @@ func newConcurrentHarness(t *testing.T, tables []string, k int, byTable map[stri
 	s.copyTablesSeq = tables
 	s.copyTables = []string{tables[0]}
 	s.tableCopyComplete = make(map[string]bool)
-	s.reconnectMax = defaultCopyReconnectMax
-	s.reconnectBackoffBase = defaultCopyReconnectBackoffBase
-	s.reconnectBackoffCap = defaultCopyReconnectBackoffCap
 	s.copyDone = make(chan struct{})
 
 	groups := partitionTablesForStreams(tables, k, nil)
@@ -455,9 +452,6 @@ func TestVStreamConcurrent_ResumeSeedLandsInRightStream(t *testing.T) {
 	s.copyTablesSeq = tables
 	s.copyTables = []string{tables[0]}
 	s.tableCopyComplete = make(map[string]bool)
-	s.reconnectMax = defaultCopyReconnectMax
-	s.reconnectBackoffBase = defaultCopyReconnectBackoffBase
-	s.reconnectBackoffCap = defaultCopyReconnectBackoffCap
 	s.copyDone = make(chan struct{})
 	// ADR-0098 resume seed for the in-progress table.
 	s.resumeSeedTable = resumeTable
@@ -764,9 +758,6 @@ func TestVStreamConcurrent_MultiShardSetMinAcrossStreams(t *testing.T) {
 	s.copyTablesSeq = tables
 	s.copyTables = []string{tables[0]}
 	s.tableCopyComplete = make(map[string]bool)
-	s.reconnectMax = defaultCopyReconnectMax
-	s.reconnectBackoffBase = defaultCopyReconnectBackoffBase
-	s.reconnectBackoffCap = defaultCopyReconnectBackoffCap
 	s.copyDone = make(chan struct{})
 
 	groups := partitionTablesForStreams(tables, k, nil)
@@ -860,9 +851,6 @@ func TestVStreamConcurrent_ResumeSeedTableNotGroupFirst(t *testing.T) {
 	s.copyTablesSeq = tables
 	s.copyTables = []string{tables[0]}
 	s.tableCopyComplete = make(map[string]bool)
-	s.reconnectMax = defaultCopyReconnectMax
-	s.reconnectBackoffBase = defaultCopyReconnectBackoffBase
-	s.reconnectBackoffCap = defaultCopyReconnectBackoffCap
 	s.copyDone = make(chan struct{})
 	s.resumeSeedTable = resumeTable
 	s.resumeSeed = resumeCursorPos(t, resumeTable, 9000)

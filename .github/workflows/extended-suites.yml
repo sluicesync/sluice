@@ -313,7 +313,7 @@ jobs:
     name: Pipeline vstream suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 104
+    timeout-minutes: 119
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
       # The -run alternation, defined ONCE so the budget guard below and
@@ -357,6 +357,11 @@ jobs:
       # ~7m locally) — 98m/104m. The pin had already DRIFTED: 28 tests
       # matched on main before this one (three joined without a bump, and
       # their cost is NOT re-derived here), so the count is 29.
+      # Re-derived 2026-10-22 (VSTREAM-COPY-RECONNECT-STALE-ROWS fixed): the
+      # same test, no new test, so still 29; its cells are all unskipped
+      # now (13: eight faulted, two of them re-copies that run a cold start
+      # three times, plus three controls; 21.7m locally, was ~7m) — +15m,
+      # 113m/119m.
       VSTREAM_PIPELINE_EXPECTED_TESTS: "29"
     steps:
       - uses: actions/checkout@v7
@@ -402,7 +407,7 @@ jobs:
       - name: Run the pipeline vstream tests
         run: |
           set -o pipefail
-          go test -tags='integration vstream' -race -count=1 -timeout=98m \
+          go test -tags='integration vstream' -race -count=1 -timeout=113m \
             -run "$VSTREAM_PIPELINE_RUN" -v ./internal/pipeline/ 2>&1 | tee vstream-pipeline.out
           # Second half of the TEST-9 guard, mirroring the filtered-tag-
           # gate's per-test PASS assert: every matched test must have

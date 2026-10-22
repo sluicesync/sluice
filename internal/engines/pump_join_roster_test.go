@@ -112,7 +112,7 @@ var pumpJoinRoster = map[string]pumpJoinEntry{
 	"mysql.vstreamSnapshotStream": {
 		joinsItsGoroutine,
 		"copyWG via goPump/joinPumps, joined in close() AFTER cancel()+cancelCopyForShutdown() and BEFORE " +
-			"s.conn is closed — so no COPY pump can Recv on the stream or reconnectCopy re-open on the client " +
+			"s.conn is closed — so no COPY pump can Recv on the stream or open its next table's stream on the client " +
 			"after the conn is torn down. cancelCopyForShutdown flips the terminal state (err+copyComplete) so " +
 			"a pump parked in enqueue-backpressure cond.Wait (which ctx-cancel can't reach) wakes and returns " +
 			"instead of re-parking, which is what makes the join deadlock-free. Covers the top-level pump (one " +

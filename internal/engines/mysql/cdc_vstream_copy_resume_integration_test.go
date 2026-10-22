@@ -637,8 +637,9 @@ forward:
 
 // TestVStream_CopyResume_ProcessRestart_ResumesViaBulkPath is the
 // v0.99.8 SILENT-DEGRADE pin (the gap the original ADR-0072 coverage
-// missed). It is DISTINCT from both the in-place reconnect test
-// (transient drop DURING an active stream, via reconnectCopy) and the
+// missed). It is DISTINCT from both the in-place reconnect test (transient
+// drop DURING an active stream; that reconnect is withdrawn,
+// VSTREAM-COPY-RECONNECT-STALE-ROWS) and the
 // CDC-reader checkpoint-resume test above (which resumes via the plain
 // OpenCDCReader → per-row apply path): here the stream is fully TORN
 // DOWN and a process restart resumes the bulk COPY through the NEW
