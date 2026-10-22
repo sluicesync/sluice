@@ -345,6 +345,21 @@ func TestVStreamCopyDoor_FilteredTableNotProbed(t *testing.T) {
 	}
 }
 
+// TestVStreamCopyDoor_FilteredTableDoesNotMaskALostCopy: a filtered emptied
+// table answers "unproven", but an unfiltered emptied table whose source
+// still holds rows is a lost copy, and that contradiction must win — the flag
+// is refused rather than let through on the filtered table's softer answer.
+func TestVStreamCopyDoor_FilteredTableDoesNotMaskALostCopy(t *testing.T) {
+	ctx := context.Background()
+	tgt := proofTargetWith(header(ir.MigrationPhaseComplete, "t1_small", "t2_big"))
+	tgt.empty = map[string]bool{"t1_small": true, "t2_big": true}
+	s := vstreamDoorStreamer(t, tgt) // the source probe finds rows in every table it reads
+	s.RowFilters = map[string]string{"t1_small": "region = 'EU'"}
+	s.AssertCopyFinished = true
+	_, err := s.phaseRefuseUnprovenVStreamCopy(ctx, anchoredAfter(), "st", cursorless)
+	requireContradicted(t, err, "while the source table holds rows")
+}
+
 func TestVStreamCopyDoor_DrainedTable(t *testing.T) {
 	ctx := context.Background()
 	t.Run("empty on source and target: passes, records the table", func(t *testing.T) {
