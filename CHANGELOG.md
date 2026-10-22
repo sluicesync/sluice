@@ -4,6 +4,8 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+## [0.163.5] - 2026-10-22
+
 ### Fixed
 
 - **`sync start --force-cold-start` help no longer says a populated target always collides on PRIMARY KEY (FORCE-COLD-START-HELP-STALE).** On a source that copies by upsert (PlanetScale, Vitess) it collides on nothing and keeps every target row the source has since deleted, silently; v0.163.3 corrected the refusal's hint and the error-code row but not the flag's own help. The help now states both cases and points at `--restart-from-scratch`. `sluice migrate --force-cold-start` is unchanged and correct: `migrate` copies by INSERT from every source.
