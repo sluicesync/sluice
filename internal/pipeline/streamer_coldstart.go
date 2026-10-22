@@ -1020,8 +1020,14 @@ func (s *Streamer) coldStartGatePreflight(ctx context.Context, schema *ir.Schema
 		// --restart-from-scratch asks for a clear this branch cannot do
 		// (RESTART-FROM-SCRATCH-TARGET-NOT-CLEARED): refuse on an upsert
 		// reader while the target holds rows, before anything is written.
-		if fresh.clearsTarget() && copyReaderIsIdempotent(stream.Rows) {
-			if err := refuseUnclearedRestart(ctx, schema, rw); err != nil {
+		// A copy restarted by runWithRetry after a fault it could not place
+		// past the cold copy (coldCopyFaultRetried) is the same request
+		// whether or not the retry latched RestartFromScratch: when the
+		// target's position read failed, D0-4 leaves the latch off and this
+		// attempt arrives as a plain cold start onto the partial copy
+		// (SAA-COLD-COPY-RETRY-UNCLEARED).
+		if (fresh.clearsTarget() || s.coldCopyFaultRetried) && copyReaderIsIdempotent(stream.Rows) {
+			if err := refuseUnclearedRestart(ctx, schema, rw, s.coldCopyFaultRetried); err != nil {
 				migcore.CloseIf(rw)
 				migcore.CloseIf(sw)
 				_ = stream.Abandon()

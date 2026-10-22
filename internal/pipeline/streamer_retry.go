@@ -155,6 +155,7 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 	// re-snapshot has already fired this Run, so the recovery is bounded
 	// to one (a second consecutive ErrPositionInvalid is terminal).
 	resnapshotted := false
+	s.coldCopyFaultRetried = false
 	// D0-4 (audit 2026-07-23): whether any SUCCESSFUL position read this
 	// Run found the cdc-state anchor row. A FAILED read (target down —
 	// both engines return found=false on error) proves nothing about the
@@ -207,6 +208,7 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 				return rerr
 			}
 			resnapshotted = true
+			s.coldCopyFaultRetried = false // a re-snapshot of a stream that reached CDC, not a copy fault
 			continue
 		}
 		// Bug 57 fix (v0.52.2): check the retriable wrapper BEFORE the
@@ -335,15 +337,24 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 			// re-runs this discriminator with real evidence.
 			if anchorSeen {
 				s.RestartFromScratch = false
+				s.coldCopyFaultRetried = false
+			} else {
+				// Possibly mid-copy, latch untouched: the next attempt may
+				// take a plain cold start onto a partial copy, which the
+				// --schema-already-applied gate must refuse unless empty
+				// (SAA-COLD-COPY-RETRY-UNCLEARED).
+				s.coldCopyFaultRetried = true
 			}
 		case afterFound:
 			// CDC phase: warm-resume from the durable position on the next
 			// attempt; do not force a re-copy.
 			s.RestartFromScratch = false
+			s.coldCopyFaultRetried = false
 		default:
 			// Cold-copy phase (PROVEN by a successful read finding no
 			// cdc-state row): force a clean re-establishment of the copy.
 			s.RestartFromScratch = true
+			s.coldCopyFaultRetried = true
 		}
 		// Loose end 2b: a VStream Phase-2 "established then went idle"
 		// progress timeout (mysql.vstreamProgressTimeoutError, carrying
@@ -438,6 +449,7 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 					return rerr
 				}
 				resnapshotted = true
+				s.coldCopyFaultRetried = false
 				consecutive = 0
 				continue
 			}

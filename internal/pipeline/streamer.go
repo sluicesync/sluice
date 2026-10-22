@@ -1486,6 +1486,15 @@ type Streamer struct {
 	// the retry/recovery loop without booting a full pipeline.
 	runOnceFn func(context.Context) error
 
+	// coldCopyFaultRetried reports that this Run's runWithRetry retried a
+	// failure it could not place after the cold copy: no cdc-state row was
+	// found, or the read failed with no anchor ever seen (D0-4). The target
+	// may then hold a partial copy that the next attempt must not upsert
+	// over, which matters under --schema-already-applied, where the restart
+	// cannot clear the tables ([refuseUnclearedRestart]). Set and cleared by
+	// runWithRetry only; the zero value (no such retry) is the CLI default.
+	coldCopyFaultRetried bool
+
 	// aimdResumeSize carries the AIMD controller's shrunk batch size
 	// ACROSS runOnce restarts within one Run (the v0.99.69
 	// sustained-tx-killer fix). The controller is constructed per

@@ -31,39 +31,51 @@ import (
 // ([freshCopyReason.clearsTarget]), so it cannot keep a stale row.
 const copyResumeWithdrawnMarker = "VSTREAM-COPY-RESUME-WITHDRAWN"
 
-// restartUnclearedMarker names the refusal of a re-copy that was asked to
-// clear the target (--restart-from-scratch) but cannot, because
-// --schema-already-applied forbids the drop-and-recreate the clear is.
+// restartUnclearedMarker names the refusal of a re-copy that has to clear
+// the target (--restart-from-scratch, or the copy restart runWithRetry takes
+// after a mid-copy fault) but cannot, because --schema-already-applied
+// forbids the drop-and-recreate the clear is.
 const restartUnclearedMarker = "RESTART-FROM-SCRATCH-TARGET-NOT-CLEARED"
 
-// refuseUnclearedRestart refuses --restart-from-scratch combined with
-// --schema-already-applied on an upsert reader (VStream) while an in-scope
-// target table still holds rows. That cold start takes the
-// schema-already-applied branch, which skips the clear, and the upsert copy
-// then keeps every target row the source has deleted since it was copied,
-// silently — the harm VSTREAM-COPY-RESUME-WITHDRAWN names --restart-from-scratch
-// as the remedy for. A target whose emptiness cannot be probed is refused
-// too: the clear cannot be proven to be unnecessary. With the tables
-// emptied by hand, the same command copies into them correctly.
-func refuseUnclearedRestart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter) error {
+// refuseUnclearedRestart refuses a re-copy under --schema-already-applied
+// on an upsert reader (VStream) while an in-scope target table still holds
+// rows. That cold start takes the schema-already-applied branch, which skips
+// the clear, and the upsert copy then keeps every target row the source has
+// deleted since it was copied, silently — the harm
+// VSTREAM-COPY-RESUME-WITHDRAWN names --restart-from-scratch as the remedy
+// for. A target whose emptiness cannot be probed is refused too: the clear
+// cannot be proven to be unnecessary. With the tables emptied by hand, the
+// same command copies into them correctly.
+//
+// Two requests reach it, and the message names the one that did, so an
+// operator is never told about a flag they did not pass: the operator's
+// --restart-from-scratch, and (afterFault) runWithRetry restarting a copy a
+// fault interrupted (SAA-COLD-COPY-RETRY-UNCLEARED), which left the partial
+// copy on the target.
+func refuseUnclearedRestart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter, afterFault bool) error {
+	request := "--restart-from-scratch with --schema-already-applied"
+	unchanged := "no target table was changed by this run"
+	if afterFault {
+		request = "a fault during the copy made this run restart the copy, and with --schema-already-applied it"
+		unchanged = "the interrupted copy's rows are still there, and nothing more was written"
+	}
 	checker, ok := rw.(ir.TableEmptyChecker)
 	if !ok {
-		return fmt.Errorf("pipeline: cold start refused: %s: --restart-from-scratch with --schema-already-applied "+
-			"cannot clear the target (that would drop the tables you pre-created), and this target cannot report "+
-			"whether its tables are empty; empty the in-scope target tables yourself, then re-run the same command",
-			restartUnclearedMarker)
+		return fmt.Errorf("pipeline: cold start refused: %s: %s cannot clear the target (that would drop the tables "+
+			"you pre-created), and this target cannot report whether its tables are empty; empty the in-scope target "+
+			"tables yourself, then re-run the same command", restartUnclearedMarker, request)
 	}
 	for _, table := range schema.Tables {
 		empty, err := checker.IsTableEmpty(ctx, table)
 		if err != nil {
-			return fmt.Errorf("pipeline: %s: probe of target table %q: %w", restartUnclearedMarker, table.Name, err)
+			return fmt.Errorf("pipeline: cold start refused: %s: %s cannot clear the target, and the emptiness probe of "+
+				"target table %q failed: %w", restartUnclearedMarker, request, table.Name, err)
 		}
 		if !empty {
-			return fmt.Errorf("pipeline: cold start refused: %s: --restart-from-scratch with --schema-already-applied "+
-				"does not clear the target (that would drop the tables you pre-created), and target table %q still "+
-				"holds rows: an upsert re-copy over them would keep every row the source has deleted since they were "+
-				"copied. Empty the in-scope target tables yourself (e.g. TRUNCATE), then re-run the same command; "+
-				"no target table was changed by this run", restartUnclearedMarker, table.Name)
+			return fmt.Errorf("pipeline: cold start refused: %s: %s does not clear the target (that would drop the "+
+				"tables you pre-created), and target table %q still holds rows: an upsert re-copy over them would keep "+
+				"every row the source has deleted since they were copied. Empty the in-scope target tables yourself "+
+				"(e.g. TRUNCATE), then re-run the same command; %s", restartUnclearedMarker, request, table.Name, unchanged)
 		}
 	}
 	return nil
