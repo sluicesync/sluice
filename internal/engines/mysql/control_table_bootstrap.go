@@ -64,7 +64,8 @@ func wrapControlTableBootstrapError(err error, statement string) error {
 		recipe = "deploy the failing statement with `sluice deploy-ddl --ddl '<statement>'` " +
 			"(`sluice control-tables ddl` prints CREATE statements only, which cannot bring an existing table up to date); then re-run."
 		remedy = "this statement shipped through a deploy request with `sluice deploy-ddl --ddl '" + oneLine + "'` (`sluice " +
-			"control-tables ddl` prints CREATE statements only, which cannot bring an existing table up to date)"
+			"control-tables ddl` prints CREATE statements only, which cannot bring an existing table up to date; if the " +
+			"table needs more than one column, the re-run names the next ALTER the same way, so expect a round per statement)"
 	}
 	return ir.WithMarker(sluicecode.Wrap(
 		sluicecode.CodePSDirectDDLBlocked,

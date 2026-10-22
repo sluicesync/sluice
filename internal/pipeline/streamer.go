@@ -1627,6 +1627,11 @@ type Streamer struct {
 	// lane copied, recorded when its branch of phaseOpenChangeStream returns.
 	scopeDriftDoorDone   bool
 	coldStartEstablished []string
+	// copyDoorHeaderTables is the table set (bare names) of the progress
+	// header a VSTREAM-COPY-COMPLETION-UNPROVEN header-only pass stood on, set
+	// by that pass and read by [Streamer.recordAfterCopyDoor]: only a table
+	// the header recorded is certified as copied.
+	copyDoorHeaderTables map[string]bool
 	// coldStartIDs are the table ids a cold-start lane's copy started with
 	// and the ids its anchor verified against them (coldstart_copy_identity.go).
 	coldStartIDs coldStartIdentities
