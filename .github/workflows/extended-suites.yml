@@ -52,8 +52,13 @@
 name: Extended suites
 
 on:
-  schedule:
-    - cron: "0 10 * * 0"
+  # DISPATCH-ONLY since 2026-10-22 (operator decision). The weekly trigger
+  # was `schedule: cron "0 10 * * 0"`; the jobs' `github.event_name ==
+  # 'schedule'` conditions are kept so restoring that block restores the
+  # weekly selection unchanged (report-red.yml still lists "Extended
+  # suites"). Until then, the legs above run only when dispatched — notably
+  # `crossversion` before a BackupFormatVersion bump and `vstream-pipeline`
+  # before a VStream-path release.
   workflow_dispatch:
     inputs:
       suite:

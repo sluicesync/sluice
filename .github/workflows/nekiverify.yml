@@ -50,8 +50,13 @@
 name: Neki Verify
 
 on:
+  # DISPATCH-ONLY since 2026-10-22 (operator decision): each run provisions
+  # billable PlanetScale Neki databases, so it runs when someone dispatches
+  # it, not on a timer. The weekly schedule it had is recorded below; to
+  # restore it, put back the `schedule:` block (report-red.yml still lists
+  # "Neki Verify", so a scheduled red would file its standing issue again).
   workflow_dispatch:
-  # Weekly, operator-decided 2026-09-11. Neki is a platform PREVIEW: the
+  # Was weekly, operator-decided 2026-09-11. Neki is a platform PREVIEW: the
   # measurements these tests re-confirm are true on one build and will
   # rot, and a suite nobody dispatches notices nothing. The cadence is a
   # knob — drop to dispatch-only or lengthen the interval if the cost or
@@ -74,8 +79,7 @@ on:
   #     is accepted rather than chased.
   #   * :20 rather than :00 because GitHub documents that runs scheduled
   #     on the hour are the most contended and can be delayed.
-  schedule:
-    - cron: "20 17 * * 0"
+  # The removed trigger was: schedule: cron "20 17 * * 0".
 
 # Reads repo contents only; the secrets are scoped at the job's env block.
 permissions:
