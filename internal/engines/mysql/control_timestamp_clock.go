@@ -12,13 +12,15 @@ import (
 var _ ir.ControlTimestampClock = (*ChangeApplier)(nil)
 
 // ControlTimestampsComparable implements [ir.ControlTimestampClock]: always
-// true. sluice_cdc_state.updated_at and sluice_migrate_state.updated_at are
-// both TIMESTAMP ... DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP on
-// every release that writes a sync cold start's header (checked at v0.149.0
-// and now), and MySQL stores a TIMESTAMP in UTC and renders both columns in
-// the reading session's zone, so their order is the order of the writes.
-// Their resolution is one second: two writes in the same second compare
-// equal, which a caller must treat as unordered.
+// false. Both updated_at columns are on one clock (TIMESTAMP, stored in UTC),
+// but sluice_cdc_state.updated_at is ON UPDATE CURRENT_TIMESTAMP, so it moves
+// on every UPDATE that changes the row — requestStop, clearStopRequested
+// (which a start runs before the VStream copy door), the live-added and
+// table-set writes — not only on a position write. Its order against the
+// progress record therefore says nothing about when the position was written,
+// and a frozen mid-copy checkpoint touched by any of those writes would read
+// as the later, finished anchor. A caller must treat the comparison as
+// unproven here.
 func (a *ChangeApplier) ControlTimestampsComparable(context.Context) (bool, error) {
-	return true, nil
+	return false, nil
 }

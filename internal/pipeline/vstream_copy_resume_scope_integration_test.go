@@ -365,7 +365,13 @@ func vcrStreamExact(t *testing.T, r vcrRig, s *Streamer, traffic string, compare
 			vcrLogTail(t, r, logStart)
 			t.Fatalf("the run exited before the target matched the source (restart-from-scratch=%v): %v", s.RestartFromScratch, run.err)
 		}
-		vcrSeed(t, r.mysqlDSN, traffic, "traffic", []int64{trafficBase + i})
+		// Traffic for the first ten seconds only, then wait for the target to
+		// catch up: a target whose apply latency is over a second (a MySQL
+		// target's batched apply) never matched a source that gained a row
+		// every second until the deadline.
+		if i < 10 {
+			vcrSeed(t, r.mysqlDSN, traffic, "traffic", []int64{trafficBase + i})
+		}
 		exact := true
 		for _, tbl := range compare {
 			if !vcrCompare(t, r, tbl).exact() {
@@ -621,6 +627,11 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 		// the real complete header kept — the plain run passes on it.
 		r.tgt().exec(t, "UPDATE sluice_cdc_state SET established_tables = NULL WHERE stream_id = 'vclfin'")
 		vcrStreamExact(t, r, fin(), fb, []string{fa, fb})
+		// The pass recorded the tables, so the header is judged once.
+		if got := r.tgt().scalar(t, "SELECT established_tables IS NOT NULL FROM sluice_cdc_state WHERE stream_id = 'vclfin'"); got != "true" {
+			t.Fatalf("the header-only pass did not record the stream's tables (established_tables IS NOT NULL = %s)", got)
+		}
+		r.tgt().exec(t, "UPDATE sluice_cdc_state SET established_tables = NULL WHERE stream_id = 'vclfin'")
 
 		// F2: the header written after the position (a ≤v0.163.1 stop
 		// between complete and the anchor) refuses, and the flag with it.
@@ -670,11 +681,21 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 		time.Sleep(3 * time.Second)
 		fin := func() *Streamer { return mr.streamer("vclmy", []string{ha, hb}, "") }
 		vcrStreamExact(t, mr, fin(), ha, []string{ha, hb})
-		time.Sleep(1100 * time.Millisecond) // past the one-second resolution
+		// A MySQL-family target's sluice_cdc_state.updated_at moves on
+		// non-position writes too (ON UPDATE CURRENT_TIMESTAMP), so the
+		// header alone never proves the copy there: refused as unproven,
+		// NOT contradicted, and the flag is the way through — once.
 		mr.tgt().exec(t, "UPDATE sluice_cdc_state SET established_tables = NULL WHERE stream_id = 'vclmy'")
-		vcrStreamExact(t, mr, fin(), hb, []string{ha, hb})
-		mr.tgt().exec(t, "UPDATE sluice_migrate_state SET updated_at = NOW() + INTERVAL 1 DAY WHERE migration_id = 'sync-vclmy'")
-		vclRequireUnproven(t, mr, fin())
+		if err := vclRequireUnproven(t, mr, fin()); strings.Contains(err.Error(), "cannot be accepted") {
+			t.Fatalf("a plain refusal read as the flag's: %v", err)
+		}
+		asserted := fin()
+		asserted.AssertCopyFinished = true
+		vcrStreamExact(t, mr, asserted, hb, []string{ha, hb})
+		if got := mr.tgt().scalar(t, "SELECT established_tables IS NOT NULL FROM sluice_cdc_state WHERE stream_id = 'vclmy'"); got != "1" && got != "true" {
+			t.Fatalf("--assert-copy-finished resumed without recording (established_tables IS NOT NULL = %s)", got)
+		}
+		vcrStreamExact(t, mr, fin(), ha, []string{ha, hb}) // the next plain run passes on the record
 	})
 }
 

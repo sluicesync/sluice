@@ -1161,10 +1161,16 @@ func readStopRequested(ctx context.Context, db *sql.DB, controlKeyspace, streamI
 
 // requestStop flips the stop flag on the named stream's row. Returns
 // errStreamNotFound when no row exists (the operator likely typoed
-// the stream ID; the CLI surfaces a friendly message). Idempotent;
-// updated_at is left alone so the "age" column in `sync status`
-// continues to reflect real apply activity rather than stop-request
-// bookkeeping.
+// the stream ID; the CLI surfaces a friendly message). Idempotent.
+//
+// updated_at is NOT left alone here, whatever the statement suggests: the
+// column is ON UPDATE CURRENT_TIMESTAMP, so MySQL bumps it on any UPDATE
+// that changes the row — this one, clearStopRequested, the live-added and
+// established/dropped table-set writes — not only on a position write. So on
+// a MySQL-family target updated_at is "the row last changed", never "the
+// position was last written"; ControlTimestampsComparable answers false for
+// that reason. (An earlier version of this comment said updated_at was left
+// alone, which is true on Postgres and false here.)
 //
 // The existence probe + unconditional UPDATE pair (rather than a
 // rows-affected check) is the shared skeleton's changed-rows branch —

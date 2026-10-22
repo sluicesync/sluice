@@ -25,7 +25,7 @@ func TestControlTimestampsComparable_FollowsTheSessionZone(t *testing.T) {
 	for _, tc := range []struct {
 		zone string
 		want bool
-	}{{"UTC", true}, {"America/New_York", false}, {"Asia/Kolkata", false}} {
+	}{{"UTC", true}, {"America/New_York", false}, {"Asia/Kolkata", false}, {"Europe/London", false}, {"Europe/Lisbon", false}} {
 		a, err := Engine{}.OpenChangeApplier(ctx, dsn+"&timezone="+tc.zone)
 		if err != nil {
 			t.Fatalf("%s: open applier: %v", tc.zone, err)

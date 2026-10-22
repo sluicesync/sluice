@@ -267,12 +267,12 @@ func (t controlTable) ddlRequired(what, stmt string, err error) error {
 	case errors.Is(err, errTableAbsent):
 		return ir.WithMarker(fmt.Errorf("postgres: %s: sluice control table %s %s: %w — this path never creates control tables; "+
 			"have the owner create it with the statement below, or apply the full set `sluice control-tables ddl --engine postgres` prints, then re-run: %s",
-			ControlTableDDLRequiredMarker, t.ref(), what, err, oneLine), ir.ErrControlTableDDLRequired)
+			ControlTableDDLRequiredMarker, t.ref(), what, err, oneLine), t.ddlRemedy(oneLine))
 	case state == pgSQLStateInsufficientPrivilege:
 		return ir.WithMarker(fmt.Errorf("postgres: %s: sluice control table %s %s and this role may not create it: %w — "+
 			"run the statement below as the table's owner (or a role with CREATE on schema %q), "+
 			"or apply the full set `sluice control-tables ddl --engine postgres` prints, then re-run: %s",
-			ControlTableDDLRequiredMarker, t.ref(), what, err, t.schema, oneLine), ir.ErrControlTableDDLRequired)
+			ControlTableDDLRequiredMarker, t.ref(), what, err, t.schema, oneLine), t.ddlRemedy(oneLine))
 	case state == sqlStateInvalidSchemaName:
 		return fmt.Errorf("postgres: %s: schema %q does not exist, so sluice control table %s cannot be created there: %w — "+
 			"check the target DSN's schema= parameter (sluice's control schema), or create the schema",
@@ -280,6 +280,19 @@ func (t controlTable) ddlRequired(what, stmt string, err error) error {
 	default:
 		return fmt.Errorf("postgres: %s: sluice control table %s %s and the statement that fixes it failed: %w — the statement was: %s",
 			ControlTableDDLRequiredMarker, t.ref(), what, err, oneLine)
+	}
+}
+
+// ddlRemedy is the [ir.ControlTableDDLRequiredError] for a statement this
+// role may not run. `sluice control-tables ddl --engine postgres` prints each
+// table's CREATE together with the ADD COLUMN, CREATE INDEX and UTC-DEFAULT
+// statements later releases added, so it fixes a missing table and an
+// out-of-date one alike.
+func (t controlTable) ddlRemedy(oneLine string) error {
+	return &ir.ControlTableDDLRequiredError{
+		Statement: oneLine,
+		Remedy: fmt.Sprintf("the statements `sluice control-tables ddl --engine postgres` prints applied by the owner of "+
+			"%s (or a role with CREATE on schema %q)", t.ref(), t.schema),
 	}
 }
 

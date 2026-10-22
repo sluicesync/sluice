@@ -51,17 +51,36 @@ func wrapControlTableBootstrapError(err error, statement string) error {
 		return err
 	}
 	oneLine := strings.Join(strings.Fields(statement), " ")
+	hint := "ship sluice's control-table DDL through a PlanetScale deploy request: `sluice control-tables ddl` prints the statements, `sluice deploy-ddl --ddl '<statement>'` deploys each one; then re-run"
+	recipe := "`sluice control-tables ddl` prints the full control-table set and " +
+		"`sluice deploy-ddl --ddl '<statement>'` deploys one statement; then re-run."
+	remedy := "the statements `sluice control-tables ddl` prints shipped through a deploy request, one each with " +
+		"`sluice deploy-ddl --ddl '<statement>'`"
+	if isAlterStatement(oneLine) {
+		// `control-tables ddl` prints CREATE TABLE IF NOT EXISTS only, which
+		// is a no-op on a table that exists and lacks a column: the ALTER is
+		// the only statement that fixes it.
+		hint = "ship the failing ALTER through a PlanetScale deploy request with `sluice deploy-ddl --ddl '<statement>'` (`sluice control-tables ddl` prints CREATE statements only, which cannot bring an existing table up to date); then re-run"
+		recipe = "deploy the failing statement with `sluice deploy-ddl --ddl '<statement>'` " +
+			"(`sluice control-tables ddl` prints CREATE statements only, which cannot bring an existing table up to date); then re-run."
+		remedy = "this statement shipped through a deploy request with `sluice deploy-ddl --ddl '" + oneLine + "'` (`sluice " +
+			"control-tables ddl` prints CREATE statements only, which cannot bring an existing table up to date)"
+	}
 	return ir.WithMarker(sluicecode.Wrap(
 		sluicecode.CodePSDirectDDLBlocked,
-		"ship sluice's control-table DDL through a PlanetScale deploy request: `sluice control-tables ddl` prints the statements, `sluice deploy-ddl --ddl '<statement>'` deploys each one; then re-run",
+		hint,
 		fmt.Errorf("%w: %w | "+
 			"sluice needs to run control-table DDL that this branch's safe-migrations setting refuses "+
-			"(every direct DDL statement is blocked). Ship it through a deploy request instead: "+
-			"`sluice control-tables ddl` prints the full control-table set and "+
-			"`sluice deploy-ddl --ddl '<statement>'` deploys one statement; then re-run. "+
+			"(every direct DDL statement is blocked). Ship it through a deploy request instead: %s "+
 			"The statement that failed here is: %s",
-			ErrSafeMigrationsBlocked, err, oneLine),
-	), ir.ErrControlTableDDLRequired)
+			ErrSafeMigrationsBlocked, err, recipe, oneLine),
+	), &ir.ControlTableDDLRequiredError{Statement: oneLine, Remedy: remedy})
+}
+
+// isAlterStatement reports whether a control-table statement alters an
+// existing table rather than creating one.
+func isAlterStatement(oneLine string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(oneLine)), "ALTER ")
 }
 
 // ControlTableDDLGuidance implements [ir.ControlTableDDLProvider]: the
