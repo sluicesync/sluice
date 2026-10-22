@@ -339,9 +339,17 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	// completes and BEFORE the CDC anchor is persisted / CDC begins. The
 	// ordering is load-bearing: CDC replays from the copy anchor, so any
 	// value that changed between the copy and this re-read is re-applied by
-	// CDC to its final value; and because the anchor is not yet persisted,
-	// a crash mid-repair re-cold-starts rather than warm-resuming a
-	// partially-repaired target. Skipped by --no-float-exact-reread (the
+	// CDC to its final value. A crash mid-repair must not warm-resume the
+	// partially-repaired target, and what stops it depends on what the
+	// control row holds then: a first cold start has no position row (since
+	// v0.163.3 nothing is persisted before the anchor), so the next start
+	// cold-starts; a re-copy of an existing stream holds its old position,
+	// and the COLD-START-IN-PROGRESS mark refuses it; a ≤v0.163.1 run could
+	// hold a frozen mid-copy checkpoint beside a header already marked
+	// complete, which VSTREAM-COPY-COMPLETION-UNPROVEN refuses by ordering
+	// the two (streamer_vstream_copy_unproven.go). An earlier version of this
+	// comment said the crash "re-cold-starts" outright; that was false
+	// whenever a position row existed. Skipped by --no-float-exact-reread (the
 	// WARN above then states the rounding is retained). No-op on every
 	// non-VStream source. Uses the finalized (post-mapping) schema for the
 	// target column types the UPDATE binds against.

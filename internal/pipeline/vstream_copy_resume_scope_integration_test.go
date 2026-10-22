@@ -73,10 +73,18 @@ type vcrRig struct {
 	streamDSN string // vtgate + VStream params
 	tgtDSN    string
 	logs      *logcapture.Buffer
+	tgtEngine string // "" = postgres
 }
 
 func (r vcrRig) src() twfbDB { return twfbDB{engine: "mysql", dsn: r.mysqlDSN} }
-func (r vcrRig) tgt() twfbDB { return twfbDB{engine: "postgres", dsn: r.tgtDSN} }
+func (r vcrRig) tgt() twfbDB { return twfbDB{engine: r.targetEngine(), dsn: r.tgtDSN} }
+
+func (r vcrRig) targetEngine() string {
+	if r.tgtEngine == "" {
+		return "postgres"
+	}
+	return r.tgtEngine
+}
 
 // streamer builds the Streamer a `sync start --include-table ...` run would,
 // with extraDSN appended to the source DSN (e.g. the single-stream opt-out).
@@ -85,9 +93,9 @@ func (r vcrRig) streamer(streamID string, include []string, extraDSN string) *St
 	if !ok {
 		panic("engine not registered: planetscale")
 	}
-	tgtEng, ok := engines.Get("postgres")
+	tgtEng, ok := engines.Get(r.targetEngine())
 	if !ok {
-		panic("engine not registered: postgres")
+		panic("engine not registered: " + r.targetEngine())
 	}
 	filter, err := migcore.NewTableFilter(include, nil)
 	if err != nil {
@@ -598,12 +606,41 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 		r.src().exec(t, "DELETE FROM "+ma+" WHERE id <= 20")
 		before := len(vcrIDs(t, r.tgt(), mb))
 		vclRequireUnproven(t, r, mid())
+		// F3: the flag cannot override a header short of complete.
+		midAsserted := mid()
+		midAsserted.AssertCopyFinished = true
+		vclRequireContradicted(t, r, midAsserted)
 		if after := len(vcrIDs(t, r.tgt(), mb)); after != before {
 			t.Fatalf("the refused resume changed the target: %d rows before, %d after", before, after)
 		}
 		recopy := mid()
 		recopy.RestartFromScratch = true
 		vcrRecopyExact(t, r, recopy, ma, []string{ma, mb})
+
+		// Header-only proof (the v0.149–v0.162 shape): the record removed,
+		// the real complete header kept — the plain run passes on it.
+		r.tgt().exec(t, "UPDATE sluice_cdc_state SET established_tables = NULL WHERE stream_id = 'vclfin'")
+		vcrStreamExact(t, r, fin(), fb, []string{fa, fb})
+
+		// F2: the header written after the position (a ≤v0.163.1 stop
+		// between complete and the anchor) refuses, and the flag with it.
+		r.tgt().exec(t, "UPDATE sluice_migrate_state SET updated_at = pg_catalog.timezone('utc', pg_catalog.now()) + interval '1 day' WHERE migration_id = 'sync-vclfin'")
+		vclRequireUnproven(t, r, fin())
+		f2Asserted := fin()
+		f2Asserted.AssertCopyFinished = true
+		vclRequireContradicted(t, r, f2Asserted)
+		r.tgt().exec(t, "UPDATE sluice_migrate_state SET updated_at = TIMESTAMP '2000-01-01' WHERE migration_id = 'sync-vclfin'")
+
+		// F1: a copied table emptied on the target beside the complete header
+		// (a re-copy stopped after its drop, before the header clear).
+		r.tgt().exec(t, "TRUNCATE "+fb)
+		vclRequireUnproven(t, r, fin())
+		f1Asserted := fin()
+		f1Asserted.AssertCopyFinished = true
+		vclRequireContradicted(t, r, f1Asserted)
+		refill := fin()
+		refill.RestartFromScratch = true
+		vcrRecopyExact(t, r, refill, fa, []string{fa, fb})
 
 		// The finished stream, with the evidence of its finished copy gone.
 		r.tgt().exec(t, "UPDATE sluice_cdc_state SET established_tables = NULL WHERE stream_id = 'vclfin'")
@@ -617,6 +654,37 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 		}
 		vcrStreamExact(t, r, fin(), fb, []string{fa, fb}) // the next plain run passes on the record
 	})
+
+	// The header-only proof and its F2 refusal on a MySQL target, whose two
+	// updated_at columns are ON UPDATE CURRENT_TIMESTAMP at one-second
+	// resolution (the clock premise ControlTimestampsComparable asserts).
+	t.Run("CursorlessCheckpoint/header-only-mysql-target", func(t *testing.T) {
+		myDSN, cleanupMy := startMySQLTarget(t)
+		defer cleanupMy()
+		mr := r
+		mr.tgtDSN, mr.tgtEngine = myDSN, "mysql"
+		const ha, hb = "hm_a", "hm_b"
+		vcrCreate(t, mr, ha, hb)
+		vcrSeed(t, mr.mysqlDSN, ha, "v1", vcrRange(1, 1, 1000))
+		vcrSeed(t, mr.mysqlDSN, hb, "v1", vcrRange(1, 1, 20_000))
+		time.Sleep(3 * time.Second)
+		fin := func() *Streamer { return mr.streamer("vclmy", []string{ha, hb}, "") }
+		vcrStreamExact(t, mr, fin(), ha, []string{ha, hb})
+		time.Sleep(1100 * time.Millisecond) // past the one-second resolution
+		mr.tgt().exec(t, "UPDATE sluice_cdc_state SET established_tables = NULL WHERE stream_id = 'vclmy'")
+		vcrStreamExact(t, mr, fin(), hb, []string{ha, hb})
+		mr.tgt().exec(t, "UPDATE sluice_migrate_state SET updated_at = NOW() + INTERVAL 1 DAY WHERE migration_id = 'sync-vclmy'")
+		vclRequireUnproven(t, mr, fin())
+	})
+}
+
+// vclRequireContradicted runs s (with --assert-copy-finished), which must be
+// refused because the target shows the copy did not finish.
+func vclRequireContradicted(t *testing.T, r vcrRig, s *Streamer) {
+	t.Helper()
+	if err := vclRequireUnproven(t, r, s); !strings.Contains(err.Error(), "--assert-copy-finished cannot be accepted") {
+		t.Fatalf("want --assert-copy-finished refused over contradicting evidence; got %v", err)
+	}
 }
 
 // vclReadPosition reads streamID's persisted position off the target.
@@ -660,7 +728,7 @@ func vclWritePosition(t *testing.T, r vcrRig, streamID string, pos ir.Position) 
 
 // vclRequireUnproven runs s, which must refuse VSTREAM-COPY-COMPLETION-UNPROVEN
 // within three minutes.
-func vclRequireUnproven(t *testing.T, r vcrRig, s *Streamer) {
+func vclRequireUnproven(t *testing.T, r vcrRig, s *Streamer) error {
 	t.Helper()
 	logStart := r.logs.Len()
 	run := startTWFBRun(s)
@@ -678,6 +746,7 @@ func vclRequireUnproven(t *testing.T, r vcrRig, s *Streamer) {
 		t.Fatalf("want the %s refusal; got %v", vstreamCopyUnprovenMarker, run.err)
 	}
 	t.Logf("REFUSED (loud): %v", run.err)
+	return run.err
 }
 
 // TestStreamer_VStreamCopyResume_TwoShards runs the same phases on a

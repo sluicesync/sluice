@@ -40,6 +40,29 @@ var ErrIncludeTableScopeDrift = errors.New("INCLUDE-TABLE-SCOPE-DRIFT")
 // do-not-restart roster, which backs off and retries.
 var ErrIncludeTableAddInProgress = errors.New("INCLUDE-TABLE-ADD-IN-PROGRESS")
 
+// ErrControlTableDDLRequired classifies a failure to bring one of sluice's own
+// control tables up to date because the DDL it needs cannot run on this target:
+// a role that holds only DML on the tables (Postgres SQLSTATE 42501, or a table
+// the path may not create), or a PlanetScale branch whose safe-migrations
+// setting refuses direct DDL. A restart meets the same refusal, so a caller
+// that would otherwise retry it must not. The remedy is to have the statements
+// `sluice control-tables ddl` prints applied by a role or channel that can (on
+// PlanetScale, `sluice deploy-ddl`). Engines attach it with [WithMarker],
+// leaving their message as written. Not attached to a MySQL privilege error
+// outside safe migrations (errno 1142), which the MySQL engine does not
+// classify.
+var ErrControlTableDDLRequired = errors.New("CONTROL-TABLE-DDL-REQUIRED")
+
+// ControlTimestampClock is the optional [ChangeApplier] surface that says
+// whether the target's sluice_cdc_state.updated_at and
+// sluice_migrate_state.updated_at are on one clock, so the order of two of
+// their values is the order of the writes. The VStream copy-completion door
+// (VSTREAM-COPY-COMPLETION-UNPROVEN) compares them; an applier without it, or
+// one that answers false, leaves that comparison unproven.
+type ControlTimestampClock interface {
+	ControlTimestampsComparable(ctx context.Context) (bool, error)
+}
+
 // ErrPendingAddSuperseded classifies an add-table that found its own pending
 // entry gone or replaced: `sluice schema add-table --abandon` marked it
 // abandoned (or a stream start then cleared it), or a re-run add took it
