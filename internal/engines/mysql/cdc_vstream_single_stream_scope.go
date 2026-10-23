@@ -23,7 +23,7 @@ import (
 // (bufferCopyRow), so a DELETE replayed there is dropped, and the CDC tail
 // starts at the last table's snapshot, after it. A row deleted from a
 // finished table while a later one was being copied stays on the target, at
-// exit 0. Measured on Vitess 24 with no fault: 60 of 60 such deletes stale,
+// exit 0. Measured on a local vttestserver (mysql80) with no fault: 60 of 60 such deletes stale,
 // every one received in the copy phase; updates exact. The default per-table
 // copy opens each table as its own stream, has no catch-up, and was exact in
 // the same cell.

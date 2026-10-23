@@ -8,7 +8,9 @@ package pipeline
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +33,7 @@ import (
 func TestStreamer_VStreamSlotNameKeepsTheCopyScope(t *testing.T) {
 	var logs logcapture.Buffer
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	mysqlDSN, grpcEndpoint, _, cleanupSrc := startShardedVTTestServer(t, "commerce", 1)
@@ -63,20 +65,27 @@ func TestStreamer_VStreamSlotNameKeepsTheCopyScope(t *testing.T) {
 	run := startTWFBRun(s)
 	defer func() { _ = run.stop(t) }()
 
-	// The changes land once sn_a is on the target, while sn_b copies.
+	// The changes land once sn_a is on the target and sn_b's copy has
+	// committed at least one batch there, so they fall inside sn_b's copy.
 	deadline := time.Now().Add(8 * time.Minute)
+	var nb int
 	for {
 		if run.exited() || time.Now().After(deadline) {
 			vcrLogTail(t, r, logStart)
-			t.Fatalf("RIG: the copy exited or timed out before %s was on the target (%v)", a, run.err)
+			t.Fatalf("RIG: the copy exited or timed out before %s was on the target and %s had a row there (%v)", a, b, run.err)
 		}
-		if n, _ := strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+a)); n >= 1000-floor {
+		na, _ := strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+a))
+		nb, _ = strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+b))
+		if na >= 1000-floor && nb >= 1 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	nb, _ := strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+b))
-	t.Logf("changes start with %s on the target and %d rows of %s", a, nb, b)
+	if nb < 1 {
+		t.Fatalf("RIG: the changes would start before %s had a copied batch on the target", b)
+	}
+	t.Logf("changes start with %s on the target and %d of %d rows of %s (still copying: %v)",
+		a, nb, vrsBigRows-floor, b, nb < vrsBigRows-floor)
 	for _, stmt := range []string{
 		"DELETE FROM " + a + " WHERE id BETWEEN 201 AND 220",
 		"UPDATE " + a + " SET payload = CONCAT('upd-', id) WHERE id BETWEEN 301 AND 310",
@@ -134,7 +143,26 @@ func TestStreamer_VStreamSlotNameKeepsTheCopyScope(t *testing.T) {
 			t.Logf("EXACT: %s", verdict)
 		}
 	}
-	if rows := vrsRows(t, r.tgt(), x); rows != nil {
-		t.Errorf("%s, outside --include-table, exists on the target with %d rows", x, len(rows))
+	// The open named exactly sn_a and sn_b: the per-table copy logs its
+	// table count when it starts (sn_a's stream opens with it) and each
+	// later table as it advances. The keyspace-wide open logs neither; it
+	// streams sn_x too, which the target cannot show, since a table outside
+	// the schema scope is never created there.
+	opened := r.logs.String()[logStart:]
+	if !strings.Contains(opened, "auto-shard-by-table COPY") || !strings.Contains(opened, "tables=2") {
+		t.Errorf("the copy did not open per table over the two in-scope tables (no auto-shard line with tables=2): " +
+			"the --slot-name open was not scoped to --include-table")
+	}
+	var advanced []string
+	for _, line := range strings.Split(opened, "\n") {
+		if !strings.Contains(line, "auto-shard advanced to next table COPY") {
+			continue
+		}
+		if i := strings.Index(line, "table="); i >= 0 {
+			advanced = append(advanced, strings.Fields(line[i+len("table="):])[0])
+		}
+	}
+	if !slices.Equal(advanced, []string{b}) {
+		t.Errorf("the per-table copy advanced to %v; want exactly [%s] (after %s), never %s", advanced, b, a, x)
 	}
 }
