@@ -88,6 +88,16 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 163, 8},
+		fixedIn:     semver{0, 163, 8},
+		claimMarker: "`--no-drain` now works only on a Postgres source",
+		why: "presents the Postgres publication-add live path as the safe one, but the v0.163.8 cycle " +
+			"measured it losing changes to the new table during the add at exit 0: a filtered stream drops " +
+			"them until its next live-added poll, and an unfiltered stream's delete is undone by the copy " +
+			"(sluice-testing Bug 332). The refusals v0.163.8 shipped are unchanged; a refusal of --no-drain " +
+			"on every source ships in its own release.",
+	},
+	{
 		amended:     semver{0, 163, 6},
 		fixedIn:     semver{0, 163, 6},
 		claimMarker: "a vtgate outage longer than about 13 seconds uses all 8",
