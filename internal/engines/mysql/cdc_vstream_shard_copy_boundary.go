@@ -242,10 +242,18 @@ var errCopyRowChangeRefused = errors.New(copyRowChangeRefusedMarker)
 // copyRowChangeRefusal judges one row change received on a shard still
 // copying the table. It returns nil for what the copy can apply by upsert: a
 // copy row (an after image and no before image), or an UPDATE that leaves
-// every primary-key column byte for byte as it was, whose after image is the
-// row's value. Anything else is refused: a DELETE, an UPDATE that changes the
-// key (the upsert would leave the old row), a change with no image, or an
-// UPDATE on a table whose key the fields do not name.
+// every primary-key column byte for byte as it was AND carries a full after
+// image (no column omitted under binlog_row_image=NOBLOB, no partial-JSON
+// diff; [refuseVStreamPartialRowImage], the check the CDC dispatchers make),
+// whose after image is then the row's value. Anything else is refused: a
+// DELETE, an UPDATE with a partial image (the upsert would write NULL or a
+// JSON diff over the real value), an UPDATE that changes the key (the upsert
+// would leave the old row), a change with no image, or an UPDATE on a table
+// whose key the fields do not name. The partial-image refusal is classified
+// like the rest: retriable on a single-table stream, and on the drained
+// add-table deferred to the stopped stream, whose CDC tail makes the same
+// partial-image check and refuses loudly when it replays the change, so a
+// deferral cannot apply the partial image either.
 //
 // singleTableStream says whether the stream copies exactly one table (the
 // default per-table copy, the concurrent copy, a one-table scope). There the
@@ -276,6 +284,16 @@ func copyRowChangeRefusal(keyspace, shard, table string, rc *binlogdata.RowChang
 	case rc.GetBefore() == nil && rc.GetAfter() != nil:
 		return nil
 	case rc.GetBefore() != nil && rc.GetAfter() != nil:
+		// The after image is the row's value only when it is FULL: under
+		// binlog_row_image=NOBLOB an unchanged BLOB/TEXT column arrives as a
+		// NULL cell, and under PARTIAL_JSON a JSON column carries a diff
+		// expression. Upserting either writes NULL or the diff text over the
+		// real value (the item-74 class the CDC dispatchers refuse with the
+		// same check), so a partial image is never "the row's value".
+		if perr := refuseVStreamPartialRowImage(rc, fields, keyspace, table); perr != nil {
+			shape = "an UPDATE with a partial row image (" + perr.Error() + ")"
+			break
+		}
 		if copyRowKeyUnchanged(rc, fields) {
 			return nil
 		}

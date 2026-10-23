@@ -81,6 +81,30 @@ func TestCopyRowChangeRefusal_Shapes(t *testing.T) {
 		{"update, keyless table", &binlogdata.RowChange{Before: makeRow([]string{"1", "a"}), After: makeRow([]string{"1", "b"})}, keyless, "changes the primary key"},
 		{"update, key NULL to empty", &binlogdata.RowChange{Before: makeRowOmitting([]*string{nil, ptr("a")}), After: makeRow([]string{"", "a"})}, keyed, "changes the primary key"},
 		{"update, malformed before", &binlogdata.RowChange{Before: &query.Row{Lengths: []int64{1}}, After: makeRow([]string{"1", "b"})}, keyed, "changes the primary key"},
+		{"update, key unchanged, full image bitmap", &binlogdata.RowChange{
+			Before: makeRow([]string{"1", "a"}), After: makeRow([]string{"1", "b"}),
+			DataColumns: makeColBitmap([]bool{true, true}),
+		}, keyed, ""},
+		// NOBLOB: an unchanged BLOB/TEXT column is omitted from the after
+		// image; upserting it would write NULL over the real value.
+		{"update, key unchanged, column omitted (NOBLOB)", &binlogdata.RowChange{
+			Before: makeRow([]string{"1", "a"}), After: makeRowOmitting([]*string{ptr("1"), nil}),
+			DataColumns: makeColBitmap([]bool{true, false}),
+		}, keyed, "partial row image"},
+		// PARTIAL_JSON: the after image carries a JSON diff, not the value.
+		{"update, key unchanged, partial JSON", &binlogdata.RowChange{
+			Before: makeRow([]string{"1", "a"}), After: makeRow([]string{"1", `JSON_REPLACE(@1, '$.a', 2)`}),
+			DataColumns: makeColBitmap([]bool{true, true}), JsonPartialValues: makeColBitmap([]bool{false, true}),
+		}, keyed, "partial row image"},
+		{"update, VARCHAR key gains a trailing space", &binlogdata.RowChange{
+			Before: makeRow([]string{"a", "x"}), After: makeRow([]string{"a ", "x"}),
+		}, scbVarcharKeyFields(), "changes the primary key"},
+		{"update, composite key, varbinary part changed", &binlogdata.RowChange{
+			Before: makeRow([]string{"1", "\x01", "x"}), After: makeRow([]string{"1", "\x02", "x"}),
+		}, scbCompositeKeyFields(), "changes the primary key"},
+		{"update, composite key unchanged", &binlogdata.RowChange{
+			Before: makeRow([]string{"1", "\x01", "x"}), After: makeRow([]string{"1", "\x01", "y"}),
+		}, scbCompositeKeyFields(), ""},
 		{"delete", &binlogdata.RowChange{Before: makeRow([]string{"1", "a"})}, keyed, "a DELETE"},
 		{"neither image", &binlogdata.RowChange{}, keyed, "neither image"},
 	} {
@@ -476,5 +500,74 @@ func TestVStreamSnapshot_DeferredReplaysAreLeftToTheStream(t *testing.T) {
 	}
 	if n := s.deferredReplays["t"]; n != 4 {
 		t.Errorf("deferred %d change(s); want 4 (both changes of the early event, then the key change and the delete)", n)
+	}
+}
+
+func scbVarcharKeyFields() []*query.Field {
+	return []*query.Field{
+		{Name: "k", Type: query.Type_VARCHAR, Charset: 255, Flags: uint32(query.MySqlFlag_PRI_KEY_FLAG | query.MySqlFlag_NOT_NULL_FLAG)},
+		{Name: "v", Type: query.Type_VARCHAR, Charset: 255},
+	}
+}
+
+func scbCompositeKeyFields() []*query.Field {
+	return []*query.Field{
+		{Name: "id", Type: query.Type_INT64, Flags: uint32(query.MySqlFlag_PRI_KEY_FLAG | query.MySqlFlag_NOT_NULL_FLAG)},
+		{Name: "b", Type: query.Type_VARBINARY, Flags: uint32(query.MySqlFlag_PRI_KEY_FLAG | query.MySqlFlag_NOT_NULL_FLAG)},
+		{Name: "v", Type: query.Type_VARCHAR, Charset: 255},
+	}
+}
+
+// TestVStreamCopyDispatchers_PartialImageUpdateRefuses: both copy
+// dispatchers (the sequential bufferCopyRow and the concurrent
+// copyStream.bufferRow) refuse an unchanged-key UPDATE whose after image is
+// partial (a NOBLOB-omitted column, a partial-JSON diff) instead of upserting
+// it, and buffer nothing from it.
+func TestVStreamCopyDispatchers_PartialImageUpdateRefuses(t *testing.T) {
+	partial := map[string]*binlogdata.RowChange{
+		"noblob": {
+			Before: makeRow([]string{"1", "a"}), After: makeRowOmitting([]*string{ptr("1"), nil}),
+			DataColumns: makeColBitmap([]bool{true, false}),
+		},
+		"partial-json": {
+			Before: makeRow([]string{"1", "a"}), After: makeRow([]string{"1", `JSON_REPLACE(@1, '$.a', 2)`}),
+			DataColumns: makeColBitmap([]bool{true, true}), JsonPartialValues: makeColBitmap([]bool{false, true}),
+		},
+	}
+	requireRefused := func(t *testing.T, s *vstreamSnapshotStream) {
+		t.Helper()
+		s.mu.Lock()
+		s.readTables = map[string]bool{"t": true}
+		s.mu.Unlock()
+		if err := s.Err(); !errors.Is(err, errCopyRowChangeRefused) || !strings.Contains(err.Error(), "partial row image") {
+			t.Fatalf("Err = %v; want the partial-image refusal", err)
+		}
+		if n := len(s.rowBuffer["t"]); n != 0 {
+			t.Fatalf("buffered %d row(s) from a partial image; want none", n)
+		}
+	}
+	for name, rc := range partial {
+		t.Run("sequential/"+name, func(t *testing.T) {
+			s := newTestSnapshotStream()
+			s.copyTables = []string{"t"}
+			for _, ev := range []*binlogdata.VEvent{scbField("-80", scbFields()), scbRow("-80", rc)} {
+				if _, err := s.dispatchCopyEvent(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			requireRefused(t, s)
+		})
+		t.Run("concurrent/"+name, func(t *testing.T) {
+			s := newTestSnapshotStream()
+			s.perStreamBytes = make([]int64, 1)
+			s.perStreamCap = defaultSnapshotMaxBufferBytes
+			cs := &copyStream{parent: s, fields: map[string][]*query.Field{}}
+			for _, ev := range []*binlogdata.VEvent{scbField("-80", scbFields()), scbRow("-80", rc)} {
+				if _, err := cs.dispatchCopyEvent("t", ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			requireRefused(t, s)
+		})
 	}
 }
