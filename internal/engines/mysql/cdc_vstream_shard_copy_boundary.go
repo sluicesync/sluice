@@ -85,8 +85,13 @@ import (
 //
 // On a shard that has NOT finished its copy, a copy row is an after image and
 // nothing else (uvstreamer.sendEventsForRows: Before nil, After the row). A
-// row change with a before image is a replayed change (vttablet's catch-up
-// before the next table of a multi-table stream, or a resume's). An UPDATE
+// row change with a before image is a replayed change, from one of two
+// causes: vttablet's catch-up before the next table of a multi-table stream
+// (deterministic), or vttablet's catch-up after vtgate restarted the shard's
+// tablet stream from its copy cursor on a retriable error, which reaches
+// every copy path, the default per-table copy included (transient;
+// VSTREAM-VTGATE-SHARD-RETRY-CATCHUP-DELETES, see [copyRowChangeRefusal] for
+// how each is classified). An UPDATE
 // that leaves every key cell as it was is still applied as an upsert of its
 // after image, which is the row's value. A DELETE, a key-changing UPDATE or a
 // change with no image cannot be applied in order against the rows the copy
@@ -224,7 +229,22 @@ var errCopyRowChangeRefused = errors.New(copyRowChangeRefusedMarker)
 // row's value. Anything else is refused: a DELETE, an UPDATE that changes the
 // key (the upsert would leave the old row), a change with no image, or an
 // UPDATE on a table whose key the fields do not name.
-func copyRowChangeRefusal(keyspace, shard, table string, rc *binlogdata.RowChange, fields []*query.Field) error {
+//
+// singleTableStream says whether the stream copies exactly one table (the
+// default per-table copy, the concurrent copy, a one-table scope). There the
+// only replay inside the copy is vtgate's: it restarts a shard's tablet
+// stream on a retriable error (vstream_manager.streamFromTablet, up to three
+// times: a reparent, a vttablet restart, a health-check stream end) from the
+// shard's last position and copy cursor, and vttablet catches up before it
+// copies on (copy.go catchupAndCopy; shouldSendEventForTable sends every
+// event of a table with a cursor). That is a transient fault, so the refusal
+// is retriable and takes the same route as a mid-copy Recv fault
+// (VSTREAM-COPY-RECONNECT-STALE-ROWS): the Streamer's retry restarts the cold
+// start from a new snapshot (ADR-0109 §B). On a stream that copies several
+// tables in one VStream (the keyspace-wide open `schema add-table` uses)
+// vttablet also replays deterministically before every later table, so a
+// retry would meet it again: terminal.
+func copyRowChangeRefusal(keyspace, shard, table string, rc *binlogdata.RowChange, fields []*query.Field, singleTableStream bool) error {
 	var shape string
 	switch {
 	case rc.GetBefore() == nil && rc.GetAfter() != nil:
@@ -239,12 +259,23 @@ func copyRowChangeRefusal(keyspace, shard, table string, rc *binlogdata.RowChang
 	default:
 		shape = "a row change with neither image"
 	}
+	if singleTableStream {
+		return &retriableMySQLError{err: fmt.Errorf("mysql/vstream: snapshot: %w: table %s.%s received %s on shard %s while that "+
+			"shard was still copying it. A copy row carries only an after image, so this is a change Vitess replayed inside the "+
+			"copy: vtgate restarted that shard's stream mid-copy (a reparent, a vttablet restart, maintenance) and vttablet "+
+			"caught up before copying on. The copy cannot apply it in order against the rows it has buffered, so this copy "+
+			"stops and is retried from a new snapshot: a sync cold start restarts it automatically (a first cold start clears "+
+			"the in-scope target tables first), and any other command can simply be run again",
+			errCopyRowChangeRefused, keyspace, table, shape, shard)}
+	}
 	return fmt.Errorf("mysql/vstream: snapshot: %w: table %s.%s received %s on shard %s while that shard was still copying it. "+
-		"A copy row carries only an after image, so this is a change vttablet replayed inside the copy (its catch-up before "+
-		"the next table of a multi-table stream), which the copy cannot apply in order; copying on would leave the target "+
-		"different from the source. A cold start copies each table in its own stream, which replays nothing: run "+
-		"`sluice sync start --source-driver=... --source=... --target-driver=... --target=...` with the table in scope "+
-		"(and `--restart-from-scratch` for an established stream)",
+		"A copy row carries only an after image, so this is a change Vitess replayed inside the copy: this stream copies "+
+		"several tables in one VStream (`sluice schema add-table` copies the whole keyspace that way), and before each later "+
+		"table vttablet replays the changes made to the tables it already copied (or vtgate restarted the shard's stream). "+
+		"The copy cannot apply it in order, and a retry would meet the same replay, so this copy stops. Bring the table in "+
+		"with a re-copy instead, which copies each table in its own stream: with the stream stopped, run "+
+		"`sluice sync start --source-driver=... --source=... --target-driver=... --target=... --stream-id=...` with "+
+		"--include-table naming every table of the stream and this one, and --restart-from-scratch",
 		errCopyRowChangeRefused, keyspace, table, shape, shard)
 }
 

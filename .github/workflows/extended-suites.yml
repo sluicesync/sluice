@@ -313,7 +313,7 @@ jobs:
     name: Pipeline vstream suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 140
+    timeout-minutes: 142
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
       # The -run alternation, defined ONCE so the budget guard below and
@@ -385,6 +385,9 @@ jobs:
       # 331): +1, TestStreamer_VStreamShardSkewCopy — a one-, a two- and a
       # four-shard vttestserver boot and six cells, each a 160,000-row copy
       # through the 512 KB/s proxy (~7m locally) — makes 32, 134m/140m.
+      # +1 cell in the same test (its AddTable group: a second one-shard
+      # boot, an establishing cold start, a refused add-table and a
+      # --restart-from-scratch re-copy, ~2m locally) — still 32, 136m/142m.
       VSTREAM_PIPELINE_EXPECTED_TESTS: "32"
     steps:
       - uses: actions/checkout@v7
@@ -430,7 +433,7 @@ jobs:
       - name: Run the pipeline vstream tests
         run: |
           set -o pipefail
-          go test -tags='integration vstream' -race -count=1 -timeout=134m \
+          go test -tags='integration vstream' -race -count=1 -timeout=136m \
             -run "$VSTREAM_PIPELINE_RUN" -v ./internal/pipeline/ 2>&1 | tee vstream-pipeline.out
           # Second half of the TEST-9 guard, mirroring the filtered-tag-
           # gate's per-test PASS assert: every matched test must have

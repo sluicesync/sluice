@@ -2099,7 +2099,7 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 		// A shard still copying sends copy rows (an after image only). A
 		// replayed change it cannot apply refuses this table; it is never
 		// skipped (the skip this replaced dropped every DELETE).
-		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields); err != nil {
+		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields, len(s.copyTables) == 1); err != nil {
 			s.refuseTableLocked(tableName, err)
 			return nil
 		}

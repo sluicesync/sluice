@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"vitess.io/vitess/go/vt/proto/query"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline/migcore"
 )
 
 // Unit pins for VSTREAM-SHARD-SKEW-COPY-CHANGES-DROPPED (Bug 331) and the
@@ -82,22 +84,39 @@ func TestCopyRowChangeRefusal_Shapes(t *testing.T) {
 		{"delete", &binlogdata.RowChange{Before: makeRow([]string{"1", "a"})}, keyed, "a DELETE"},
 		{"neither image", &binlogdata.RowChange{}, keyed, "neither image"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := copyRowChangeRefusal("main", "-80", "t", tc.rc, tc.fields)
-			if tc.refuse == "" {
-				if err != nil {
-					t.Fatalf("refused an appliable change: %v", err)
+		for _, single := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/single-table-stream=%v", tc.name, single), func(t *testing.T) {
+				err := copyRowChangeRefusal("main", "-80", "t", tc.rc, tc.fields, single)
+				if tc.refuse == "" {
+					if err != nil {
+						t.Fatalf("refused an appliable change: %v", err)
+					}
+					return
 				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("applied a %s; want %s", tc.name, copyRowChangeRefusedMarker)
-			}
-			if !errors.Is(err, errCopyRowChangeRefused) || !strings.Contains(err.Error(), copyRowChangeRefusedMarker) ||
-				!strings.Contains(err.Error(), tc.refuse) || !strings.Contains(err.Error(), "shard -80") {
-				t.Fatalf("refusal = %v; want the marker, %q and the shard", err, tc.refuse)
-			}
-		})
+				if err == nil {
+					t.Fatalf("applied a %s; want %s", tc.name, copyRowChangeRefusedMarker)
+				}
+				if !errors.Is(err, errCopyRowChangeRefused) || !strings.Contains(err.Error(), copyRowChangeRefusedMarker) ||
+					!strings.Contains(err.Error(), tc.refuse) || !strings.Contains(err.Error(), "shard -80") {
+					t.Fatalf("refusal = %v; want the marker, %q and the shard", err, tc.refuse)
+				}
+				// The classification, through the wrap the pipeline's copy
+				// puts on a reader error (migcore.ReaderStreamErr), read the
+				// way runWithRetry reads it (classifyRetriable): a
+				// single-table stream's refusal is a vtgate shard retry's
+				// replay and must restart the copy; a multi-table stream's
+				// replay is deterministic and must stay terminal.
+				wrapped := migcore.ReaderStreamErr(errReader{err}, &ir.Table{Name: "t"})
+				var re ir.RetriableError
+				retriable := errors.As(wrapped, &re) && re.Retriable()
+				if retriable != single {
+					t.Fatalf("retriable = %v for single-table-stream=%v; want %v: %v", retriable, single, single, wrapped)
+				}
+				if !errors.Is(wrapped, errCopyRowChangeRefused) {
+					t.Fatalf("the pipeline wrap lost the marker sentinel: %v", wrapped)
+				}
+			})
+		}
 	}
 }
 
@@ -352,7 +371,61 @@ func TestVStreamConcurrentCopy_CopyPhaseDeleteRefusesItsTable(t *testing.T) {
 	s.mu.Lock()
 	s.readTables = map[string]bool{"t": true}
 	s.mu.Unlock()
-	if err := s.Err(); !errors.Is(err, errCopyRowChangeRefused) {
+	err := s.Err()
+	if !errors.Is(err, errCopyRowChangeRefused) {
 		t.Fatalf("Err = %v; want %s", err, copyRowChangeRefusedMarker)
+	}
+	// Every concurrent stream copies one table, so its replay can only be a
+	// vtgate shard retry's: retriable.
+	var re ir.RetriableError
+	if !errors.As(err, &re) || !re.Retriable() {
+		t.Fatalf("Err = %v; want it retriable (a concurrent stream copies one table)", err)
+	}
+}
+
+// errReader is an [ir.RowReader] whose Err is a fixed error, for reading a
+// refusal through the pipeline's reader-error wrap.
+type errReader struct{ err error }
+
+func (r errReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) { return nil, r.err }
+func (r errReader) Err() error                                                 { return r.err }
+
+// TestVStreamSnapshot_CopyPhaseRefusalClassifiedByStreamScope: the
+// sequential dispatcher classifies the refusal by the stream's copy scope. A
+// stream copying one table (the default per-table copy, a one-table scope)
+// can only be replaying after a vtgate shard retry: retriable, so the
+// Streamer restarts the cold start (VSTREAM-VTGATE-SHARD-RETRY-CATCHUP-DELETES).
+// The keyspace-wide stream (no table list, `schema add-table`) also replays
+// deterministically before every later table: terminal.
+func TestVStreamSnapshot_CopyPhaseRefusalClassifiedByStreamScope(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		scope     []string
+		retriable bool
+	}{
+		{"one-table stream", []string{"t"}, true},
+		{"keyspace-wide stream", nil, false},
+		{"multi-table stream", []string{"t", "u"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestSnapshotStream()
+			s.copyTables = tc.scope
+			for _, ev := range []*binlogdata.VEvent{
+				scbField("-80", scbFields()),
+				scbRow("-80", &binlogdata.RowChange{Before: makeRow([]string{"1", "a"})}),
+			} {
+				if _, err := s.dispatchCopyEvent(ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.mu.Lock()
+			s.readTables = map[string]bool{"t": true}
+			s.mu.Unlock()
+			err := s.Err()
+			var re ir.RetriableError
+			if got := errors.As(err, &re) && re.Retriable(); got != tc.retriable || !errors.Is(err, errCopyRowChangeRefused) {
+				t.Fatalf("Err = %v: retriable=%v, want %v (and the marker)", err, got, tc.retriable)
+			}
+		})
 	}
 }

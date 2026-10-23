@@ -543,7 +543,7 @@ func (cs *copyStream) bufferRow(table string, ev *binlogdata.VEvent) error {
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields); err != nil {
+		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields, true); err != nil {
 			s.mu.Lock()
 			s.refuseTableLocked(tableName, err)
 			s.mu.Unlock()
