@@ -290,15 +290,25 @@ func TestVStreamSnapshot_CopyPhaseDeleteRefusesItsTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	delivered := 0
-	for range ch {
-		delivered++
-	}
-	if delivered != 0 {
-		t.Errorf("the refused table delivered %d row(s); want none", delivered)
-	}
-	if ctx.Err() != nil {
-		t.Fatal("the refused table's read waited for the copy instead of closing")
+	drained := make(chan int, 1)
+	go func() {
+		n := 0
+		for range ch {
+			n++
+		}
+		drained <- n
+	}()
+	select {
+	case delivered := <-drained:
+		if delivered != 0 {
+			t.Errorf("the refused table delivered %d row(s); want none", delivered)
+		}
+	case <-time.After(3 * time.Second):
+		// Nothing here completes the copy, so a read that does not close
+		// on the refusal waits forever; end it so the test reports.
+		s.failCopy(errors.New("test: the refused table's read never closed"))
+		<-drained
+		t.Fatal("the refused table's read waited for the copy instead of closing on the refusal")
 	}
 	if err := rr.Err(); !errors.Is(err, errCopyRowChangeRefused) {
 		t.Fatalf("Err after reading the refused table = %v; want %s", err, copyRowChangeRefusedMarker)
