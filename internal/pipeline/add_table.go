@@ -221,13 +221,14 @@ type AddTable struct {
 	//
 	// Trade-off: LiveMode skips the `stop_requested_at` refusal in
 	// favour of an explicit invariant check (snapshot-LSN ≥ slot
-	// confirmed_flush_lsn captured at publication-add time). Two
-	// engine pairs take the live path — see preflightLive: a
-	// publication-bearing source (PG, publication-add) and a binlog-CDC
-	// source writing to a MySQL-family target whose applier exposes
-	// RecordLiveAddedTable (the MySQL filter-flip, ADR-0034). Any other
-	// pair — a VStream source among them — refuses with a clear error
-	// directing the operator at the drained add-table flow. The CLI
+	// confirmed_flush_lsn captured at publication-add time). Only a
+	// publication-bearing source (PG, publication-add) takes the live
+	// path — see preflightLive. Every other source refuses before
+	// anything is written and names the drained add-table flow: a binlog
+	// source (NO-DRAIN-BINLOG-SOURCE; ADR-0034's filter-flip lost every
+	// change made to the table between the add's snapshot and the stream
+	// admitting it, which spans the whole copy, not a poll interval), a
+	// VStream source (NO-DRAIN-VSTREAM-SOURCE), and the rest. The CLI
 	// flag is `--no-drain` on `sluice schema add-table`.
 	LiveMode bool
 
@@ -615,12 +616,9 @@ func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, p
 	// this in practice, but the explicit check pins the invariant so
 	// a future regression in the flow's ordering fails loudly rather
 	// than producing silent drift on the new table.
-	//
-	// MySQL's filter-flip path (ADR-0034) has no equivalent invariant —
-	// the binlog auto-includes every table by construction, so the
-	// snapshot's binlog position is the only floor and no separate
-	// "before-the-mechanism" position needs comparing against it.
-	if a.LiveMode && preflight.mode == liveModePublicationAdd {
+	// It is the only live path: preflightLive refuses --no-drain on every
+	// source without a publication.
+	if a.LiveMode {
 		if err := a.verifyLiveModeLSNInvariant(ctx, preflight.slotConfirmedFlushLSN, stream.Position); err != nil {
 			return err
 		}
@@ -824,20 +822,22 @@ func (a *AddTable) recordAddedTable(ctx context.Context, applier ir.ChangeApplie
 		))
 	}
 	slog.InfoContext(ctx, "add-table: recorded the table in the stream's live-added set: it is in the stream's scope on every "+
-		"start from now on (only `schema add-table --abandon` takes it out), and a running stream picks it up on its next poll "+
-		"tick; a stream whose --exclude-table names it refuses (LIVE-ADDED-TABLE-EXCLUDED) until one of the two changes",
+		"start from now on (only `schema add-table --abandon` takes it out); on a publication source a running stream applies it from "+
+		"the publication add, but on any other source a stream that was still running picks it up only at its next poll tick and "+
+		"has dropped the table's changes until then, so the stream must have been stopped for the add; "+
+		"a stream whose --exclude-table names it refuses (LIVE-ADDED-TABLE-EXCLUDED) until one of the two changes",
 		slog.String("table", a.TableName), slog.String("stream_id", a.StreamID))
 	return nil
 }
 
 // logAddComplete emits the terminal success line, tailored to whether
-// the add ran live (the active stream picks up new-table events on its
-// next consumption) or drained (operator must `sluice sync start
-// --resume`).
+// the add ran live (only on a publication source: the publication has
+// delivered the table to the running stream since before the snapshot)
+// or drained (operator must restart the stream).
 func (a *AddTable) logAddComplete(ctx context.Context) {
 	if a.LiveMode {
 		slog.InfoContext(
-			ctx, "add-table: live add complete; the active stream's tail will pick up new-table events on its next consumption",
+			ctx, "add-table: live add complete; the running stream has applied the table's changes since the publication add, before the snapshot",
 			slog.String("table", a.TableName),
 			slog.String("stream_id", a.StreamID),
 		)
@@ -1041,26 +1041,6 @@ func (a *AddTable) validate() error {
 	return migcore.ValidateTargetSchema(a.Target, a.TargetSchema)
 }
 
-// liveAddMode encodes which Phase 2 mechanism the orchestrator picked
-// based on engine capabilities. Drives the post-bulk-copy step
-// (publication-add → no-op for MySQL filter-flip; record column → no-op
-// for PG). Zero value is the PG path (preserves pre-ADR-0034 behaviour).
-type liveAddMode int
-
-const (
-	// liveModePublicationAdd is the PG mechanism (ADR-0030):
-	// publication-add-then-snapshot, idempotent applier absorbs the
-	// [snapshot-LSN, slot-LSN] overlap. Zero value.
-	liveModePublicationAdd liveAddMode = iota
-
-	// liveModeBinlogFilterFlip is the MySQL mechanism (ADR-0034): the
-	// orchestrator records the new table on the per-target
-	// sluice_cdc_state.live_added_tables column after bulk-copy
-	// succeeds; the running streamer's poll goroutine merges into the
-	// dispatch filter on its next tick.
-	liveModeBinlogFilterFlip
-)
-
 // addTablePreflight is the orchestrator-side state captured during
 // the stream pre-flight: the active stream exists, the recorded
 // target-schema namespace, and (in live mode) the active stream's
@@ -1076,15 +1056,9 @@ const (
 // the schema writer / row writer / change applier — either inherited
 // from the recorded value, supplied by the operator, or (when both
 // sides agreed-empty) the empty string for "use the DSN default."
-//
-// mode encodes which Phase 2 mechanism the orchestrator chose based
-// on engine capabilities (PG publication-add vs MySQL filter-flip).
-// Drained-mode runs leave the field at the zero value; only live-mode
-// runs consult it for post-bulk-copy dispatch.
 type addTablePreflight struct {
 	slotConfirmedFlushLSN string
 	resolvedTargetSchema  string
-	mode                  liveAddMode
 }
 
 // preflightStream verifies the active stream's row exists on the
@@ -1160,7 +1134,7 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 	}
 
 	if a.LiveMode {
-		live, err := a.preflightLive(ctx, applier, status)
+		live, err := a.preflightLive(ctx, status)
 		if err != nil {
 			return addTablePreflight{}, err
 		}
@@ -1238,52 +1212,81 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 	return nil
 }
 
-// preflightLive applies the live-mode refusals and captures any
-// engine-specific floor (PG slot confirmed_flush_lsn, MySQL nothing
-// today) needed by later phases. Two paths, dispatched by source-
-// engine capability:
+// preflightLive applies the live-mode refusals and captures the
+// publication path's floor. Only a publication-bearing source has a live
+// path (`publicationAdder`, Postgres, ADR-0030): it captures the active
+// stream's slot confirmed_flush_lsn so the snapshot-LSN ≥ slot-LSN
+// invariant can be checked after the snapshot opens, and refuses if the
+// source doesn't also implement `slotPositionReader` (a code-side
+// guarantee on PG; the absence indicates a build with the engine surface
+// stripped).
 //
-//   - PG (`publicationAdder`): ADR-0030. Captures the active stream's
-//     slot confirmed_flush_lsn so the snapshot-LSN ≥ slot-LSN
-//     invariant can be checked after the snapshot opens. Refuses if
-//     the source doesn't also implement `slotPositionReader` (a code-
-//     side guarantee on PG; the absence indicates a build with the
-//     engine surface stripped).
+// Every other source refuses, before anything is written
+// ([noDrainLivePathRefusal]).
+func (a *AddTable) preflightLive(ctx context.Context, status ir.StreamStatus) (addTablePreflight, error) {
+	if err := noDrainLivePathRefusal(a.Source, status); err != nil {
+		return addTablePreflight{}, err
+	}
+	return a.preflightLivePG(ctx, status)
+}
+
+// noDrainLivePathRefusal is the --no-drain source decision: nil for a
+// publication-bearing source (the one live path), otherwise
+// [noDrainRefusal]'s message for the stream's CDC method
+// ([streamSourceCDC]: the declared driver and the stream's recorded
+// position), each naming the drained add-table flow. Pinned across every
+// registered engine by TestNoDrainLivePath_EngineMatrix.
+func noDrainLivePathRefusal(source ir.Engine, status ir.StreamStatus) error {
+	if _, publicationSource := source.(publicationAdder); publicationSource {
+		return nil
+	}
+	sourceCDC, cdcFrom := streamSourceCDC(source, status)
+	return noDrainRefusal(source.Name(), sourceCDC, cdcFrom)
+}
+
+// noDrainRefusal is the --no-drain refusal for a source without a
+// publication. Two sources get their own marker, because each reached a
+// live path that lost data:
 //
-//   - MySQL binlog (a binlog-CDC source, and `liveAddedTablesWriter` on a
-//     MySQL-family target's applier, since MySQL's filter-flip mechanism
-//     is target-side): ADR-0034. No source-side floor to capture (the
-//     binlog auto-includes everything by construction — the snapshot's
-//     own binlog position is the only floor that matters, and it's
-//     captured at open time).
+//   - a BINLOG source (MySQL, MariaDB; NO-DRAIN-BINLOG-SOURCE) took
+//     ADR-0034's filter-flip. The copy reads a snapshot fixed when it
+//     opens, the table joins the running stream's scope only after the
+//     copy, and the stream drops the table's changes until its poll admits
+//     it while its position moves past them. ADR-0034 called that window
+//     the poll lag; it is the whole copy.
+//     TestAddTableNoDrainWindow_Binlog_MySQLToMySQL_Live measured every
+//     change made between the snapshot and admission lost (60 deletes kept,
+//     30 updates stale, 30 inserts missing), with a 200ms poll as with 5s,
+//     on MySQL and MariaDB, at exit 0 with no WARN.
+//   - a VStream source (planetscale, vitess; NO-DRAIN-VSTREAM-SOURCE) took
+//     the same path with a keyspace-wide copy that also drops its own
+//     catch-up deletes (TestStreamer_VStreamAddTableKeyspaceWideCopy: 80
+//     deletes and 10 updates stale, surviving restarts).
 //
-// [liveAddPathFor] decides which. A VStream source refuses with its own
-// message (noDrainVStreamSourceMarker); every other pair refuses with
-// the generic one. Both name the drained add-table flow, and both run
-// before anything is written.
-func (a *AddTable) preflightLive(ctx context.Context, applier ir.ChangeApplier, status ir.StreamStatus) (addTablePreflight, error) {
-	_, publicationSource := a.Source.(publicationAdder)
-	_, recordsLiveAdds := applier.(liveAddedTablesWriter)
-	sourceCDC, cdcFrom := streamSourceCDC(a.Source, status)
-	mode, ok := liveAddPathFor(publicationSource, sourceCDC, engineNameOrEmpty(a.Target), recordsLiveAdds)
-	switch {
-	case ok && mode == liveModePublicationAdd:
-		return a.preflightLivePG(ctx, status)
-	case ok:
-		return a.preflightLiveBinlog(ctx, applier, status)
-	case sourceCDC == ir.CDCVStream:
-		return addTablePreflight{}, fmt.Errorf(
+// Every other source (the trigger-CDC engines, and engines with no CDC,
+// which validate refuses earlier) gets the generic refusal.
+//
+// Pinned across every registered engine by TestNoDrainLivePath_EngineMatrix.
+func noDrainRefusal(source string, sourceCDC ir.CDCMethod, cdcFrom string) error {
+	switch sourceCDC {
+	case ir.CDCBinlog:
+		return fmt.Errorf(
+			"pipeline: add-table: %s: --no-drain is not supported on a binlog source (source=%q; binlog per %s): the add copies the table from a snapshot fixed when it opens, and the running stream drops every change to the table until it admits the table after the copy, so every delete, update and insert made to it during the add would be lost. %s",
+			noDrainBinlogSourceMarker, source, cdcFrom, drainedAddTableFlow,
+		)
+	case ir.CDCVStream:
+		return fmt.Errorf(
 			"pipeline: add-table: %s: --no-drain is not supported on a VStream source (source=%q; VStream per %s): its add-table copy is one keyspace-wide snapshot that drops the deletes made during it, and the running stream drops every change to the table until the copy finishes, so the table would be left with rows the source deleted or changed. %s",
-			noDrainVStreamSourceMarker, a.Source.Name(), cdcFrom, drainedAddTableFlow,
+			noDrainVStreamSourceMarker, source, cdcFrom, drainedAddTableFlow,
 		)
 	}
-	return addTablePreflight{}, fmt.Errorf(
-		"pipeline: add-table: --no-drain requires either a publication-bearing source engine (PG) or a binlog source (MySQL, MariaDB) writing to a MySQL-family target whose applier exposes RecordLiveAddedTable; source=%q target=%q is neither. %s",
-		a.Source.Name(), a.Target.Name(), drainedAddTableFlow,
+	return fmt.Errorf(
+		"pipeline: add-table: --no-drain requires a publication-bearing source engine (Postgres); source=%q (cdc=%s) is not one. %s",
+		source, sourceCDC, drainedAddTableFlow,
 	)
 }
 
-// drainedAddTableFlow is the remedy both --no-drain refusals name. The
+// drainedAddTableFlow is the remedy every --no-drain refusal names. The
 // stop must hold for the whole add: add-table does not detect a stream
 // that is still running (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED), and a
 // fleet supervisor's Reconcile restarts a stopped leg that is still in its
@@ -1329,39 +1332,9 @@ func streamSourceCDC(source ir.Engine, status ir.StreamStatus) (method ir.CDCMet
 // refusal for a VStream (PlanetScale/Vitess) source carries.
 const noDrainVStreamSourceMarker = "NO-DRAIN-VSTREAM-SOURCE"
 
-// liveAddPathFor picks the --no-drain mechanism for an engine pair, or
-// reports that the pair has none (ok false), from what the pair declares:
-//
-//   - a source that extends a publication (Postgres) takes the ADR-0030
-//     publication-add path, whatever the target;
-//   - a BINLOG source (sourceCDC == ir.CDCBinlog: vanilla MySQL, MariaDB)
-//     writing to a MySQL-family target whose applier records live-added
-//     tables takes the ADR-0034 filter-flip path. The source check is the
-//     CDC capability, not "MySQL-family": a VStream source
-//     (planetscale/vitess) is MySQL-family but has no binlog tail that
-//     includes every table, and through it the filter-flip path left the
-//     added table with the copy's dropped deletes and every change the
-//     running stream made before its poll admitted the table
-//     (noDrainVStreamSourceMarker; TestStreamer_VStreamAddTableKeyspaceWideCopy
-//     measured 80 deletes and 10 updates stale, surviving restarts). The
-//     trigger-CDC sources (postgres-trigger, sqlite-trigger, d1-trigger)
-//     are not binlog sources either: the --no-drain help never listed them,
-//     the filter-flip path was never measured against them, and they now
-//     take the generic refusal instead of reaching it.
-//
-// Pinned across every registered engine by TestLiveAddPathFor_EngineMatrix.
-func liveAddPathFor(publicationSource bool, sourceCDC ir.CDCMethod, targetEngine string, targetRecordsLiveAdds bool) (liveAddMode, bool) {
-	switch {
-	case publicationSource:
-		return liveModePublicationAdd, true
-	// The filter-flip live path is MySQL-target-only (ADR-0034). Since Bug
-	// 321 R6 A the Postgres applier carries a live-added set too, so the
-	// surface alone no longer identifies the path.
-	case sourceCDC == ir.CDCBinlog && targetRecordsLiveAdds && migcore.IsMySQLFamilyEngine(targetEngine):
-		return liveModeBinlogFilterFlip, true
-	}
-	return 0, false
-}
+// noDrainBinlogSourceMarker is the grep-stable marker the --no-drain
+// refusal for a MySQL or MariaDB binlog source carries.
+const noDrainBinlogSourceMarker = "NO-DRAIN-BINLOG-SOURCE"
 
 // preflightLivePG is the original ADR-0030 preflight: capture the
 // active stream's slot confirmed_flush_lsn so the snapshot-LSN ≥
@@ -1395,37 +1368,7 @@ func (a *AddTable) preflightLivePG(ctx context.Context, status ir.StreamStatus) 
 		slog.String("slot_source", slotNameSource(status)),
 		slog.String("confirmed_flush_lsn", lsn),
 	)
-	return addTablePreflight{slotConfirmedFlushLSN: lsn, mode: liveModePublicationAdd}, nil
-}
-
-// preflightLiveBinlog is the ADR-0034 preflight for binlog-source
-// engines (MySQL). The "filter-flip" mechanism is target-side: the
-// orchestrator records the new table on
-// `sluice_cdc_state.live_added_tables` after bulk-copy succeeds, and
-// the running streamer's poll goroutine merges it into the dispatch
-// filter on its next tick. There's no source-side floor to capture
-// today — the binlog auto-includes every table by construction, so
-// the only floor that matters is the snapshot's own binlog position,
-// captured at OpenSnapshotStream time.
-//
-// The preflight surfaces the chosen path in the log so an operator
-// inspecting the run can confirm which mechanism fired.
-func (a *AddTable) preflightLiveBinlog(ctx context.Context, applier ir.ChangeApplier, _ ir.StreamStatus) (addTablePreflight, error) {
-	// Defensive: the structural-interface dispatch in preflightLive
-	// already type-asserted, so this should always succeed.
-	if _, ok := applier.(liveAddedTablesWriter); !ok {
-		return addTablePreflight{}, fmt.Errorf(
-			"pipeline: add-table: --no-drain (binlog-source path): target applier does not implement RecordLiveAddedTable; %q",
-			a.Target.Name(),
-		)
-	}
-	slog.InfoContext(
-		ctx, "add-table: live mode: binlog-source filter-flip path (ADR-0034)",
-		slog.String("source", a.Source.Name()),
-		slog.String("target", a.Target.Name()),
-		slog.String("stream_id", a.StreamID),
-	)
-	return addTablePreflight{mode: liveModeBinlogFilterFlip}, nil
+	return addTablePreflight{slotConfirmedFlushLSN: lsn}, nil
 }
 
 // schemaSourceLabel returns a diagnostic tag for the

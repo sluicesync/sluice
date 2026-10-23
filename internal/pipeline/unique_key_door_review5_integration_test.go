@@ -120,9 +120,15 @@ func TestStreamer_UniqueKeyDoor_Review5AddTableAcceptedKey(t *testing.T) {
 		"INSERT INTO kd VALUES (1,'a',1,'one'),(2,'b',1,'two');")
 	actx, acancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer acancel()
+	// The shape under test is a table added while the stream runs. --no-drain
+	// on a binlog source refuses now (NO-DRAIN-BINLOG-SOURCE), so the state is
+	// reached the one way a MySQL stream still can: a drained add the operator
+	// ran without stopping the stream, which add-table does not detect
+	// (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED in docs/dev/audit-backlog.md).
+	// When that door is closed, this pin needs a Postgres live-add twin.
 	if err := (&AddTable{
 		Source: mysqlEng, Target: mysqlEng, SourceDSN: srcDSN, TargetDSN: tgtDSN,
-		StreamID: streamID, TableName: "kd", LiveMode: true, AcceptTargetOnlyUniqueKeys: accept,
+		StreamID: streamID, TableName: "kd", AcceptTargetOnlyUniqueKeys: accept,
 	}).Run(actx); err != nil {
 		t.Fatalf("add-table with the key accepted: %v", err)
 	}

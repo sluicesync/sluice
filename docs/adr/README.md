@@ -56,7 +56,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | [0031](adr-0031-multi-source-aggregation-target-schema.md) | Multi-source aggregation via `--target-schema NAME` (PG-only) |
 | [0032](adr-0032-pg-extension-passthrough.md) | PG extension passthrough catalog — 7-extension enumerated allowlist |
 | [0033](adr-0033-mid-stream-live-add-strict-zero-loss.md) | Strict zero-loss correctness for live add-table (Bug 36 closure) |
-| [0034](adr-0034-mysql-phase-2-live-add-table.md) | MySQL Phase 2 live add-table via streamer-side filter-flip. Its additive-override rule (a live-added table wins over `--exclude-table`) is **superseded** in v0.163.0 (Bug 321): the contradiction refuses as `LIVE-ADDED-TABLE-EXCLUDED` |
+| [0034](adr-0034-mysql-phase-2-live-add-table.md) | MySQL Phase 2 live add-table via streamer-side filter-flip. Its additive-override rule (a live-added table wins over `--exclude-table`) is **superseded** in v0.163.0 (Bug 321): the contradiction refuses as `LIVE-ADDED-TABLE-EXCLUDED`. The live path itself is **withdrawn** (2026-10-23): it lost every change made to the new table during the copy, so `--no-drain` on a binlog source refuses `NO-DRAIN-BINLOG-SOURCE` |
 | [0035](adr-0035-postgis-geometry-spatial-support.md) | PostGIS-aware geometry translation with SRID preserved cross-engine |
 | [0036](adr-0036-mid-stream-loss-surface-characterization.md) | Mid-stream loss-surface characterization (post-Bug-36 audit) |
 

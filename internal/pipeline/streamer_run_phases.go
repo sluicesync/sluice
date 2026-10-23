@@ -1059,7 +1059,7 @@ func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.
 
 	// ---- 4a. Live-added-tables poll for ADR-0034 (MySQL Phase 2
 	// mid-stream live add-table). The orchestrator's
-	// `sluice schema add-table --no-drain TABLE` writes the new table
+	// `sluice schema add-table TABLE` writes the new table
 	// into the per-target sluice_cdc_state row's live_added_tables
 	// column; the poll goroutine here picks that up on its 5s tick
 	// cadence and merges into the dispatch filter additively. The

@@ -1067,8 +1067,9 @@ func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error 
 
 // ReadLiveAddedTables returns the comma-parsed live_added_tables
 // column for streamID — the set of tables that have been live-added to
-// this stream's scope by `sluice schema add-table --no-drain`
-// (ADR-0034 MySQL Phase 2). The pipeline streamer's poll goroutine
+// this stream's scope by `sluice schema add-table` (ADR-0034; every add
+// since Bug 321 R6 A, and `--no-drain` on a binlog source is refused,
+// NO-DRAIN-BINLOG-SOURCE). The pipeline streamer's poll goroutine
 // calls this on its tick cadence to keep its in-memory dispatch
 // filter in sync.
 //
@@ -1085,7 +1086,7 @@ func (a *ChangeApplier) ReadLiveAddedTables(ctx context.Context, streamID string
 
 // RecordLiveAddedTable appends tableName to the per-target row's
 // live_added_tables column for streamID. ADR-0034. Called by the
-// add-table --no-drain orchestrator on a successful live-add. The
+// add-table orchestrator on every successful add. The
 // streamer's poll goroutine picks the change up on its next tick;
 // from that point onwards, binlog events on the new table reach the
 // applier.

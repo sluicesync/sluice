@@ -1,15 +1,18 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Pins for liveAddPathFor, the `schema add-table --no-drain` engine-pair
-// decision, and for the NO-DRAIN-VSTREAM-SOURCE refusal it feeds.
+// Pins for the `schema add-table --no-drain` source decision: only a
+// publication-bearing source has a live path, and every other source
+// refuses with noDrainRefusal's message for its CDC method
+// (NO-DRAIN-BINLOG-SOURCE, NO-DRAIN-VSTREAM-SOURCE, or the generic one).
 //
 // The matrix walks the REAL engine registry rather than a stub: whether a
 // source is a publication source is a type assertion against the concrete
 // engine, and its CDC method is its declared capability, so only the real
 // engines say which path each one reaches. A registered engine the table
 // below does not classify fails the test, so a new engine cannot join the
-// live paths unexamined.
+// live path unexamined. The target plays no part in the decision any more
+// (the binlog filter-flip, the only target-dependent path, is refused).
 
 package pipeline
 
@@ -30,50 +33,31 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
-// liveAddSourceClass is what a source engine's --no-drain path should be.
-type liveAddSourceClass int
+// noDrainLive marks the one source class with a live path.
+const noDrainLive = "live"
 
-const (
-	liveAddNone        liveAddSourceClass = iota // refuses with every target
-	liveAddPublication                           // publication-add, every target
-	liveAddBinlog                                // filter-flip, MySQL-family targets only
-)
+// noDrainExpected classifies every registered engine as a --no-drain
+// source: noDrainLive, a refusal marker, or "" for the generic refusal.
+var noDrainExpected = map[string]string{
+	"postgres":    noDrainLive,
+	"mysql":       noDrainBinlogSourceMarker,
+	"mariadb":     noDrainBinlogSourceMarker,
+	"planetscale": noDrainVStreamSourceMarker,
+	"vitess":      noDrainVStreamSourceMarker,
 
-// liveAddExpected classifies every registered engine as a source.
-var liveAddExpected = map[string]liveAddSourceClass{
-	"postgres":    liveAddPublication,
-	"mysql":       liveAddBinlog,
-	"mariadb":     liveAddBinlog,
-	"planetscale": liveAddNone, // VStream: NO-DRAIN-VSTREAM-SOURCE
-	"vitess":      liveAddNone, // VStream: NO-DRAIN-VSTREAM-SOURCE
+	"postgres-trigger": "",
+	"sqlite-trigger":   "",
+	"d1-trigger":       "",
 
-	"postgres-trigger": liveAddNone,
-	"sqlite-trigger":   liveAddNone,
-	"d1-trigger":       liveAddNone,
-
-	"sqlite":   liveAddNone,
-	"d1":       liveAddNone,
-	"mydumper": liveAddNone,
-	"csv":      liveAddNone,
-	"tsv":      liveAddNone,
-	"ndjson":   liveAddNone,
+	"sqlite":   "",
+	"d1":       "",
+	"mydumper": "",
+	"csv":      "",
+	"tsv":      "",
+	"ndjson":   "",
 }
 
-func TestLiveAddPathFor_EngineMatrix(t *testing.T) {
-	targets := []struct {
-		name         string
-		mysqlFamily  bool
-		recordsAdded bool
-	}{
-		{"mysql", true, true},
-		{"mariadb", true, true},
-		{"planetscale", true, true},
-		{"vitess", true, true},
-		{"mysql", true, false}, // an applier without the live-added surface
-		{"postgres", false, true},
-		{"postgres", false, false},
-	}
-
+func TestNoDrainLivePath_EngineMatrix(t *testing.T) {
 	names := engines.Names()
 	seen := map[string]bool{}
 	for _, name := range names {
@@ -81,30 +65,35 @@ func TestLiveAddPathFor_EngineMatrix(t *testing.T) {
 		if !ok {
 			t.Fatalf("engines.Get(%q) missed a name engines.Names() reported", name)
 		}
-		want, classified := liveAddExpected[name]
+		want, classified := noDrainExpected[name]
 		if !classified {
-			t.Errorf("registered engine %q has no --no-drain classification in liveAddExpected; decide which live path (if any) it takes as a source", name)
+			t.Errorf("registered engine %q has no --no-drain classification in noDrainExpected; decide whether it has a live path as a source", name)
 			continue
 		}
 		seen[name] = true
-		_, publicationSource := src.(publicationAdder)
+		// The decision preflightLive makes, before the publication path's
+		// slot read (which dials the source).
+		err := noDrainLivePathRefusal(src, ir.StreamStatus{})
+		if want == noDrainLive {
+			if err != nil {
+				t.Errorf("source %s: want the live path, got the refusal %v", name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("source %s: took the live path; want a refusal (marker %q)", name, want)
+			continue
+		}
 		cdc := src.Capabilities().CDC
-		for _, tgt := range targets {
-			mode, ok := liveAddPathFor(publicationSource, cdc, tgt.name, tgt.recordsAdded)
-			switch want {
-			case liveAddPublication:
-				if !ok || mode != liveModePublicationAdd {
-					t.Errorf("source %s (cdc=%s) -> target %s (records=%v): got (mode=%d, ok=%v), want the publication-add path", name, cdc, tgt.name, tgt.recordsAdded, mode, ok)
-				}
-			case liveAddBinlog:
-				wantOK := tgt.mysqlFamily && tgt.recordsAdded
-				if ok != wantOK || (ok && mode != liveModeBinlogFilterFlip) {
-					t.Errorf("source %s (cdc=%s) -> target %s (records=%v): got (mode=%d, ok=%v), want filter-flip=%v", name, cdc, tgt.name, tgt.recordsAdded, mode, ok, wantOK)
-				}
-			case liveAddNone:
-				if ok {
-					t.Errorf("source %s (cdc=%s) -> target %s (records=%v): got a live path (mode=%d), want a refusal", name, cdc, tgt.name, tgt.recordsAdded, mode)
-				}
+		msg := err.Error()
+		for _, m := range []string{noDrainBinlogSourceMarker, noDrainVStreamSourceMarker} {
+			if has := strings.Contains(msg, m); has != (m == want) {
+				t.Errorf("source %s (cdc=%s): marker %s present=%v, want %v; refusal: %v", name, cdc, m, has, m == want, err)
+			}
+		}
+		for _, remedy := range []string{"sluice sync stop --wait", "without --no-drain", "sluice sync start", "Keep the stream stopped"} {
+			if !strings.Contains(msg, remedy) {
+				t.Errorf("source %s: refusal lacks the drained flow's %q: %v", name, remedy, err)
 			}
 		}
 	}
@@ -116,8 +105,8 @@ func TestLiveAddPathFor_EngineMatrix(t *testing.T) {
 		}
 	}
 
-	// The VStream refusal message keys on the CDC capability: bind the
-	// premise that the VStream flavors declare it, and the binlog ones do not.
+	// The markers key on the CDC capability: bind the premise that the
+	// VStream flavors declare VStream and the binlog ones binlog.
 	for name, wantCDC := range map[string]ir.CDCMethod{
 		"planetscale": ir.CDCVStream,
 		"vitess":      ir.CDCVStream,
@@ -175,16 +164,17 @@ func TestAddTable_LiveMode_VStreamSourceRefusesBeforeAnyWrite(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_RecordedVStreamPositionRefuses closes the
-// --source-driver bypass: a stream a VStream streamer started (its recorded
-// position a VGTID) handed to `schema add-table --no-drain --source-driver
-// mysql`, whose DECLARED capability is binlog, still refuses
-// NO-DRAIN-VSTREAM-SOURCE, before anything is written. The controls: the
-// same mysql source with a recorded binlog position, or no position yet,
-// passes the door (and then fails dialling the unreachable source, which is
-// past it). The tokens are the shapes the MySQL codecs write
-// (TestPositionCDCMethod binds them to the encoders).
-func TestAddTable_LiveMode_RecordedVStreamPositionRefuses(t *testing.T) {
+// TestAddTable_LiveMode_RecordedPositionPicksTheRefusal drives Run with the
+// real MySQL-family engines and a stream position recorded on the target:
+// every cell refuses before anything is written, and the marker names the
+// CDC method the stream actually runs on. A VStream stream handed
+// `--source-driver mysql` (declared binlog) refuses NO-DRAIN-VSTREAM-SOURCE
+// from its recorded VGTID; a recorded binlog position, or no position yet,
+// refuses NO-DRAIN-BINLOG-SOURCE; a declared VStream source refuses
+// NO-DRAIN-VSTREAM-SOURCE whatever the position says. The tokens are the
+// shapes the MySQL codecs write (TestPositionCDCMethod binds them to the
+// encoders).
+func TestAddTable_LiveMode_RecordedPositionPicksTheRefusal(t *testing.T) {
 	const (
 		vstreamToken = `[{"keyspace":"ks","shard":"0","gtid":"MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-10"}]`
 		binlogToken  = `{"mode":"gtid","gtid_set":"3e11fa47-71ca-11e1-9e33-c80aa9429562:1-10"}`
@@ -193,13 +183,14 @@ func TestAddTable_LiveMode_RecordedVStreamPositionRefuses(t *testing.T) {
 		name       string
 		source     string
 		position   ir.Position
-		wantRefuse bool
+		wantMarker string
 	}{
-		{"mysql source, recorded vstream position", "mysql", ir.Position{Engine: "mysql", Token: vstreamToken}, true},
-		{"mariadb source, recorded vstream position", "mariadb", ir.Position{Engine: "mysql", Token: vstreamToken}, true},
-		{"mysql source, recorded binlog position", "mysql", ir.Position{Engine: "mysql", Token: binlogToken}, false},
-		{"mysql source, no position yet", "mysql", ir.Position{}, false},
-		{"planetscale source, recorded binlog position", "planetscale", ir.Position{Engine: "mysql", Token: binlogToken}, true},
+		{"mysql source, recorded vstream position", "mysql", ir.Position{Engine: "mysql", Token: vstreamToken}, noDrainVStreamSourceMarker},
+		{"mariadb source, recorded vstream position", "mariadb", ir.Position{Engine: "mysql", Token: vstreamToken}, noDrainVStreamSourceMarker},
+		{"mysql source, recorded binlog position", "mysql", ir.Position{Engine: "mysql", Token: binlogToken}, noDrainBinlogSourceMarker},
+		{"mariadb source, recorded binlog position", "mariadb", ir.Position{Engine: "mysql", Token: binlogToken}, noDrainBinlogSourceMarker},
+		{"mysql source, no position yet", "mysql", ir.Position{}, noDrainBinlogSourceMarker},
+		{"planetscale source, recorded binlog position", "planetscale", ir.Position{Engine: "mysql", Token: binlogToken}, noDrainVStreamSourceMarker},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -215,15 +206,8 @@ func TestAddTable_LiveMode_RecordedVStreamPositionRefuses(t *testing.T) {
 				StreamID: "live", TableName: "new_table",
 				LiveMode: true,
 			}).Run(context.Background())
-			if err == nil {
-				t.Fatal("Run returned nil against an unreachable source; want an error either way")
-			}
-			refused := strings.Contains(err.Error(), noDrainVStreamSourceMarker)
-			if refused != c.wantRefuse {
-				t.Fatalf("refused=%v, want %v; err = %v", refused, c.wantRefuse, err)
-			}
-			if !c.wantRefuse {
-				return
+			if err == nil || !strings.Contains(err.Error(), c.wantMarker) {
+				t.Fatalf("Run = %v; want the %s refusal", err, c.wantMarker)
 			}
 			if len(tgt.applier.recordedLiveAdds) != 0 || tgt.openSchemaWriterCalls != 0 || tgt.openRowWriterCalls != 0 {
 				t.Errorf("wrote before refusing: live adds %v, schema writers %d, row writers %d", tgt.applier.recordedLiveAdds, tgt.openSchemaWriterCalls, tgt.openRowWriterCalls)

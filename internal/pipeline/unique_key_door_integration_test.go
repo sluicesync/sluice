@@ -775,6 +775,18 @@ func TestStreamer_UniqueKeyDoor_AddTable(t *testing.T) {
 		t.Fatal("the stream never delivered the warmup row")
 	}
 	tgt := twfbDB{engine: "mysql", dsn: tgtDSN}
+	// The adds run drained, against the stopped stream: --no-drain on a
+	// binlog source refuses (NO-DRAIN-BINLOG-SOURCE) before this door, and
+	// the door is the same on both paths.
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Streamer.Run returned %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Streamer.Run did not return after cancel")
+	}
 
 	for _, tc := range []struct{ table, remedy string }{{"orders_a", "drop"}, {"orders_b", "accept"}} {
 		t.Run(tc.table+"/"+tc.remedy, func(t *testing.T) {
@@ -789,7 +801,7 @@ func TestStreamer_UniqueKeyDoor_AddTable(t *testing.T) {
 				defer acancel()
 				return (&AddTable{
 					Source: mysqlEng, Target: mysqlEng, SourceDSN: srcDSN, TargetDSN: tgtDSN,
-					StreamID: streamID, TableName: tc.table, LiveMode: true,
+					StreamID: streamID, TableName: tc.table,
 					AcceptTargetOnlyUniqueKeys: accept,
 				}).Run(actx)
 			}
@@ -825,15 +837,5 @@ func TestStreamer_UniqueKeyDoor_AddTable(t *testing.T) {
 				t.Fatal("the add-table copy did not deliver both rows after the remedy")
 			}
 		})
-	}
-
-	cancel()
-	select {
-	case err := <-runErr:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Errorf("Streamer.Run returned %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("Streamer.Run did not return after cancel")
 	}
 }
