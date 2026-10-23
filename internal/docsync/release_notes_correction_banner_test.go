@@ -420,7 +420,12 @@ func TestDeclaredNotesAmendmentsAreBannered(t *testing.T) {
 			t.Errorf("v%s carries no `> **Correction` banner although v%s amended it (%s)",
 				am.amended, am.fixedIn, am.why)
 		}
-		if !strings.Contains(body, "v"+am.fixedIn.String()) {
+		// Scoped to the blockquotes for the same self-reference reason as
+		// the marker above, mirrored: the archive's own H1 names its
+		// version, so for an entry whose fixedIn equals amended a
+		// whole-body search always passes. The v0.163.6 entry was green
+		// with the version stripped from its banner until this scoping.
+		if !strings.Contains(blockquoteText(body), "v"+am.fixedIn.String()) {
 			t.Errorf("v%s's correction banner does not name the fixing version v%s — an operator reading it "+
 				"cannot tell what to upgrade to", am.amended, am.fixedIn)
 		}
@@ -435,7 +440,7 @@ func TestDeclaredNotesAmendmentsAreBannered(t *testing.T) {
 				"CHANGELOG is the second claim home and drifts from the archive when only one is fixed",
 				am.amended, am.fixedIn, am.why)
 		}
-		if !strings.Contains(blk, "v"+am.fixedIn.String()) {
+		if !strings.Contains(correctionParagraphs(blk), "v"+am.fixedIn.String()) {
 			t.Errorf("CHANGELOG §%s's correction does not name the fixing version v%s", am.amended, am.fixedIn)
 		}
 	}
@@ -452,6 +457,34 @@ func stripBlockquotes(body string) string {
 		}
 		sb.WriteString(ln)
 		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+// blockquoteText keeps only the blockquote lines — the inverse of
+// stripBlockquotes — so a check about what the banner says cannot be
+// satisfied by the rest of the archive.
+func blockquoteText(body string) string {
+	var sb strings.Builder
+	for _, ln := range strings.Split(body, "\n") {
+		if strings.HasPrefix(ln, ">") {
+			sb.WriteString(ln)
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
+
+// correctionParagraphs keeps only the blank-line-separated paragraphs of
+// a CHANGELOG block that carry a `**Correction` opener, for the same
+// reason: the block's own entries routinely name its version.
+func correctionParagraphs(blk string) string {
+	var sb strings.Builder
+	for _, p := range strings.Split(blk, "\n\n") {
+		if changelogCorrectionRE.MatchString(p) {
+			sb.WriteString(p)
+			sb.WriteString("\n\n")
+		}
 	}
 	return sb.String()
 }
