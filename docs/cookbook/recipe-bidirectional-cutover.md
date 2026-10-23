@@ -190,9 +190,7 @@ rather than accepted, so nothing silently downgrades if you try it.
 
 ## What's NOT in this recipe
 
-- **Mid-stream schema changes during the sync window.** Use `sluice
-  schema add-table TABLE --stream-id ID --no-drain` for live add-table.
-  See [`docs/schema-change-runbook.md`](../schema-change-runbook.md).
+- **Mid-stream schema changes during the sync window.** To add a table, use the drained flow: `sluice sync stop --wait`, then `sluice schema add-table TABLE --stream-id ID`, then `sluice sync start` with the same `--stream-id`, keeping the stream stopped (no fleet reload, no supervisor restart) until add-table returns, because add-table does not detect a running stream. `--no-drain` (add without stopping) works only on a Postgres source; a MySQL or MariaDB source refuses it (`NO-DRAIN-BINLOG-SOURCE`), as does a PlanetScale or Vitess source (`NO-DRAIN-VSTREAM-SOURCE`). See [`docs/schema-change-runbook.md`](../schema-change-runbook.md).
 - **Backup chains.** See [recipe-backup-encrypted.md](recipe-backup-encrypted.md).
 - **PII redaction during the sync.** See
   [recipe-redaction-keyset.md](recipe-redaction-keyset.md).

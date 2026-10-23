@@ -94,6 +94,8 @@ MySQL has no publication concept; the binlog auto-includes every table with no o
 
 MySQL Phase 2 shipped in v0.27.0 via the streamer-side filter-flip mechanism — see [ADR-0034](adr-0034-mysql-phase-2-live-add-table.md). The same `--no-drain` CLI flag works against both engines now; the orchestrator dispatches by source-engine capability (publication-add for PG, filter-flip for MySQL). MySQL Phase 2 ships with the same best-effort caveat documented in this ADR's § "What could go wrong" item 3 — events on the new table during the brief filter-flip window may not be delivered. The strict-zero-loss roadmap entry now covers both engines.
 
+*Correction (2026-10-23): ADR-0034's filter-flip path is withdrawn, and `--no-drain` now works only on a Postgres source (this ADR's publication-add). The window was not "brief": it spanned the whole copy, and every change made to the new table between the add's snapshot and the stream admitting it was lost at exit 0 (measured on MySQL and MariaDB: 60 deletes kept, 30 updates stale, 30 inserts missing). A MySQL or MariaDB binlog source now refuses `--no-drain` with `NO-DRAIN-BINLOG-SOURCE`, and a PlanetScale or Vitess source, which reached the same path through a target-only check, with `NO-DRAIN-VSTREAM-SOURCE`; the trigger-CDC sources take the generic refusal. Each names the drained add-table flow. See ADR-0034's withdrawal note.*
+
 ## Consequences
 
 - **Operators with HA workloads no longer need a drain window.** `sluice schema add-table TABLE --no-drain` runs against an active stream; the new table joins the stream's scope and is bulk-copied, with no lull in CDC consumption for the existing tables.
