@@ -103,6 +103,12 @@ var (
 	// replays would again reach the target never — the first-boundary
 	// witness only checks boundaries it is handed.
 	_ firstTouchBoundaryArmer = (*mysql.CDCReader)(nil)
+	// NO-DRAIN-VSTREAM-SOURCE's recorded-position half: if this assertion
+	// quietly stopped matching, `schema add-table --no-drain
+	// --source-driver mysql` against a VStream stream would fall back to the
+	// driver's declared binlog capability and take the filter-flip path
+	// again.
+	_ positionCDCClassifier = mysql.Engine{}
 	// Its seeding half (audit 2026-09-01 SLM-1): the prior shape the
 	// refusal above compares against at a table's FIRST boundary. Same
 	// reasoning — an assertion that quietly stopped matching would leave

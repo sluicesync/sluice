@@ -1264,7 +1264,7 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 func (a *AddTable) preflightLive(ctx context.Context, applier ir.ChangeApplier, status ir.StreamStatus) (addTablePreflight, error) {
 	_, publicationSource := a.Source.(publicationAdder)
 	_, recordsLiveAdds := applier.(liveAddedTablesWriter)
-	sourceCDC := a.Source.Capabilities().CDC
+	sourceCDC, cdcFrom := streamSourceCDC(a.Source, status)
 	mode, ok := liveAddPathFor(publicationSource, sourceCDC, engineNameOrEmpty(a.Target), recordsLiveAdds)
 	switch {
 	case ok && mode == liveModePublicationAdd:
@@ -1273,16 +1273,56 @@ func (a *AddTable) preflightLive(ctx context.Context, applier ir.ChangeApplier, 
 		return a.preflightLiveBinlog(ctx, applier, status)
 	case sourceCDC == ir.CDCVStream:
 		return addTablePreflight{}, fmt.Errorf(
-			"pipeline: add-table: %s: --no-drain is not supported on a VStream source (source=%q): its add-table copy is one keyspace-wide snapshot that drops the deletes made during it, and the running stream drops every change to the table until the copy finishes, so the table would be left with rows the source deleted or changed. "+
-				"Use the drained add-table flow: `sluice sync stop --wait`, then `sluice schema add-table` without --no-drain, then `sluice sync start` again with the same --stream-id (it warm-resumes from the stream's position and replays what changed during the add). "+
-				"The stop is not optional: add-table does not detect a stream that is still running, and an add without --no-drain against one loses the same changes",
-			noDrainVStreamSourceMarker, a.Source.Name(),
+			"pipeline: add-table: %s: --no-drain is not supported on a VStream source (source=%q; VStream per %s): its add-table copy is one keyspace-wide snapshot that drops the deletes made during it, and the running stream drops every change to the table until the copy finishes, so the table would be left with rows the source deleted or changed. %s",
+			noDrainVStreamSourceMarker, a.Source.Name(), cdcFrom, drainedAddTableFlow,
 		)
 	}
 	return addTablePreflight{}, fmt.Errorf(
-		"pipeline: add-table: --no-drain requires either a publication-bearing source engine (PG) or a binlog source (MySQL, MariaDB) writing to a MySQL-family target whose applier exposes RecordLiveAddedTable; source=%q target=%q is neither. Use the drained add-table flow (`sluice sync stop --wait`, then `sluice schema add-table` without --no-drain, then `sluice sync start` again with the same --stream-id) for unsupported engine pairs",
-		a.Source.Name(), a.Target.Name(),
+		"pipeline: add-table: --no-drain requires either a publication-bearing source engine (PG) or a binlog source (MySQL, MariaDB) writing to a MySQL-family target whose applier exposes RecordLiveAddedTable; source=%q target=%q is neither. %s",
+		a.Source.Name(), a.Target.Name(), drainedAddTableFlow,
 	)
+}
+
+// drainedAddTableFlow is the remedy both --no-drain refusals name. The
+// stop must hold for the whole add: add-table does not detect a stream
+// that is still running (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED), and a
+// fleet supervisor's Reconcile restarts a stopped leg that is still in its
+// config on the next reload.
+const drainedAddTableFlow = "Use the drained add-table flow: `sluice sync stop --wait`, then `sluice schema add-table` without --no-drain, then start the stream again: " +
+	"`sluice sync start` with the same --stream-id (it warm-resumes from the stream's position and replays what changed during the add), " +
+	"or, for a `sluice sync run` fleet leg, the fleet (a leg restarts from its fleet config, not from `sync start --stream-id`). " +
+	"Keep the stream stopped until add-table returns: no fleet reload, no supervisor or systemd restart in between. " +
+	"add-table does not detect a stream that is still running, and an add without --no-drain against one loses the same changes"
+
+// positionCDCClassifier reports which CDC method wrote a persisted stream
+// position. The MySQL engine implements it for every flavor, because its
+// flavors share one set of position codecs and differ in CDC method.
+type positionCDCClassifier interface {
+	PositionCDCMethod(pos ir.Position) (method ir.CDCMethod, known bool)
+}
+
+// streamSourceCDC is the CDC method of the stream add-table joins, and
+// where that answer came from. The engine passed to add-table
+// (--source-driver) is not proof: a stream started from planetscale or
+// vitess can be handed `--source-driver mysql` (self-hosted Vitess's
+// underlying mysqld, say), whose declared capability is binlog while the
+// running streamer is VStream. So either one saying VStream decides: a
+// declared VStream source refuses whatever the position says, and
+// otherwise the stream's RECORDED position decides when the source can
+// classify it. The declared capability is the fallback for a stream with no
+// position yet, a source that cannot classify, or a token it does not
+// recognise.
+func streamSourceCDC(source ir.Engine, status ir.StreamStatus) (method ir.CDCMethod, from string) {
+	declared := source.Capabilities().CDC
+	if declared == ir.CDCVStream {
+		return declared, "--source-driver"
+	}
+	if c, ok := source.(positionCDCClassifier); ok {
+		if m, known := c.PositionCDCMethod(status.Position); known {
+			return m, "the stream's recorded position"
+		}
+	}
+	return declared, "--source-driver"
 }
 
 // noDrainVStreamSourceMarker is the grep-stable marker the --no-drain

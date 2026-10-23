@@ -174,3 +174,60 @@ func TestAddTable_LiveMode_VStreamSourceRefusesBeforeAnyWrite(t *testing.T) {
 		}
 	}
 }
+
+// TestAddTable_LiveMode_RecordedVStreamPositionRefuses closes the
+// --source-driver bypass: a stream a VStream streamer started (its recorded
+// position a VGTID) handed to `schema add-table --no-drain --source-driver
+// mysql`, whose DECLARED capability is binlog, still refuses
+// NO-DRAIN-VSTREAM-SOURCE, before anything is written. The controls: the
+// same mysql source with a recorded binlog position, or no position yet,
+// passes the door (and then fails dialling the unreachable source, which is
+// past it). The tokens are the shapes the MySQL codecs write
+// (TestPositionCDCMethod binds them to the encoders).
+func TestAddTable_LiveMode_RecordedVStreamPositionRefuses(t *testing.T) {
+	const (
+		vstreamToken = `[{"keyspace":"ks","shard":"0","gtid":"MySQL56/3e11fa47-71ca-11e1-9e33-c80aa9429562:1-10"}]`
+		binlogToken  = `{"mode":"gtid","gtid_set":"3e11fa47-71ca-11e1-9e33-c80aa9429562:1-10"}`
+	)
+	cases := []struct {
+		name       string
+		source     string
+		position   ir.Position
+		wantRefuse bool
+	}{
+		{"mysql source, recorded vstream position", "mysql", ir.Position{Engine: "mysql", Token: vstreamToken}, true},
+		{"mariadb source, recorded vstream position", "mariadb", ir.Position{Engine: "mysql", Token: vstreamToken}, true},
+		{"mysql source, recorded binlog position", "mysql", ir.Position{Engine: "mysql", Token: binlogToken}, false},
+		{"mysql source, no position yet", "mysql", ir.Position{}, false},
+		{"planetscale source, recorded binlog position", "planetscale", ir.Position{Engine: "mysql", Token: binlogToken}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			src, ok := engines.Get(c.source)
+			if !ok {
+				t.Fatalf("engine %q not registered", c.source)
+			}
+			tgt := newAddTableTargetEngineWithLiveAdd("mysql")
+			tgt.applier.streams = []ir.StreamStatus{{StreamID: "live", Position: c.position}}
+			err := (&AddTable{
+				Source: src, Target: tgt,
+				SourceDSN: "user:pw@tcp(127.0.0.1:1)/ks", TargetDSN: "tgt",
+				StreamID: "live", TableName: "new_table",
+				LiveMode: true,
+			}).Run(context.Background())
+			if err == nil {
+				t.Fatal("Run returned nil against an unreachable source; want an error either way")
+			}
+			refused := strings.Contains(err.Error(), noDrainVStreamSourceMarker)
+			if refused != c.wantRefuse {
+				t.Fatalf("refused=%v, want %v; err = %v", refused, c.wantRefuse, err)
+			}
+			if !c.wantRefuse {
+				return
+			}
+			if len(tgt.applier.recordedLiveAdds) != 0 || tgt.openSchemaWriterCalls != 0 || tgt.openRowWriterCalls != 0 {
+				t.Errorf("wrote before refusing: live adds %v, schema writers %d, row writers %d", tgt.applier.recordedLiveAdds, tgt.openSchemaWriterCalls, tgt.openRowWriterCalls)
+			}
+		})
+	}
+}
