@@ -215,3 +215,37 @@ func TestAddTable_LiveMode_RecordedPositionPicksTheRefusal(t *testing.T) {
 		})
 	}
 }
+
+// TestAddTable_InFlightStopHintOffersNoDrainOnlyOnPublicationSource pins the
+// drained preflight's in-flight-stop hint: it offers --no-drain only on a
+// publication source, the one source where --no-drain is not refused.
+func TestAddTable_InFlightStopHintOffersNoDrainOnlyOnPublicationSource(t *testing.T) {
+	binlog := newAddTableSourceEngine("binlog-source")
+	binlog.cdc = ir.CDCBinlog
+	cases := []struct {
+		name      string
+		src       ir.Engine
+		wantOffer bool
+	}{
+		{"binlog source", binlog, false},
+		{"publication source", newAddTableSourceEngineLive("pg-source"), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tgt := newAddTableTargetEngine("target")
+			tgt.applier.streams = []ir.StreamStatus{{StreamID: "s"}}
+			tgt.applier.stopRequested = true
+			err := (&AddTable{
+				Source: c.src, Target: tgt,
+				SourceDSN: "src", TargetDSN: "tgt",
+				StreamID: "s", TableName: "new_table",
+			}).Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "in-flight stop request") {
+				t.Fatalf("Run = %v; want the in-flight-stop refusal", err)
+			}
+			if got := strings.Contains(err.Error(), "--no-drain"); got != c.wantOffer {
+				t.Errorf("hint offers --no-drain = %v, want %v: %v", got, c.wantOffer, err)
+			}
+		})
+	}
+}

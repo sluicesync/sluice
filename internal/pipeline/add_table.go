@@ -1207,7 +1207,14 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read stop flag: %w", err))
 	}
 	if stopRequested {
-		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table (or pass --no-drain to use Phase 2 live add)", a.StreamID)
+		// The --no-drain alternative exists only on a publication source;
+		// everywhere else it refuses (NO-DRAIN-BINLOG-SOURCE,
+		// NO-DRAIN-VSTREAM-SOURCE), so the hint does not offer it there.
+		alternative := ""
+		if isPublicationAdder(a.Source) {
+			alternative = " (or, on this Postgres source, pass --no-drain to add the table to a running stream)"
+		}
+		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table%s", a.StreamID, alternative)
 	}
 	return nil
 }
@@ -1711,12 +1718,9 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 		)
 	}
 	if a.LiveMode {
-		switch {
-		case isPublicationAdder(a.Source):
-			slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) PG path (ADR-0030): would capture active stream's slot confirmed_flush_lsn, ALTER PUBLICATION ADD TABLE, capture snapshot, verify snapshot-LSN ≥ slot-LSN invariant, bulk-copy rows, drop temp slot")
-		default:
-			slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) binlog-source path (ADR-0034): would capture snapshot, bulk-copy rows, then record table on cdc-state.live_added_tables for the running streamer's poll to merge into the dispatch filter")
-		}
+		// Only the publication path is live: preflightLive refuses every
+		// other source before the dry run is reached.
+		slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) PG path (ADR-0030): would capture active stream's slot confirmed_flush_lsn, ALTER PUBLICATION ADD TABLE, capture snapshot, verify snapshot-LSN ≥ slot-LSN invariant, bulk-copy rows, drop temp slot")
 	} else {
 		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=...` with the same --stream-id")
 	}
@@ -1724,9 +1728,7 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 }
 
 // isPublicationAdder reports whether src implements [publicationAdder]
-// — the PG-path discriminator used by the dry-run log + dispatch
-// helpers. Pulled out of an inline assertion so the call sites read
-// declaratively.
+// — the PG-path discriminator, used by the drained preflight's hint.
 func isPublicationAdder(src ir.Engine) bool {
 	_, ok := src.(publicationAdder)
 	return ok

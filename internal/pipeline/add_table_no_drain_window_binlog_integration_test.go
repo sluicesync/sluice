@@ -33,7 +33,9 @@
 // NO-DRAIN-BINLOG-SOURCE before it opens a snapshot or records the table,
 // and the running stream is unaffected. The short-poll arm went with the
 // path it measured (a refusal does not depend on the poll). The drained
-// controls stay exact pins across every phase.
+// controls (mysql->mysql, mysql->postgres, mariadb->mariadb) stay exact pins
+// across every phase. The RecopyRemedy cells measure the CHANGELOG's
+// re-copy, including its foreign-key caveat.
 
 package pipeline
 
@@ -142,17 +144,23 @@ func (d ndwDB) exec(t *testing.T, stmts ...string) {
 // rows reads every (id, payload) of orders; nil when the table is absent.
 func (d ndwDB) rows(t *testing.T) map[int64]string {
 	t.Helper()
+	return d.tableRows(t, "orders")
+}
+
+// tableRows reads every (id, payload) of table; nil when it is absent.
+func (d ndwDB) tableRows(t *testing.T, table string) map[int64]string {
+	t.Helper()
 	db, err := sql.Open(d.driver, d.dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	rs, err := db.Query("SELECT id, payload FROM orders")
+	rs, err := db.Query("SELECT id, payload FROM " + table)
 	if err != nil {
 		if strings.Contains(err.Error(), "doesn't exist") || strings.Contains(err.Error(), "does not exist") {
 			return nil
 		}
-		t.Fatalf("read orders: %v", err)
+		t.Fatalf("read %s: %v", table, err)
 	}
 	defer func() { _ = rs.Close() }()
 	out := map[int64]string{}
@@ -539,57 +547,79 @@ func runNoDrainArm(t *testing.T, arm ndwArm) {
 	}
 }
 
-// TestAddTableNoDrainWindow_Binlog_RecopyRemedy measures the remedy the
+// TestAddTableNoDrainWindow_Binlog_RecopyRemedy* measure the remedy the
 // CHANGELOG gives an operator whose table an earlier --no-drain add left
-// diverged: stop the stream, empty the target table, add it again drained,
-// restart. The damage is planted directly on the target in the shape the
-// live path left (deleted rows kept, updates at the old value, inserts
-// missing), so the pin does not depend on the refused path; the verdict
-// compares the source and the target by id and payload.
-func TestAddTableNoDrainWindow_Binlog_RecopyRemedy(t *testing.T) {
-	srcDSN, tgtDSN, cleanup := startMySQLBinlog(t)
-	defer cleanup()
+// diverged: stop the stream, empty the target table WITHOUT firing the
+// foreign keys that reference it, add it again drained, restart.
+//
+// The damage is planted directly on the target in the shape the live path
+// left (deleted rows kept, updates at the old value, inserts missing), so the
+// pin does not depend on the refused path. A child table order_notes, added
+// to the stream after orders, carries a foreign key to orders with ON DELETE
+// CASCADE, which sluice creates on the target too: emptying orders with a
+// plain DELETE would cascade into it, and the restarted stream never puts
+// those child rows back (REMEDY-EMPTY-TABLE-FK-CASCADE). The hazard is
+// measured inside a rolled-back transaction; the remedy empties orders with
+// the target's foreign-key enforcement off for that session
+// (FOREIGN_KEY_CHECKS=0 on MySQL/MariaDB, session_replication_role =
+// replica on Postgres). The verdict compares source and target, by id and
+// payload, for both tables.
+func runRecopyRemedy(t *testing.T, srcEngine, tgtEngine string, src, tgt ndwDB, disableFKs string) {
+	t.Helper()
 	captureSlog(t)
-	src, tgt := ndwDB{"mysql", srcDSN}, ndwDB{"mysql", tgtDSN}
-	eng, ok := engines.Get("mysql")
+	sEng, ok := engines.Get(srcEngine)
 	if !ok {
-		t.Fatal("mysql engine not registered")
+		t.Fatalf("%s engine not registered", srcEngine)
+	}
+	tEng, ok := engines.Get(tgtEngine)
+	if !ok {
+		t.Fatalf("%s engine not registered", tgtEngine)
 	}
 	src.exec(t,
 		"CREATE TABLE users (id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB",
 		"INSERT INTO users VALUES (1, 'u1')",
 		"CREATE TABLE orders (id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB",
-		"INSERT INTO orders VALUES "+ndwValues(1, 2000, "v1"))
-	const streamID = "ndw-recopy-remedy"
+		"INSERT INTO orders VALUES "+ndwValues(1, 2000, "v1"),
+		"CREATE TABLE order_notes (id BIGINT NOT NULL, order_id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id), "+
+			"CONSTRAINT fk_notes_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE) ENGINE=InnoDB")
+	notes := make([]string, 0, 200)
+	for id := 1; id <= 200; id++ {
+		notes = append(notes, fmt.Sprintf("(%d,%d,'note')", id, id))
+	}
+	src.exec(t, "INSERT INTO order_notes VALUES "+strings.Join(notes, ","))
+
+	streamID := "ndw-recopy-" + tgtEngine
 	filter := mustNewFilter(t, []string{"users"}, nil)
 	mk := func() *Streamer {
-		return &Streamer{Source: eng, Target: eng, SourceDSN: srcDSN, TargetDSN: tgtDSN, StreamID: streamID, Filter: filter}
+		return &Streamer{Source: sEng, Target: tEng, SourceDSN: src.dsn, TargetDSN: tgt.dsn, StreamID: streamID, Filter: filter}
 	}
-	cell := twfbCell{tgt: twfbDB{engine: "mysql", dsn: tgtDSN}, streamID: streamID}
+	cell := twfbCell{tgt: twfbDB{engine: "mysql", dsn: tgt.dsn}, streamID: streamID}
+	if tgtEngine == "postgres" {
+		cell.tgt.engine = "postgres"
+	}
 	run := startTWFBRun(mk())
 	defer func() { _ = run.stop(t) }()
 	cell.waitStreaming(t, run)
 	// stopAddRestart is the drained flow: stop, add, restart.
-	stopAddRestart := func(beforeAdd func()) {
+	stopAddRestart := func(table string, beforeAdd func()) {
 		t.Helper()
-		ndwStopWait(t, eng, tgtDSN, streamID, run)
+		ndwStopWait(t, tEng, tgt.dsn, streamID, run)
 		if beforeAdd != nil {
 			beforeAdd()
 		}
-		if err := (&AddTable{Source: eng, Target: eng, SourceDSN: srcDSN, TargetDSN: tgtDSN, StreamID: streamID, TableName: "orders"}).Run(context.Background()); err != nil {
-			t.Fatalf("drained AddTable: %v", err)
+		if err := (&AddTable{Source: sEng, Target: tEng, SourceDSN: src.dsn, TargetDSN: tgt.dsn, StreamID: streamID, TableName: table}).Run(context.Background()); err != nil {
+			t.Fatalf("drained AddTable %s: %v", table, err)
 		}
 		run = startTWFBRun(mk())
 	}
-	stopAddRestart(nil)
-	if n := tgt.count(t); n != 2000 {
-		t.Fatalf("RIG: the first add copied %d rows; want 2000", n)
+	stopAddRestart("orders", nil)
+	stopAddRestart("order_notes", nil)
+	if n, m := tgt.count(t), len(tgt.tableRows(t, "order_notes")); n != 2000 || m != 200 {
+		t.Fatalf("RIG: the adds copied %d orders and %d order_notes rows; want 2000 and 200", n, m)
 	}
 
 	// The damage the lost window left, planted on the target alone (no
-	// source change touches these rows, so the running stream leaves them):
-	// rows the source deleted still present, updates at the old value,
-	// inserts missing.
+	// source change touches these rows, so the running stream leaves them).
 	tgt.exec(t, "INSERT INTO orders VALUES "+ndwValues(50001, 50020, "deleted-on-source"),
 		"UPDATE orders SET payload = 'stale' WHERE id BETWEEN 101 AND 110",
 		"DELETE FROM orders WHERE id BETWEEN 1500 AND 1509")
@@ -597,12 +627,23 @@ func TestAddTableNoDrainWindow_Binlog_RecopyRemedy(t *testing.T) {
 	if stale != 20 || changed != 10 || missing != 10 {
 		t.Fatalf("RIG: planted damage reads %d stale, %d changed, %d missing; want 20/10/10", stale, changed, missing)
 	}
-	t.Logf("planted: %d deleted rows still on target, %d rows with old values, %d rows missing; row counts source %d target %d",
-		stale, changed, missing, src.count(t), tgt.count(t))
 
-	// The remedy: stop, empty the target table, add it again drained, restart.
-	stopAddRestart(func() { tgt.exec(t, "DELETE FROM orders") })
-	src.exec(t, "DELETE FROM orders WHERE id = 1000", "INSERT INTO orders VALUES (9000001, 'marker')")
+	ndwStopWait(t, tEng, tgt.dsn, streamID, run)
+	// The hazard: a plain DELETE of orders on the target, rolled back.
+	notesLeft := ndwInSession(t, tgt, true, "DELETE FROM orders", "SELECT COUNT(*) FROM order_notes")
+	t.Logf("hazard: a plain DELETE FROM orders on the %s target would leave %d of 200 order_notes rows (rolled back)", tgtEngine, notesLeft)
+	// The CHANGELOG's foreign-key caveat rests on this: the target carries the
+	// source's cascading key. If it stops doing so, revisit the caveat.
+	if notesLeft != 0 {
+		t.Errorf("PREMISE: a plain DELETE of orders left %d of 200 order_notes rows on the %s target; the remedy's foreign-key caveat assumes the target cascades", notesLeft, tgtEngine)
+	}
+	run = startTWFBRun(mk())
+
+	// The remedy, with the foreign keys off for the emptying session.
+	stopAddRestart("orders", func() {
+		ndwInSession(t, tgt, false, disableFKs, "DELETE FROM orders", "SELECT COUNT(*) FROM order_notes")
+	})
+	src.exec(t, "DELETE FROM orders WHERE id = 1999", "INSERT INTO orders VALUES (9000001, 'marker')")
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, ok := tgt.rows(t)[9000001]; ok {
@@ -613,11 +654,78 @@ func TestAddTableNoDrainWindow_Binlog_RecopyRemedy(t *testing.T) {
 	if _, ok := tgt.rows(t)[9000001]; !ok {
 		t.Fatal("RIG: the post-remedy marker never reached the target")
 	}
-	stale, changed, missing = ndwDiff(src.rows(t), tgt.rows(t))
-	t.Logf("after the re-copy: %d deleted rows still on target, %d rows with old values, %d rows missing", stale, changed, missing)
-	if stale+changed+missing > 0 {
-		t.Errorf("the re-copy remedy left the table diverged: %d stale, %d changed, %d missing", stale, changed, missing)
+	for _, table := range []string{"orders", "order_notes"} {
+		stale, changed, missing := ndwDiff(src.tableRows(t, table), tgt.tableRows(t, table))
+		t.Logf("after the re-copy, %s: %d deleted rows still on target, %d rows with old values, %d rows missing", table, stale, changed, missing)
+		if stale+changed+missing > 0 {
+			t.Errorf("the re-copy remedy left %s diverged: %d stale, %d changed, %d missing", table, stale, changed, missing)
+		}
 	}
+}
+
+// ndwInSession runs stmts on ONE connection (so a session setting holds for
+// the statements after it), inside a transaction rolled back when rollback is
+// set and committed otherwise, and returns the integer the last statement
+// selects.
+func ndwInSession(t *testing.T, d ndwDB, rollback bool, stmts ...string) int {
+	t.Helper()
+	db, err := sql.Open(d.driver, d.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range stmts[:len(stmts)-1] {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("exec %q: %v", s, err)
+		}
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, stmts[len(stmts)-1]).Scan(&n); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("query %q: %v", stmts[len(stmts)-1], err)
+	}
+	if rollback {
+		_ = tx.Rollback()
+		return n
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return n
+}
+
+func TestAddTableNoDrainWindow_Binlog_RecopyRemedy(t *testing.T) {
+	srcDSN, tgtDSN, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	runRecopyRemedy(t, "mysql", "mysql", ndwDB{"mysql", srcDSN}, ndwDB{"mysql", tgtDSN}, "SET FOREIGN_KEY_CHECKS = 0")
+}
+
+func TestAddTableNoDrainWindow_Binlog_RecopyRemedyMariaDB(t *testing.T) {
+	srcDSN, cleanup := startMariaDBBinlog(t)
+	defer cleanup()
+	ndwDB{"mysql", srcDSN}.exec(t, "CREATE DATABASE target_db")
+	tgtDSN := strings.Replace(srcDSN, "/source_db?", "/target_db?", 1)
+	runRecopyRemedy(t, "mariadb", "mariadb", ndwDB{"mysql", srcDSN}, ndwDB{"mysql", tgtDSN}, "SET FOREIGN_KEY_CHECKS = 0")
+}
+
+func TestAddTableNoDrainWindow_Binlog_RecopyRemedyPostgresTarget(t *testing.T) {
+	srcDSN, _, cleanup := startMySQLBinlog(t)
+	defer cleanup()
+	_, pgDSN, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+	runRecopyRemedy(t, "mysql", "postgres", ndwDB{"mysql", srcDSN}, ndwDB{"pgx", pgDSN}, "SET LOCAL session_replication_role = replica")
 }
 
 // ndwValues renders rows lo..hi with one payload as an INSERT VALUES list.
@@ -677,5 +785,16 @@ func TestAddTableNoDrainWindow_Binlog_MariaDBToMariaDB_Live(t *testing.T) {
 	runNoDrainArm(t, ndwArm{
 		name: "mariadb-mariadb-live", srcEngine: "mariadb", tgtEngine: "mariadb",
 		src: ndwDB{"mysql", srcDSN}, tgt: ndwDB{"mysql", tgtDSN}, noDrain: true,
+	})
+}
+
+func TestAddTableNoDrainWindow_Binlog_MariaDBToMariaDB_DrainedStoppedControl(t *testing.T) {
+	srcDSN, cleanup := startMariaDBBinlog(t)
+	defer cleanup()
+	ndwDB{"mysql", srcDSN}.exec(t, "CREATE DATABASE target_db")
+	tgtDSN := strings.Replace(srcDSN, "/source_db?", "/target_db?", 1)
+	runNoDrainArm(t, ndwArm{
+		name: "mariadb-mariadb-drained-stopped", srcEngine: "mariadb", tgtEngine: "mariadb",
+		src: ndwDB{"mysql", srcDSN}, tgt: ndwDB{"mysql", tgtDSN},
 	})
 }

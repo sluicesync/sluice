@@ -74,8 +74,9 @@
 // VStream source): the two NoDrain cells require that refusal, with nothing
 // written to the target and the running stream unaffected (the measuring
 // code for those modes was removed with them; commit 8c9baaee carries it).
-// The Drained cell stays the exact pin. (a) is still open: the BufferCap
-// cell stays a measurement.
+// The Drained cells stay the exact pins: into Postgres 16 (measured 3 runs)
+// and, since 2026-10-23, into MySQL 8.0 (MySQLTarget/Drained, 1 run), one
+// shard each. (a) is still open: the BufferCap cell stays a measurement.
 //
 // Usage (Windows; see CLAUDE.md for the Rancher Desktop env):
 //
@@ -83,7 +84,7 @@
 //	  -count=1 -timeout=120m -v -run 'TestStreamer_VStreamAddTableKeyspaceWideCopy' ./internal/pipeline/
 //
 // The BufferCap measurement skips unless SLUICE_ATK_MEASURE=1 (the item is
-// open); the Drained cell runs SLUICE_ATK_RUNS times (default 1).
+// open); the Drained cells run SLUICE_ATK_RUNS times (default 1).
 
 package pipeline
 
@@ -847,18 +848,23 @@ func TestStreamer_VStreamAddTableKeyspaceWideCopy(t *testing.T) {
 		r := vcrRig{mysqlDSN: mysqlDSN, streamDSN: streamDSN, tgtDSN: tgtDSN, logs: &logs}
 		atkCell(t, r, proxyDSN, proxy, "dr")
 	})
-	// --no-drain refuses (NO-DRAIN-VSTREAM-SOURCE). Before the refusal both
-	// cells left 80 deletes and 10 updates of the added table stale in every
-	// measured run, the cold-start one never delivering the post-add marker
-	// either (see the header).
-	t.Run("NoDrain/MySQLTarget", func(t *testing.T) {
+	t.Run("MySQLTarget", func(t *testing.T) {
 		tgtDSN, cleanupTgt := startMySQLTarget(t)
 		defer cleanupTgt()
 		r := vcrRig{mysqlDSN: mysqlDSN, streamDSN: streamDSN, tgtDSN: tgtDSN, logs: &logs, tgtEngine: "mysql"}
-		t.Run("AfterColdStart", func(t *testing.T) {
+		// The drained flow into the target the --no-drain cells use: exact,
+		// the same pin as the Postgres cell.
+		t.Run("Drained", func(t *testing.T) {
+			atkCell(t, r, proxyDSN, proxy, "dm")
+		})
+		// --no-drain refuses (NO-DRAIN-VSTREAM-SOURCE). Before the refusal
+		// both cells left 80 deletes and 10 updates of the added table stale
+		// in every measured run, the cold-start one never delivering the
+		// post-add marker either (see the header).
+		t.Run("NoDrain/AfterColdStart", func(t *testing.T) {
 			atkNoDrainRefusalCell(t, r, "nd", false)
 		})
-		t.Run("AfterWarmResume", func(t *testing.T) {
+		t.Run("NoDrain/AfterWarmResume", func(t *testing.T) {
 			atkNoDrainRefusalCell(t, r, "nw", true)
 		})
 	})
