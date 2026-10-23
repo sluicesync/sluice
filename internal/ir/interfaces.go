@@ -4721,6 +4721,22 @@ type TableScopedSnapshotOpener interface {
 	OpenSnapshotStreamForTables(ctx context.Context, dsn string, tables []string) (*SnapshotStream, error)
 }
 
+// SnapshotScopeChecker is the optional engine surface for a source whose
+// snapshot cannot copy some table scopes faithfully under the DSN it is
+// given. CheckSnapshotScope returns the refusal the snapshot open would
+// raise for tables, and does no I/O, so a caller can refuse before it
+// writes anything: the `sync` cold start clears the stream's apply marks
+// before its snapshot opens, and `backup full` falls back to its
+// non-snapshot copy on an open error rather than failing.
+//
+// The open raises the same refusal itself, so a caller that skips the check
+// still fails loudly, only later. A nil return means the scope copies as
+// the open would copy it. tables has the meaning it has for
+// [TableScopedSnapshotOpener.OpenSnapshotStreamForTables].
+type SnapshotScopeChecker interface {
+	CheckSnapshotScope(dsn string, tables []string) error
+}
+
 // FilteredSnapshotOpener is the optional engine surface that pushes a
 // per-table `--where` predicate into the snapshot COPY at OPEN time
 // (ADR-0174 Piece 2, continuous filtered `sync --where` on VStream

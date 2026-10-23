@@ -50,6 +50,12 @@ import (
 //     binlog event a restart reads again.
 //   - DSN-TIME-ZONE-NOT-UTC: listed. The DSN is the leg's configuration; a
 //     restart parses the same one.
+//   - VSTREAM-SINGLE-STREAM-MULTI-TABLE (VStream-family sources, codeless):
+//     listed. It is a pure function of the leg's source DSN (its
+//     vstream_copy_single_stream parameter) and its include/exclude scope,
+//     both configuration, read before the cold start writes anything; a
+//     restart computes the same scope and refuses again until the operator
+//     removes the parameter.
 //   - KEY-SCOPED-WRITE-MATCHED-MULTIPLE-ROWS (coded,
 //     SLUICE-E-CDC-KEY-MATCHED-MULTIPLE-ROWS): listed. The refused write's
 //     transaction is rolled back, and a restart replays the same source
@@ -153,6 +159,7 @@ var refusalsARestartRepeats = []error{
 	applymarks.ErrMismatch,
 	ir.ErrCharsetNotDecodable,
 	ir.ErrDSNTimeZoneNotUTC,
+	ir.ErrVStreamSingleStreamMultiTable,
 	ir.ErrKeyScopedWriteMatchedMultipleRows,
 	ir.ErrChangeLogWatermarkStalled,
 	ir.ErrHeartbeatTableNotSluices,

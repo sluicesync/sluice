@@ -30,6 +30,7 @@ import (
 
 	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/applymarks"
+	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
@@ -273,6 +274,11 @@ func TestSupervisor_RefusalsARestartRepeatsAreNotRestarted(t *testing.T) {
 		// (streamer_scope_drift.go).
 		"INCLUDE-TABLE-SCOPE-DRIFT": (&Streamer{Source: nonScoperEngine{}, Target: nonScoperEngine{}}).
 			includeTableScopeDriftError("st", "", []scopeDriftTable{{name: "nt", notEstablished: true}}),
+		// Built by the real VStream check the cold start calls
+		// (engines/mysql/cdc_vstream_single_stream_scope.go).
+		"VSTREAM-SINGLE-STREAM-MULTI-TABLE": mysql.Engine{Flavor: mysql.FlavorPlanetScale}.CheckSnapshotScope(
+			"u:p@tcp(127.0.0.1:1)/ks?vstream_copy_single_stream=true", []string{"a", "b"},
+		),
 	}
 
 	if len(cases) != len(refusalsARestartRepeats) {

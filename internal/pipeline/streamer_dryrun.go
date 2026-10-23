@@ -99,6 +99,11 @@ func (s *Streamer) buildDryRunPlan(ctx context.Context, streamID string, persist
 	// ADR-0143: mirror the cold-start ORM-table skip so the dry-run preview
 	// honestly reflects what a real run would copy.
 	applyORMTableSkip(ctx, schema, s.SkipORMTables, s.copyFilter())
+	// A plan must refuse the copy scope the cold start refuses
+	// (VSTREAM-SINGLE-STREAM-MULTI-TABLE), with the same table list.
+	if err := migcore.PreflightSnapshotScope(s.Source, s.SourceDSN, migcore.TableNamesForPublication(schema)); err != nil {
+		return nil, err
+	}
 	mapped, err := translate.ApplyMappings(schema, s.Mappings)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)

@@ -555,15 +555,18 @@ func TestStreamer_VStreamCopyResume(t *testing.T) {
 	})
 
 	// The single-stream path (vstream_copy_single_stream=true) with two
-	// tables, and a one-table scope, which takes the single-stream path too.
-	t.Run("SingleStream/delete-while-stopped", func(t *testing.T) {
+	// tables is refused before it copies anything
+	// (VSTREAM-SINGLE-STREAM-MULTI-TABLE: it loses deletes with no stop at
+	// all), so it has no stopped copy to refuse; its remedy is the default
+	// path, measured above. A one-table scope takes the single-stream path
+	// with or without the parameter.
+	t.Run("SingleStream/multi-table-refused", func(t *testing.T) {
 		const a, b = "ss_a", "ss_b"
 		vcrCreate(t, r, a, b)
 		vcrSeed(t, r.mysqlDSN, a, "v1", vcrRange(1, 1, 1000))
 		vcrSeed(t, r.mysqlDSN, b, "v1", vcrRange(1, 1, vcrBigRows))
 		time.Sleep(3 * time.Second)
-		vcrStopRefuseRecopy(t, r, func() *Streamer { return r.streamer("vcrss", []string{a, b}, single) }, b, vcrBigRows,
-			func() { r.src().exec(t, "DELETE FROM "+a+" WHERE id <= 20") }, a, []string{a, b})
+		vssRequireRefusal(t, r, r.streamer("vcrss", []string{a, b}, single), []string{a, b}, "")
 	})
 	t.Run("SingleTableScope/delete-while-stopped", func(t *testing.T) {
 		const b = "st_b"

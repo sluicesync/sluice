@@ -64,21 +64,25 @@ func (s *Streamer) coldStart(ctx context.Context, applier ir.ChangeApplier, stre
 	const resumingCopy = false
 	stop = func() {}
 
-	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
-	// first. (The established-table record is NOT touched here: it is marked
-	// in progress at the cold start's point of no return, inside
-	// coldStartGatePreflight — see [beginColdStartRecord].)
-	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
-		return nil, stop, err
-	}
-
 	// Read + gate the source schema: open the source SchemaReader, read
 	// + filter the schema, and run every source-side preflight against
 	// the still-open reader. A nil schema with nil error is the
 	// empty-source case — nothing to stream (the (nil, nil) contract
-	// runOnce checks for).
+	// runOnce checks for). It writes nothing, so a refusal here leaves the
+	// target exactly as it was.
 	schema, snapshotTables, err := s.coldStartReadSourceSchema(ctx, resumingCopy)
 	if err != nil {
+		return nil, stop, err
+	}
+
+	// ADR-0190: the copy re-seeds the target, so the stream's apply marks go
+	// before it. After the source read, not before it, so that a source-side
+	// refusal (VSTREAM-SINGLE-STREAM-MULTI-TABLE among them) does not take an
+	// established stream's marks with it: a warm resume after the refusal
+	// relies on them. (The established-table record is NOT touched here: it
+	// is marked in progress at the cold start's point of no return, inside
+	// coldStartGatePreflight — see [beginColdStartRecord].)
+	if err := clearApplyMarksForColdStart(ctx, applier, streamID); err != nil {
 		return nil, stop, err
 	}
 	if schema == nil {
@@ -467,6 +471,16 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context, resumingCopy b
 	// gets streamed/buffered and overflows --max-buffer-bytes (ADR-0071).
 	// Unqualified names — matches the VStream filter rule's Match scope.
 	snapshotTables := migcore.TableNamesForPublication(schema)
+
+	// A copy scope the source's snapshot cannot copy faithfully under this
+	// DSN (VSTREAM-SINGLE-STREAM-MULTI-TABLE: `vstream_copy_single_stream=true`
+	// with more than one table loses deletes). Here, before coldStart clears
+	// the apply marks and before any target write; the snapshot open raises
+	// the same refusal for a caller that skips this.
+	if err := migcore.PreflightSnapshotScope(s.Source, s.SourceDSN, snapshotTables); err != nil {
+		migcore.CloseIf(sr)
+		return nil, nil, err
+	}
 
 	// Source-side RLS preflight (task #52 sub-deliverable 1). Refuses
 	// loudly when any in-scope source table has RLS enabled AND the
@@ -1624,9 +1638,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 // plain default open. It is the snapshot-stream sibling of
 // openCDCReaderWithOptionalSlot, extended with the table-scope dispatch.
 //
-//   - slotName != "" → [ir.SnapshotStreamWithSlotOpener] when the engine
-//     implements it (Postgres), else a debug note + default open. The
-//     slot is created at open time, so the name must flow in here.
+//   - slotName != "" AND the engine implements [ir.SnapshotStreamWithSlotOpener]
+//     (Postgres) → the slot-aware open. The slot is created at open time,
+//     so the name must flow in here. An engine without the surface ignores
+//     the name (a debug note) and takes the dispatch below exactly as if
+//     no --slot-name had been given.
 //   - len(tables) > 0 → [ir.FilteredSnapshotOpener] when a `--where` filter
 //     is set and the engine implements it (VStream), pushing the predicate
 //     into the COPY filter rules at open (ADR-0174 Piece 2 — the eager-COPY
@@ -1638,9 +1654,17 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 //     streamed/buffered (ADR-0071).
 //   - otherwise → the plain [ir.Engine.OpenSnapshotStream].
 //
-// Slot and table-scope never coexist on one engine (Postgres has the
-// slot; PlanetScale has the tables), but if both are somehow set the slot
-// wins — it's the more specific lifecycle requirement. The post-open
+// No engine implements both the slot surface and a table-scoped one
+// (Postgres has the slot; the MySQL family has the tables); if one ever
+// does, the slot wins — it's the more specific lifecycle requirement.
+// The FLAG is another matter: --slot-name can be set against any source,
+// and until VSTREAM-SLOT-NAME-UNSCOPED-COPY a name given to a source
+// without the slot surface returned the plain no-table open here. On a
+// VStream source that is one keyspace-wide stream: every table in the
+// keyspace copied regardless of --include-table, the --where push-down
+// skipped (the post-open RowFilterSetter is a no-op on VStream, so rows
+// outside the filter were copied), and the multi-table catch-up that
+// drops deletes (VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED). The post-open
 // [migcore.ApplyRowFilters] gate in [coldStartOpenSnapshot] still runs for
 // every path — it is the loud-failure authority for a source that supports
 // neither push-down — and is a harmless no-op re-store on the VStream path
@@ -1651,10 +1675,9 @@ func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotNa
 			return opener.OpenSnapshotStreamWithSlot(ctx, dsn, slotName)
 		}
 		slog.DebugContext(
-			ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name silently ignored",
+			ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name ignored for the snapshot open",
 			slog.String("engine", source.Name()),
 		)
-		return source.OpenSnapshotStream(ctx, dsn)
 	}
 	if len(tables) > 0 {
 		if len(rowFilters) > 0 {

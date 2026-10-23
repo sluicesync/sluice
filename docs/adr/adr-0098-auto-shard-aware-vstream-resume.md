@@ -65,7 +65,7 @@ The re-copy cost is bounded by the bytes of the already-finished tables in the i
 
 A position written by the **current released auto-shard code** (v0.99.62+) is exactly the single-in-progress-table cursor this resume expects — it round-trips unchanged. The resume refuses **loudly** (never silently re-copies the whole keyspace from row 0, never silently skips a table) when the persisted cursor cannot be placed:
 
-- **A legacy single-stream / interleaved-resume token** (one written by `vstream_copy_single_stream=true`, or a pre-ADR-0095 token) can carry `TablePKs` for **more than one** table. `resolveResumeAutoShard` refuses it and tells the operator to resume on the legacy path (`vstream_copy_single_stream=true`) or restart the cold-start.
+- **A legacy single-stream / interleaved-resume token** (one written by `vstream_copy_single_stream=true`, or a pre-ADR-0095 token) can carry `TablePKs` for **more than one** table. `resolveResumeAutoShard` refuses it and tells the operator to resume on the legacy path (`vstream_copy_single_stream=true`) or restart the cold-start. *(Superseded: the resume is unreachable since v0.163.3 (`VSTREAM-COPY-RESUME-WITHDRAWN`), the parameter is refused for more than one table (`VSTREAM-SINGLE-STREAM-MULTI-TABLE`, VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED), and the message now names `--restart-from-scratch` instead.)*
 - **A cursor naming a table no longer in scope** (an `--include-table` change since the checkpoint, or a stale token) is refused, naming the offending table and the current scope.
 - **A cursor-less position** never reaches here (the resume entry gates on `anyTablePKsPresent`); if it somehow does, it is refused rather than full-re-copied.
 

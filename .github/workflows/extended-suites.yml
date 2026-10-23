@@ -318,7 +318,7 @@ jobs:
     name: Pipeline vstream suite
     if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 122
+    timeout-minutes: 125
     env:
       TESTCONTAINERS_RYUK_DISABLED: "true"
       # The -run alternation, defined ONCE so the budget guard below and
@@ -368,7 +368,13 @@ jobs:
       # three times, plus three controls; 21.7m locally, was ~7m) — +15m,
       # 113m/119m. +2 cells (the concurrent copy and --schema-already-applied,
       # ~80s each) after the pre-tag review: 116m/122m.
-      VSTREAM_PIPELINE_EXPECTED_TESTS: "29"
+      # Re-derived 2026-10-22 (VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED
+      # and VSTREAM-SLOT-NAME-UNSCOPED-COPY): the reconnect test's
+      # multi-table single-stream cells became refusal-then-remedy cells
+      # (about the same cost: one copy each, no fault); +1,
+      # TestStreamer_VStreamSlotNameKeepsTheCopyScope — one vttestserver
+      # boot and one 200,000-row cold start (~2m) — makes 30, 119m/125m.
+      VSTREAM_PIPELINE_EXPECTED_TESTS: "30"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7.0.0
@@ -413,7 +419,7 @@ jobs:
       - name: Run the pipeline vstream tests
         run: |
           set -o pipefail
-          go test -tags='integration vstream' -race -count=1 -timeout=116m \
+          go test -tags='integration vstream' -race -count=1 -timeout=119m \
             -run "$VSTREAM_PIPELINE_RUN" -v ./internal/pipeline/ 2>&1 | tee vstream-pipeline.out
           # Second half of the TEST-9 guard, mirroring the filtered-tag-
           # gate's per-test PASS assert: every matched test must have
