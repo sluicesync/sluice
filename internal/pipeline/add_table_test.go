@@ -480,21 +480,16 @@ func TestAddTable_LegacyEmptyPublicationDoesNotScope(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_RefusesEngineWithoutEitherSurface confirms
-// live mode refuses (with a clear engine-pair message) when neither
-// the source implements publicationAdder (PG path) NOR the target
-// applier implements liveAddedTablesWriter (MySQL filter-flip path).
-// Pre-ADR-0034 this was "MySQL refuses live mode" outright; post-
-// ADR-0034 MySQL succeeds via the filter-flip path, so the refusal
-// only fires when both engines lack the necessary surfaces.
-func TestAddTable_LiveMode_RefusesEngineWithoutEitherSurface(t *testing.T) {
+// TestAddTable_LiveMode_RefusesSourceWithoutPublication confirms live mode
+// refuses, with the generic message and the drained flow, on a source that
+// neither extends a publication nor is a binlog or VStream source (the stub
+// declares logical replication without the publication surface).
+func TestAddTable_LiveMode_RefusesSourceWithoutPublication(t *testing.T) {
 	src := newAddTableSourceEngine("unsupported-source") // no publicationAdder
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
 	tgt := newAddTableTargetEngine("unsupported-target")
-	// fakeApplier does NOT implement liveAddedTablesWriter — this
-	// covers the "neither surface available" refusal path.
 	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
 
 	a := &AddTable{
@@ -505,78 +500,44 @@ func TestAddTable_LiveMode_RefusesEngineWithoutEitherSurface(t *testing.T) {
 	}
 	err := a.Run(context.Background())
 	if err == nil {
-		t.Fatalf("expected error on live mode with neither-surface engine pair; got nil")
+		t.Fatalf("expected error on live mode with a source without a publication; got nil")
 	}
-	if !strings.Contains(err.Error(), "publication-bearing source engine") {
-		t.Errorf("err = %v; want a publication-bearing-engine refusal", err)
+	for _, want := range []string{"publication-bearing source engine", "drained add-table flow", "sluice sync stop --wait"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v; want it to contain %q", err, want)
+		}
 	}
-	if !strings.Contains(err.Error(), "RecordLiveAddedTable") {
-		t.Errorf("err = %v; want a RecordLiveAddedTable refusal mention", err)
-	}
-	if !strings.Contains(err.Error(), "drained add-table flow") {
-		t.Errorf("err = %v; want recovery hint pointing at the drained flow", err)
+	if src.snapshotCalls != 0 {
+		t.Errorf("snapshot opens = %d before refusing; want 0", src.snapshotCalls)
 	}
 }
 
-// TestAddTable_LiveMode_BinlogPath_SucceedsWithFilterFlipWriter
-// confirms the ADR-0034 filter-flip path runs end-to-end when the
-// target applier implements liveAddedTablesWriter — even though the
-// source engine does NOT implement publicationAdder. MySQL is the
-// canonical engine pair this covers.
-func TestAddTable_LiveMode_BinlogPath_SucceedsWithFilterFlipWriter(t *testing.T) {
+// TestAddTable_LiveMode_BinlogSourceRefusesBeforeAnyWrite pins
+// NO-DRAIN-BINLOG-SOURCE at the stub level: a binlog source writing to a
+// MySQL-family target whose applier records live adds — the pair that took
+// ADR-0034's filter-flip — refuses before any snapshot, writer or
+// live-added record.
+func TestAddTable_LiveMode_BinlogSourceRefusesBeforeAnyWrite(t *testing.T) {
 	src := newAddTableSourceEngine("binlog-source") // no publicationAdder
+	src.cdc = ir.CDCBinlog
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	tgt := newAddTableTargetEngineWithLiveAdd("mysql") // the filter-flip path is MySQL-target-only (Bug 321 R6 A)
+	tgt := newAddTableTargetEngineWithLiveAdd("mysql")
 	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
 
-	a := &AddTable{
+	err := (&AddTable{
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
 		StreamID: "live", TableName: "new_table",
 		LiveMode: true,
+	}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), noDrainBinlogSourceMarker) {
+		t.Fatalf("Run = %v; want the %s refusal", err, noDrainBinlogSourceMarker)
 	}
-	if err := a.Run(context.Background()); err != nil {
-		t.Fatalf("AddTable (binlog filter-flip path): %v", err)
-	}
-	// The orchestrator MUST have recorded the new table on the
-	// target's cdc-state column.
-	if got := tgt.applier.recordedLiveAdds; len(got) != 1 || got[0] != "new_table" {
-		t.Errorf("recorded live-adds = %v; want [new_table]", got)
-	}
-	// Snapshot was opened (bulk-copy path ran).
-	if src.snapshotCalls != 1 {
-		t.Errorf("snapshot opens = %d; want 1", src.snapshotCalls)
-	}
-}
-
-// TestAddTable_LiveMode_BinlogPath_RecordsBeforeReturning is the
-// regression pin: a successful binlog filter-flip live add MUST have
-// recorded the new table on the cdc-state column before Run returns —
-// otherwise the running streamer's poll never observes the addition.
-func TestAddTable_LiveMode_BinlogPath_RecordsBeforeReturning(t *testing.T) {
-	src := newAddTableSourceEngine("binlog-source")
-	src.schema = &ir.Schema{Tables: []*ir.Table{
-		{Name: "events", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
-	}}
-	tgt := newAddTableTargetEngineWithLiveAdd("mysql") // the filter-flip path is MySQL-target-only (Bug 321 R6 A)
-	tgt.applier.streams = []ir.StreamStatus{{StreamID: "stream-a"}}
-
-	a := &AddTable{
-		Source: src, Target: tgt,
-		SourceDSN: "src", TargetDSN: "tgt",
-		StreamID: "stream-a", TableName: "events",
-		LiveMode: true,
-	}
-	if err := a.Run(context.Background()); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if len(tgt.applier.recordedLiveAdds) == 0 {
-		t.Fatal("orchestrator returned without recording the live-added table on cdc-state — streamer poll would never see it")
-	}
-	if tgt.applier.recordedStream != "stream-a" {
-		t.Errorf("recorded against streamID %q; want %q", tgt.applier.recordedStream, "stream-a")
+	if src.snapshotCalls != 0 || len(tgt.applier.recordedLiveAdds) != 0 || tgt.openSchemaWriterCalls != 0 || tgt.openRowWriterCalls != 0 {
+		t.Errorf("wrote before refusing: snapshots %d, live adds %v, schema writers %d, row writers %d",
+			src.snapshotCalls, tgt.applier.recordedLiveAdds, tgt.openSchemaWriterCalls, tgt.openRowWriterCalls)
 	}
 }
 
@@ -724,11 +685,12 @@ func TestTempSlotName(t *testing.T) {
 // ---- mocks ----
 
 // addTableSourceEngine wraps recordingEngine with snapshot-stream
-// support and CDC=LogicalReplication so AddTable.validate accepts
-// it.
+// support and CDC=LogicalReplication (or cdc, when set) so
+// AddTable.validate accepts it.
 type addTableSourceEngine struct {
 	*recordingEngine
 	snapshotCalls int
+	cdc           ir.CDCMethod
 }
 
 func newAddTableSourceEngine(name string) *addTableSourceEngine {
@@ -736,6 +698,9 @@ func newAddTableSourceEngine(name string) *addTableSourceEngine {
 }
 
 func (e *addTableSourceEngine) Capabilities() ir.Capabilities {
+	if e.cdc != ir.CDCNone {
+		return ir.Capabilities{CDC: e.cdc}
+	}
 	return ir.Capabilities{CDC: ir.CDCLogicalReplication}
 }
 

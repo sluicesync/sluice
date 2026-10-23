@@ -250,3 +250,29 @@ func fromBeginningVStreamPos(keyspace string, shards []string) []shardGtid {
 	}
 	return out
 }
+
+// PositionCDCMethod reports which CDC method wrote a persisted stream
+// position: [ir.CDCVStream] for a VStream VGTID (a JSON shard list),
+// [ir.CDCBinlog] for a binlog position (a JSON object with a mode). known
+// is false for an empty or unrecognised token.
+//
+// Every flavor shares the MySQL position codecs, so the answer does not
+// depend on e.Flavor: `schema add-table --no-drain` asks it about the
+// stream's RECORDED position, which a VStream streamer may have written
+// even when add-table was given --source-driver mysql
+// (NO-DRAIN-VSTREAM-SOURCE). Only the token is classified: the Engine of a
+// position read back through ListStreams is the TARGET applier's name, not
+// the writer's.
+func (Engine) PositionCDCMethod(pos ir.Position) (method ir.CDCMethod, known bool) {
+	if pos.Token == "" {
+		return ir.CDCNone, false
+	}
+	p := ir.Position{Engine: engineNameMySQL, Token: pos.Token}
+	if _, ok, err := decodeVStreamPos(p); err == nil && ok {
+		return ir.CDCVStream, true
+	}
+	if _, ok, err := decodeBinlogPos(p); err == nil && ok {
+		return ir.CDCBinlog, true
+	}
+	return ir.CDCNone, false
+}

@@ -1336,12 +1336,11 @@ func TestIncludeTableScopeDrift_BinlogDrainedAddedTableStaysInScope(t *testing.T
 // set, and a reader-side scope drop (the MySQL binlog reader's, since
 // v0.154.0) discarded them at exit 0 with the stream green. A second
 // stop/write/restart is measured too: the loss recurred at every restart.
-// addArgs is passed to the add-table run (--no-drain, or nothing).
-func stoppedWindowReachesTheAddedTable(t *testing.T, r *scopeDriftRig, addArgs ...string) {
+func stoppedWindowReachesTheAddedTable(t *testing.T, r *scopeDriftRig) {
 	t.Helper()
 	r.establishKD("kd")
 	r.exec(r.src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x'), (2, 'y'), (3, 'z')")
-	if code, out := r.addTable("users", addArgs...); code != 0 {
+	if code, out := r.addTable("users"); code != 0 {
 		t.Fatalf("schema add-table users: exit %d\n%s", code, out)
 	}
 	if got, ok := r.waitRows(r.tgt, "users", "e", "1|x,2|y,3|z", 30*time.Second); !ok {
@@ -1385,12 +1384,42 @@ func TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheAddedTable(t *testi
 	stoppedWindowReachesTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt))
 }
 
-// TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheNoDrainAddedTable
-// is Bug 322 with `--no-drain` (ADR-0034's filter flip) — lost since v0.154.0.
-func TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheNoDrainAddedTable(t *testing.T) {
+// TestIncludeTableScopeDrift_BinlogPreV01630NoDrainEntryRefusesLoudly is the
+// cross-version half of what TestIncludeTableScopeDrift_BinlogStoppedWindow-
+// ReachesTheNoDrainAddedTable used to run (Bug 322 with `--no-drain`,
+// ADR-0034's filter flip, lost since v0.154.0) before v0.163.8 refused that
+// add on a binlog source (NO-DRAIN-BINLOG-SOURCE).
+//
+// A v0.163.0-v0.163.7 `--no-drain` add left exactly the record a drained add
+// leaves (both run AddTable's pending and completed records), so
+// TestIncludeTableScopeDrift_BinlogStoppedWindowReachesTheAddedTable covers
+// it. An add by an older binary left only the live-added entry, which is
+// planted here: a v0.163.8 stream must not apply the table's stopped-window
+// changes onto a copy no record says it made — it refuses loudly
+// (INCLUDE-TABLE-SCOPE-DRIFT, "never copied by this stream") with the target
+// table untouched.
+func TestIncludeTableScopeDrift_BinlogPreV01630NoDrainEntryRefusesLoudly(t *testing.T) {
 	src, tgt, cleanup := startMySQLBinlog(t)
 	defer cleanup()
-	stoppedWindowReachesTheAddedTable(t, newScopeDriftRig(t, "mysql", src, tgt), "--no-drain")
+	r := newScopeDriftRig(t, "mysql", src, tgt)
+	r.establishKD("kd")
+	r.exec(src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x'), (2, 'y'), (3, 'z')")
+	plantPreV01630NoDrainEntry(t, r)
+	r.exec(src, "INSERT INTO users VALUES (4, 'w'); UPDATE users SET e = 'y2' WHERE id = 2; DELETE FROM users WHERE id = 3")
+	r.requireScopeDriftRefusal(r.startSync("kd"), "users", scopeDriftReasonNotEstablished)
+	if got := r.rows(tgt, "users", "e"); got != "1|x,2|y,3|z" {
+		t.Fatalf("target users = %q after the refusal; want the planted copy untouched (1|x,2|y,3|z)", got)
+	}
+}
+
+// plantPreV01630NoDrainEntry leaves the target as a pre-v0.163.0 binary's
+// `--no-drain` add of users did on a MySQL target: the table created and
+// copied, and its name in the stream's live_added_tables (the only record
+// ADR-0034's path wrote before v0.163.0).
+func plantPreV01630NoDrainEntry(t *testing.T, r *scopeDriftRig) {
+	t.Helper()
+	r.exec(r.tgt, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x'), (2, 'y'), (3, 'z')")
+	r.exec(r.tgt, "UPDATE sluice_cdc_state SET live_added_tables = 'users' WHERE stream_id = '"+r.streamID+"'")
 }
 
 // TestIncludeTableScopeDrift_BinlogAddedTableRecopyRemedyConverges measures
@@ -1521,8 +1550,10 @@ func TestIncludeTableScopeDrift_ExcludeOfAnAddedTableRefuses(t *testing.T) {
 // within its poll interval, having recorded the table as dropped (R8); a
 // restart that only narrows the exclusion refuses (R7-S1: before R8 it
 // streamed the table onto a copy missing the window's changes, at exit 0);
-// emptying the target table and adding it again converges.
-func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
+// emptying the target table and adding it again converges. addArgs is
+// passed to the add against the running stream: --no-drain on a publication
+// source; nothing on a binlog source (see the binlog test).
+func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig, addArgs ...string) {
 	t.Helper()
 	r.exec(r.src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a');"+
 		"CREATE TABLE tmp_keep (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO tmp_keep VALUES (1, 'x'), (2, 'y')")
@@ -1537,8 +1568,8 @@ func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
 	// The add cannot know the stream's flags. It usually completes before the
 	// poll sees it; if the stream's refusal abandons it first, it stops with
 	// PENDING-ADD-SUPERSEDED (R8). Either is correct.
-	if code, out := r.addTable("tmp_keep", "--no-drain"); code != 0 && !strings.Contains(out, "PENDING-ADD-SUPERSEDED") {
-		t.Fatalf("schema add-table tmp_keep --no-drain: exit %d\n%s", code, out)
+	if code, out := r.addTable("tmp_keep", addArgs...); code != 0 && !strings.Contains(out, "PENDING-ADD-SUPERSEDED") {
+		t.Fatalf("schema add-table tmp_keep %v: exit %d\n%s", addArgs, code, out)
 	}
 	r.exec(r.src, "UPDATE tmp_keep SET e = 'changed' WHERE id = 1")
 	requireLiveAddedExcludedRefusal(t, run, "tmp_keep", "stopped when it saw the add", "recorded the table as dropped")
@@ -1570,12 +1601,18 @@ func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
 func TestIncludeTableScopeDrift_PgoutputLiveAddOfAnExcludedTableStops(t *testing.T) {
 	src, tgt, cleanup := startPostgresLogical(t)
 	defer cleanup()
-	liveAddOfAnExcludedTable(t, newScopeDriftRig(t, "postgres", src, tgt))
+	liveAddOfAnExcludedTable(t, newScopeDriftRig(t, "postgres", src, tgt), "--no-drain")
 }
 
 // TestIncludeTableScopeDrift_BinlogLiveAddOfAnExcludedTableStops is R6-S1 on
-// MySQL --no-drain (ADR-0034's filter flip) — a regression R6 introduced
-// there: before it, ADR-0034's live-added set won over the exclusion.
+// a MySQL binlog source — a regression R6 introduced there: before it,
+// ADR-0034's live-added set won over the exclusion. v0.163.8 refuses
+// `--no-drain` on a binlog source (NO-DRAIN-BINLOG-SOURCE), but the running
+// stream still meets the same record two ways: an older binary's --no-drain
+// add, and a drained add run without stopping the stream
+// (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED). Both record the table after
+// the copy, while the stream runs; this test drives the second, which is the
+// first's state exactly. (Until v0.163.8 it ran the --no-drain add itself.)
 func TestIncludeTableScopeDrift_BinlogLiveAddOfAnExcludedTableStops(t *testing.T) {
 	src, tgt, cleanup := startMySQLBinlog(t)
 	defer cleanup()

@@ -126,7 +126,7 @@ This is real engineering work — ~1000-1500 LOC minimum, plus tests, plus ADR. 
 
 ## Phase 2 status (live add, no drain)
 
-**Shipped.** Phase 2 lives behind `sluice schema add-table TABLE --no-drain` (PG first, v0.24.0; the MySQL-family binlog source → MySQL-family target path followed in v0.27.0 via the streamer filter-flip, [`adr-0034-mysql-phase-2-live-add-table.md`](adr/adr-0034-mysql-phase-2-live-add-table.md)). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md) for the full correctness story.
+**Shipped.** Phase 2 lives behind `sluice schema add-table TABLE --no-drain` (PG first, v0.24.0; the MySQL-family binlog source → MySQL-family target path followed in v0.27.0 via the streamer filter-flip, [`adr-0034-mysql-phase-2-live-add-table.md`](adr/adr-0034-mysql-phase-2-live-add-table.md); that path was withdrawn in v0.163.8 after it measured silent loss of every change made to the table during the copy, so `--no-drain` now works only on a Postgres source, and MySQL/MariaDB sources refuse with `NO-DRAIN-BINLOG-SOURCE`, PlanetScale/Vitess sources with `NO-DRAIN-VSTREAM-SOURCE`). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md) for the full correctness story.
 
 The implementation chose **Strategy C variant (c)** — single-slot, publication-add-then-snapshot ordering — over Strategy B (dual-slot). Re-reading Phase 1's orchestrator after it shipped revealed that the publication-add → snapshot ordering already implements the correctness shape; the only thing keeping Phase 1 from being live-safe was the conservative `stop_requested_at` refusal in `preflightStream`. Phase 2 lifts that refusal in favour of:
 
@@ -134,7 +134,7 @@ The implementation chose **Strategy C variant (c)** — single-slot, publication
 - A captured baseline of the active stream's slot `confirmed_flush_lsn` before publication-add.
 - An invariant check after the snapshot opens: snapshot-LSN ≥ the captured slot LSN; loud refusal otherwise.
 
-**MySQL Phase 2 shipped v0.27.0** — see [ADR-0034](adr/adr-0034-mysql-phase-2-live-add-table.md). The streamer-side filter-flip mechanism this section anticipated was implemented as designed: `applyTableFilter`'s scope is extended mid-run when the publication-equivalent action fires, and the PG-only refusal in `preflightStream` is lifted for MySQL targets.
+**MySQL Phase 2 shipped v0.27.0** — see [ADR-0034](adr/adr-0034-mysql-phase-2-live-add-table.md). The streamer-side filter-flip mechanism this section anticipated was implemented as designed: `applyTableFilter`'s scope is extended mid-run when the publication-equivalent action fires, and the PG-only refusal in `preflightStream` is lifted for MySQL targets. (Withdrawn in v0.163.8: the scope extension lands only after the copy, and the stream drops the table's changes until then, so the whole copy was a silent loss window; `--no-drain` refuses again on every source without a publication, `NO-DRAIN-BINLOG-SOURCE` for MySQL/MariaDB and `NO-DRAIN-VSTREAM-SOURCE` for PlanetScale/Vitess.)
 
 **Strategy B remains reserved** for Phase 3 if real operator demand surfaces for sub-second add-table latency on workloads where the temp slot's brief WAL pin is unacceptable.
 

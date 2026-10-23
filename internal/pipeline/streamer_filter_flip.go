@@ -3,8 +3,10 @@
 
 // Streamer-side mid-run filter mutation for MySQL Phase 2 live add-table
 // (ADR-0034). The orchestrator records new tables to the per-target
-// `sluice_cdc_state.live_added_tables` column on a successful
-// `sluice schema add-table --no-drain TABLE`; the running streamer's
+// `sluice_cdc_state.live_added_tables` column on every successful
+// `sluice schema add-table TABLE` (Bug 321 R6 A; `--no-drain` on a binlog
+// source is refused, NO-DRAIN-BINLOG-SOURCE, because the poll lag below
+// drops the table's changes on a stream still running); the running streamer's
 // poll goroutine reads that column on its existing tick cadence and
 // merges any new entries into the dispatch filter additively.
 //
