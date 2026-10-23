@@ -447,8 +447,15 @@ func TestVStreamSnapshot_DeferredReplaysAreLeftToTheStream(t *testing.T) {
 	}
 	dispatch(scbField("0", scbFields()))
 	dispatch(scbRow("0", &binlogdata.RowChange{After: makeRow([]string{"1", "a"})}))
-	// A replay before the deferral: recorded as a refusal.
-	dispatch(scbRow("0", &binlogdata.RowChange{Before: makeRow([]string{"1", "a"})}))
+	// A replay before the deferral, two unappliable changes and an insert in
+	// one event: recorded as a refusal, and both changes counted.
+	dispatch(&binlogdata.VEvent{Type: binlogdata.VEventType_ROW, RowEvent: &binlogdata.RowEvent{
+		TableName: "t", Keyspace: "main", Shard: "0", RowChanges: []*binlogdata.RowChange{
+			{Before: makeRow([]string{"1", "a"})},
+			{Before: makeRow([]string{"2", "b"})},
+			{After: makeRow([]string{"9", "i"})},
+		},
+	}})
 	rr.DeferCopyReplaysToStream()
 	// After it: a key change and a delete in one event beside an insert.
 	dispatch(&binlogdata.VEvent{Type: binlogdata.VEventType_ROW, RowEvent: &binlogdata.RowEvent{
@@ -464,10 +471,10 @@ func TestVStreamSnapshot_DeferredReplaysAreLeftToTheStream(t *testing.T) {
 	if err := s.Err(); err != nil {
 		t.Fatalf("Err = %v; a deferred replay is not a refusal", err)
 	}
-	if got := scbIDs(s.rowBuffer["t"]); len(got) != 2 || got[0] != 1 || got[1] != 8 {
-		t.Errorf("buffered %v; want [1 8] (the copy row and the event's insert; the key change and the delete left to the stream)", got)
+	if got := scbIDs(s.rowBuffer["t"]); len(got) != 3 || got[0] != 1 || got[1] != 9 || got[2] != 8 {
+		t.Errorf("buffered %v; want [1 9 8] (the copy row and both events' inserts; every unappliable change left to the stream)", got)
 	}
-	if n := s.deferredReplays["t"]; n != 3 {
-		t.Errorf("deferred %d change(s); want 3 (the early refusal converted, the key change, the delete)", n)
+	if n := s.deferredReplays["t"]; n != 4 {
+		t.Errorf("deferred %d change(s); want 4 (both changes of the early event, then the key change and the delete)", n)
 	}
 }

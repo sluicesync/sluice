@@ -263,8 +263,13 @@ var errCopyRowChangeRefused = errors.New(copyRowChangeRefusedMarker)
 // retry would meet it again: terminal. Neither verdict applies when the
 // caller deferred replays ([ir.CopyReplayDeferrer]; the drained `schema
 // add-table`, whose stopped stream replays from before the copy): the
-// change is then left unapplied for that stream ([refuseTableLocked]), so in
-// practice the terminal verdict is reached by no shipping path.
+// change is then left unapplied for that stream ([refuseTableLocked]). The
+// terminal verdict is therefore reached only through a table-less snapshot
+// open whose caller does not defer: today the cold start's fallback for an
+// empty table list (openSnapshotStreamScoped), where refusing is right
+// because its change stream starts at the copy's own position.
+// TestCopyReplayDeferralRoster (internal/pipeline) holds every production
+// caller of the table-less opener to deferring or to a listed exemption.
 func copyRowChangeRefusal(keyspace, shard, table string, rc *binlogdata.RowChange, fields []*query.Field, singleTableStream bool) error {
 	var shape string
 	switch {

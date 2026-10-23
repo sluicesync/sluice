@@ -953,8 +953,10 @@ type vstreamSnapshotStream struct {
 
 	// deferReplays is set by [vstreamSnapshotRows.DeferCopyReplaysToStream]:
 	// the caller guarantees a later change stream replays from before the
-	// copy, so an unappliable replayed change is left unapplied and counted
-	// in deferredReplays (per table) instead of refusing. Guarded by mu.
+	// copy, so an unappliable replayed change is left unapplied instead of
+	// refusing. deferredReplays counts, per table, every unappliable change
+	// the copy received, deferred or not (a refusal withdrawn by a late
+	// deferral keeps an exact count). Guarded by mu.
 	deferReplays    bool
 	deferredReplays map[string]int
 
@@ -2106,13 +2108,14 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
 		// A shard still copying sends copy rows (an after image only). A
-		// replayed change it cannot apply refuses this table; it is never
-		// skipped (the skip this replaced dropped every DELETE).
+		// replayed change it cannot apply refuses this table, or is left to
+		// a later change stream the caller vouched for; it is never skipped
+		// unaccounted (the skip this replaced dropped every DELETE). Either
+		// way the event's other row changes are still judged, so every
+		// unappliable one is counted.
 		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields, len(s.copyTables) == 1); err != nil {
-			if s.refuseTableLocked(tableName, err) {
-				return nil
-			}
-			continue // deferred to the later change stream
+			s.refuseTableLocked(tableName, err)
+			continue
 		}
 		row, _, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
 		if err != nil {
@@ -2874,19 +2877,19 @@ func (s *vstreamSnapshotStream) Err() error {
 }
 
 // refuseTableLocked handles one change [copyRowChangeRefusal] judged
-// unappliable. When the caller deferred replays to a later change stream
-// ([vstreamSnapshotRows.DeferCopyReplaysToStream]) the change is left
-// unapplied and counted, and it returns false: the copy goes on with the
-// event's other row changes. Otherwise it records table's first refusal,
-// wakes any reader and returns true: the copy of that table stops. The
-// caller holds mu.
-func (s *vstreamSnapshotStream) refuseTableLocked(table string, err error) bool {
+// unappliable. Every such change is counted in deferredReplays and never
+// applied. Unless the caller deferred replays to a later change stream
+// ([vstreamSnapshotRows.DeferCopyReplaysToStream]), it also records the
+// table's first refusal and wakes any reader: the copy of that table has
+// failed. The caller holds mu and goes on with the event's other row
+// changes either way, so the count covers every unappliable change.
+func (s *vstreamSnapshotStream) refuseTableLocked(table string, err error) {
+	if s.deferredReplays == nil {
+		s.deferredReplays = map[string]int{}
+	}
+	s.deferredReplays[table]++
 	if s.deferReplays {
-		if s.deferredReplays == nil {
-			s.deferredReplays = map[string]int{}
-		}
-		s.deferredReplays[table]++
-		return false
+		return
 	}
 	if s.copyRefusals == nil {
 		s.copyRefusals = map[string]error{}
@@ -2895,29 +2898,25 @@ func (s *vstreamSnapshotStream) refuseTableLocked(table string, err error) bool 
 		s.copyRefusals[table] = err
 	}
 	s.broadcast()
-	return true
 }
 
 // deferCopyReplaysLocked switches the copy to leaving unappliable replayed
-// changes for a later change stream. A refusal already recorded becomes a
-// deferral: its change was never applied (a refusal buffers nothing), so
-// the two are the same on the target, and the switch is race-free against
-// a replay that arrived before it. The caller holds mu.
+// changes for a later change stream. A refusal already recorded is
+// withdrawn: its changes were counted and never applied, exactly as a
+// deferral leaves them, so the switch is race-free against a replay that
+// arrived before it and the count stays exact. The caller holds mu.
 func (s *vstreamSnapshotStream) deferCopyReplaysLocked() {
 	s.deferReplays = true
-	for table := range s.copyRefusals {
-		if s.deferredReplays == nil {
-			s.deferredReplays = map[string]int{}
-		}
-		s.deferredReplays[table]++
-		delete(s.copyRefusals, table)
-	}
+	clear(s.copyRefusals)
 	s.broadcast()
 }
 
 // logDeferredReplaysLocked records, once at the end of the copy, the
 // changes left to the later change stream. The caller holds mu.
 func (s *vstreamSnapshotStream) logDeferredReplaysLocked() {
+	if !s.deferReplays {
+		return // without a deferral these changes refused their tables
+	}
 	tables := make([]string, 0, len(s.deferredReplays))
 	for t := range s.deferredReplays {
 		tables = append(tables, t)

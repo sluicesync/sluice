@@ -683,18 +683,30 @@ func vskRunCell(t *testing.T, r vskRig, sh vskShape, run int) vskCellResult {
 // to the source by key and value. Before the deferral this add refused with
 // VSTREAM-COPY-ROW-CHANGE-REFUSED, and before that refusal the copy dropped
 // the deletes and wrote the key changes' new rows next to the old ones.
-func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig) {
+//
+// Two orders, both real: the added table already exists (out of the
+// stream's scope) when the stream is established, so the restart replays
+// only the add-time changes; or it is created and filled while the stream
+// is stopped (createAfterStop), so the restart also replays its CREATE TABLE
+// and every insert of its seed, onto a table the add has already created and
+// filled on the target.
+type vskAddCase struct {
+	est, added, streamID string
+	rows                 int64
+	createAfterStop      bool
+}
+
+func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig, c vskAddCase) {
 	t.Helper()
-	const est, added, streamID = "kz_est", "ka_new", "vskadd"
+	est, added, streamID, rows := c.est, c.added, c.streamID, c.rows
 	vskCreate(t, r.src(), false, r.keyspace, est)
 	small := vcrRange(1, 1, vskSmallRows)
 	vskSeed(t, r.mysqlDSN, est, small, small)
-	// ka_new exists, out of the stream's scope, before the stream is
-	// established, as in the real flow: the drained restart then replays only
-	// the add-time changes, not ka_new's whole seed.
-	vskCreate(t, r.src(), false, r.keyspace, added)
-	seed := vcrRange(1, 1, vskRows)
-	vskSeed(t, r.mysqlDSN, added, seed, seed)
+	seed := vcrRange(1, 1, int(rows))
+	if !c.createAfterStop {
+		vskCreate(t, r.src(), false, r.keyspace, added)
+		vskSeed(t, r.mysqlDSN, added, seed, seed)
+	}
 	time.Sleep(3 * time.Second)
 	cell := twfbCell{tgt: r.tgt(), streamID: streamID}
 	first := startTWFBRun(r.streamer(streamID, []string{est}, ""))
@@ -702,6 +714,11 @@ func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig) {
 		t.Fatalf("RIG: the establishing cold start never handed off (exited=%v err=%v)", first.exited(), first.err)
 	}
 	_ = first.stop(t)
+	if c.createAfterStop {
+		vskCreate(t, r.src(), false, r.keyspace, added)
+		vskSeed(t, r.mysqlDSN, added, seed, seed)
+		time.Sleep(3 * time.Second)
+	}
 
 	srcEng, _ := engines.Get("planetscale")
 	pgEng, _ := engines.Get("postgres")
@@ -719,8 +736,8 @@ func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig) {
 	deadline := time.Now().Add(6 * time.Minute)
 	for {
 		n, _ := strconv.Atoi(r.tgt().scalar(t, "SELECT count(*) FROM "+added))
-		if n >= 20_000 {
-			if n >= vskRows-1000 {
+		if n >= int(rows/8) {
+			if n >= int(rows*3/4) {
 				t.Fatalf("RIG: %s held %d rows before the deletes; the copy was not mid-way", added, n)
 			}
 			break
@@ -731,17 +748,17 @@ func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig) {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("RIG: the add-table copy never reached 20,000 rows")
+			t.Fatalf("RIG: the add-table copy never reached %d rows", rows/8)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	logStart := r.logs.Len()
-	deleted := append(vcrRange(1, 1, 20), vcrRange(150_001, 1, 20)...)
+	deleted := append(vcrRange(1, 1, 20), vcrRange(rows*15/16+1, 1, 20)...)
 	for _, id := range deleted {
 		r.src().exec(t, fmt.Sprintf("DELETE FROM %s WHERE id = %d", added, id))
 	}
 	// Key changes on rows the copy has already sent and on rows it has not.
-	keyChanged := []int64{101, 102, 103, 140_001, 140_002}
+	keyChanged := []int64{101, 102, 103, rows*7/8 + 1, rows*7/8 + 2}
 	for _, id := range keyChanged {
 		r.src().exec(t, fmt.Sprintf("UPDATE %s SET id = %d WHERE id = %d", added, id+50_000_000, id))
 	}
@@ -779,7 +796,7 @@ func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig) {
 		vskSeed(t, r.mysqlDSN, tbl, []int64{9_000_001}, []int64{9_000_001})
 	}
 	for _, tbl := range []string{est, added} {
-		if !r.tgt().waitRow(t, tbl, 9_000_001, run, 120*time.Second) {
+		if !r.tgt().waitRow(t, tbl, 9_000_001, run, 5*time.Minute) {
 			t.Fatalf("%s's marker never reached the target (exited=%v err=%v)", tbl, run.exited(), run.err)
 		}
 	}
@@ -905,7 +922,17 @@ func TestStreamer_VStreamShardSkewCopy(t *testing.T) {
 	t.Run("AddTable", func(t *testing.T) {
 		r, done := boot(t, vskLayout{shards: []string{"0"}, last: "0"})
 		defer done()
-		vskAddTableDrainedDefersReplays(t, r)
+		t.Run("TableExistedBeforeTheStream", func(t *testing.T) {
+			vskAddTableDrainedDefersReplays(t, r, vskAddCase{est: "kz_est", added: "ka_new", streamID: "vskadd", rows: vskRows})
+		})
+		// Created and filled while the stream is stopped: the restart replays
+		// its CREATE TABLE and its 40,000 inserts onto the table the add
+		// already created and filled. kb_new copies before kc_est (and the
+		// first cell's kz_est), so the catch-up before kc_est replays its
+		// add-time changes.
+		t.Run("TableCreatedWhileStopped", func(t *testing.T) {
+			vskAddTableDrainedDefersReplays(t, r, vskAddCase{est: "kc_est", added: "kb_new", streamID: "vskadd2", rows: 40_000, createAfterStop: true})
+		})
 	})
 
 	t.Run("FourShards", func(t *testing.T) {
