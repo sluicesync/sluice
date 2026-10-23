@@ -1,5 +1,9 @@
 # sluice v0.163.6
 
+> **Correction (2026-10-23).** One Compatibility sentence is narrower than v0.163.6 behaves. The fix itself is unchanged and needs no upgrade beyond v0.163.6; only this statement of its cost was wrong.
+>
+> **"a vtgate outage longer than about 13 seconds uses all 8"** (and the advice to raise `--apply-retry-attempts` to ride out more faults) holds only when each restarted copy can reach vtgate and fails later, mid-read. When vtgate refuses or drops connections outright, the restarted copy's stream open fails, and that error is not counted as retriable, so a first cold copy exits after one retry with `open snapshot stream: … rpc error: code = Unavailable` (measured: a 3-second refused outage ended the run, with `--apply-retry-attempts=30` too; v0.163.5 ended the same way). No row is lost: a plain re-run refuses `SLUICE-E-COLDSTART-TARGET-NOT-EMPTY` with the target unchanged, and the same command with `--restart-from-scratch` lands exact. A fix that counts a failed open against the budget is planned. Found by the v0.163.6 regression cycle (sluice-testing Bug 330).
+
 <!-- notes-claims-exempt: VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED VSTREAM-COLD-COPY-RETRY-BUDGET-NEVER-CREDITS reconnectStream -->
 <!-- The two markers are filings in docs/dev/audit-backlog.md, outside the gate evidence scope; reconnectStream is named because this release deletes it. The three open items reported by the review after this tag (the slot-name copy scope, the add-table keyspace-wide copy, the backup snapshot-open fallback) are not filed in this tree, so they are described without their markers. -->
 
