@@ -545,9 +545,12 @@ func (cs *copyStream) bufferRow(table string, ev *binlogdata.VEvent) error {
 	for _, rc := range rev.GetRowChanges() {
 		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields, true); err != nil {
 			s.mu.Lock()
-			s.refuseTableLocked(tableName, err)
+			refused := s.refuseTableLocked(tableName, err)
 			s.mu.Unlock()
-			return nil
+			if refused {
+				return nil
+			}
+			continue // deferred to the later change stream
 		}
 		row, _, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
 		if err != nil {

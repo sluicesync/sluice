@@ -429,3 +429,45 @@ func TestVStreamSnapshot_CopyPhaseRefusalClassifiedByStreamScope(t *testing.T) {
 		})
 	}
 }
+
+// TestVStreamSnapshot_DeferredReplaysAreLeftToTheStream: once the caller
+// defers replays (the drained `schema add-table`), a replayed DELETE or key
+// change on a shard still copying is neither applied nor refused: it is
+// counted and left to the later change stream, the event's appliable row
+// changes still buffer, and a refusal recorded BEFORE the deferral becomes
+// one (the switch is race-free against an early replay).
+func TestVStreamSnapshot_DeferredReplaysAreLeftToTheStream(t *testing.T) {
+	s := newTestSnapshotStream()
+	rr := &vstreamSnapshotRows{snap: s}
+	dispatch := func(ev *binlogdata.VEvent) {
+		t.Helper()
+		if done, err := s.dispatchCopyEvent(ev); err != nil || done {
+			t.Fatalf("dispatch: done=%v err=%v", done, err)
+		}
+	}
+	dispatch(scbField("0", scbFields()))
+	dispatch(scbRow("0", &binlogdata.RowChange{After: makeRow([]string{"1", "a"})}))
+	// A replay before the deferral: recorded as a refusal.
+	dispatch(scbRow("0", &binlogdata.RowChange{Before: makeRow([]string{"1", "a"})}))
+	rr.DeferCopyReplaysToStream()
+	// After it: a key change and a delete in one event beside an insert.
+	dispatch(&binlogdata.VEvent{Type: binlogdata.VEventType_ROW, RowEvent: &binlogdata.RowEvent{
+		TableName: "t", Keyspace: "main", Shard: "0", RowChanges: []*binlogdata.RowChange{
+			{Before: makeRow([]string{"5", "e"}), After: makeRow([]string{"6", "e"})},
+			{Before: makeRow([]string{"7", "g"})},
+			{After: makeRow([]string{"8", "h"})},
+		},
+	}})
+	s.mu.Lock()
+	s.readTables = map[string]bool{"t": true}
+	s.mu.Unlock()
+	if err := s.Err(); err != nil {
+		t.Fatalf("Err = %v; a deferred replay is not a refusal", err)
+	}
+	if got := scbIDs(s.rowBuffer["t"]); len(got) != 2 || got[0] != 1 || got[1] != 8 {
+		t.Errorf("buffered %v; want [1 8] (the copy row and the event's insert; the key change and the delete left to the stream)", got)
+	}
+	if n := s.deferredReplays["t"]; n != 3 {
+		t.Errorf("deferred %d change(s); want 3 (the early refusal converted, the key change, the delete)", n)
+	}
+}

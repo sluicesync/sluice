@@ -42,7 +42,6 @@ package pipeline
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -54,7 +53,6 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/engines"
-	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/pipeline/backup"
 	"sluicesync.dev/sluice/internal/pipeline/blobcodec"
@@ -672,21 +670,31 @@ func vskRunCell(t *testing.T, r vskRig, sh vskShape, run int) vskCellResult {
 	return res
 }
 
-// vskAddTableRefusalAndRemedy measures VSTREAM-COPY-ROW-CHANGE-REFUSED on
-// `schema add-table` and the remedy its message names. An established stream
-// copies kz_est; ka_new is added with `schema add-table` (drained), and while
-// its copy runs 40 of its rows are deleted. vttablet's keyspace-wide copy
-// sorts ka_new before kz_est, so its catch-up before kz_est replays those
-// deletes inside the copy. The add must refuse with the marker, unretried;
-// then a --restart-from-scratch re-copy with both tables in --include-table
-// must match the source by key and value, the add's pending record
-// notwithstanding.
-func vskAddTableRefusalAndRemedy(t *testing.T, r vskRig) {
+// vskAddTableDrainedDefersReplays pins the drained `schema add-table`'s
+// handling of changes Vitess replays inside its copy (ir.CopyReplayDeferrer).
+// An established stream copies kz_est and is stopped; ka_new is added with
+// `schema add-table`, and while its copy runs 40 of its rows are deleted and
+// 5 of its keys changed. vttablet's keyspace-wide copy sorts ka_new before
+// kz_est, so its catch-up before kz_est replays all 45 changes inside the
+// copy. The copy cannot apply a DELETE or key change in order, and the
+// stopped stream will replay them from its pre-add position, so the add must
+// SUCCEED, report exactly 45 changes left to the stream (the proof the
+// catch-up path ran), and the restarted stream must leave the target equal
+// to the source by key and value. Before the deferral this add refused with
+// VSTREAM-COPY-ROW-CHANGE-REFUSED, and before that refusal the copy dropped
+// the deletes and wrote the key changes' new rows next to the old ones.
+func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig) {
 	t.Helper()
 	const est, added, streamID = "kz_est", "ka_new", "vskadd"
 	vskCreate(t, r.src(), false, r.keyspace, est)
 	small := vcrRange(1, 1, vskSmallRows)
 	vskSeed(t, r.mysqlDSN, est, small, small)
+	// ka_new exists, out of the stream's scope, before the stream is
+	// established, as in the real flow: the drained restart then replays only
+	// the add-time changes, not ka_new's whole seed.
+	vskCreate(t, r.src(), false, r.keyspace, added)
+	seed := vcrRange(1, 1, vskRows)
+	vskSeed(t, r.mysqlDSN, added, seed, seed)
 	time.Sleep(3 * time.Second)
 	cell := twfbCell{tgt: r.tgt(), streamID: streamID}
 	first := startTWFBRun(r.streamer(streamID, []string{est}, ""))
@@ -694,12 +702,6 @@ func vskAddTableRefusalAndRemedy(t *testing.T, r vskRig) {
 		t.Fatalf("RIG: the establishing cold start never handed off (exited=%v err=%v)", first.exited(), first.err)
 	}
 	_ = first.stop(t)
-	prevPos := cell.persistedPosition(t)
-
-	vskCreate(t, r.src(), false, r.keyspace, added)
-	seed := vcrRange(1, 1, vskRows)
-	vskSeed(t, r.mysqlDSN, added, seed, seed)
-	time.Sleep(3 * time.Second)
 
 	srcEng, _ := engines.Get("planetscale")
 	pgEng, _ := engines.Get("postgres")
@@ -733,9 +735,15 @@ func vskAddTableRefusalAndRemedy(t *testing.T, r vskRig) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	logStart := r.logs.Len()
 	deleted := append(vcrRange(1, 1, 20), vcrRange(150_001, 1, 20)...)
 	for _, id := range deleted {
 		r.src().exec(t, fmt.Sprintf("DELETE FROM %s WHERE id = %d", added, id))
+	}
+	// Key changes on rows the copy has already sent and on rows it has not.
+	keyChanged := []int64{101, 102, 103, 140_001, 140_002}
+	for _, id := range keyChanged {
+		r.src().exec(t, fmt.Sprintf("UPDATE %s SET id = %d WHERE id = %d", added, id+50_000_000, id))
 	}
 	var addErr error
 	select {
@@ -743,27 +751,30 @@ func vskAddTableRefusalAndRemedy(t *testing.T, r vskRig) {
 	case <-time.After(8 * time.Minute):
 		t.Fatal("RIG: the add-table did not end")
 	}
-	var re ir.RetriableError
-	switch {
-	case addErr == nil:
-		t.Fatalf("the add-table succeeded although %d rows of %s were deleted during its copy; want %s", len(deleted), added, vskRefusedMarker)
-	case !strings.Contains(addErr.Error(), vskRefusedMarker):
-		t.Fatalf("the add-table failed with %v; want %s", addErr, vskRefusedMarker)
-	case errors.As(addErr, &re) && re.Retriable():
-		t.Fatalf("the add-table refusal is classified retriable; the keyspace-wide replay is deterministic and must stay terminal: %v", addErr)
+	if addErr != nil {
+		t.Fatalf("the drained add-table failed: %v; a replayed change the copy cannot apply must be left to the stopped "+
+			"stream, which replays it from before the copy", addErr)
 	}
-	t.Logf("REFUSED (loud, terminal): %v", addErr)
-	t.Logf("after the refusal the target's %s holds %s rows (source %s)", added,
-		r.tgt().scalar(t, "SELECT count(*) FROM "+added), r.src().scalar(t, "SELECT count(*) FROM "+added))
+	tag := fmt.Sprintf("%s keyspace=%s table=%s changes=", vskDeferredLine, r.keyspace, added)
+	deferred := 0
+	for _, line := range strings.Split(r.logs.String()[logStart:], "\n") {
+		if i := strings.Index(line, tag); i >= 0 {
+			var n int
+			if _, err := fmt.Sscanf(line[i+len(tag):], "%d", &n); err == nil {
+				deferred += n
+			}
+		}
+	}
+	if want := len(deleted) + len(keyChanged); deferred != want {
+		t.Errorf("TIMING: the add's copy left %d change(s) to the stream, want %d (every delete and key change, "+
+			"replayed by vttablet's catch-up before the next table)", deferred, want)
+	}
+	t.Logf("the drained add succeeded and left %d replayed change(s) to the stream; target %s holds %s rows (source %s)",
+		deferred, added, r.tgt().scalar(t, "SELECT count(*) FROM "+added), r.src().scalar(t, "SELECT count(*) FROM "+added))
 
-	// The remedy the refusal names.
-	remedy := r.streamer(streamID, []string{est, added}, "")
-	remedy.RestartFromScratch = true
-	run := startTWFBRun(remedy)
+	// The drained restart, which replays from the stream's pre-add position.
+	run := startTWFBRun(r.streamer(streamID, []string{est}, ""))
 	defer func() { _ = run.stop(t) }()
-	if !vrsAwaitHandoff(t, cell, run, prevPos, 8*time.Minute) {
-		t.Fatalf("the --restart-from-scratch remedy never handed off (exited=%v err=%v)", run.exited(), run.err)
-	}
 	for _, tbl := range []string{est, added} {
 		vskSeed(t, r.mysqlDSN, tbl, []int64{9_000_001}, []int64{9_000_001})
 	}
@@ -786,15 +797,16 @@ func vskAddTableRefusalAndRemedy(t *testing.T, r vskRig) {
 			}
 		}
 		if diff != 0 {
-			t.Errorf("after the remedy, %s differs from the source in %d row(s) (source %d, target %d)", tbl, diff, len(src), len(tgt))
+			t.Errorf("SILENT DIVERGENCE after the drained restart: %s differs from the source in %d row(s) (source %d, target %d)", tbl, diff, len(src), len(tgt))
 		} else {
-			t.Logf("EXACT after the remedy: %s source=%d target=%d", tbl, len(src), len(tgt))
+			t.Logf("EXACT after the drained restart: %s source=%d target=%d", tbl, len(src), len(tgt))
 		}
 	}
 }
 
-// vskRefusedMarker is the copy-row refusal's marker.
-const vskRefusedMarker = "VSTREAM-COPY-ROW-CHANGE-REFUSED"
+// vskDeferredLine is the snapshot's INFO record of the replayed changes a
+// copy left to the later change stream (logDeferredReplaysLocked).
+const vskDeferredLine = `msg="mysql/vstream: snapshot: the copy received changes Vitess replayed inside it and left them to the change stream, which resumes from before the copy and replays them in order"`
 
 func vskLogTail(t *testing.T, r vskRig, from int) {
 	t.Helper()
@@ -887,13 +899,13 @@ func TestStreamer_VStreamShardSkewCopy(t *testing.T) {
 	})
 
 	// `schema add-table` copies the whole keyspace in one VStream, so a
-	// delete on the added table during its own copy is replayed by vttablet's
-	// catch-up before the next table: the refusal must reach the operator
-	// (terminal, not retried), and the remedy it names must land exact.
+	// delete or key change on the added table during its own copy is replayed
+	// by vttablet's catch-up before the next table: the drained add must leave
+	// it to the stopped stream, and the restart must land exact.
 	t.Run("AddTable", func(t *testing.T) {
 		r, done := boot(t, vskLayout{shards: []string{"0"}, last: "0"})
 		defer done()
-		vskAddTableRefusalAndRemedy(t, r)
+		vskAddTableDrainedDefersReplays(t, r)
 	})
 
 	t.Run("FourShards", func(t *testing.T) {

@@ -386,8 +386,8 @@ jobs:
       # four-shard vttestserver boot and six cells, each a 160,000-row copy
       # through the 512 KB/s proxy (~7m locally) — makes 32, 134m/140m.
       # +1 cell in the same test (its AddTable group: a second one-shard
-      # boot, an establishing cold start, a refused add-table and a
-      # --restart-from-scratch re-copy, ~2m locally) — still 32, 136m/142m.
+      # boot, an establishing cold start, a drained add-table and its
+      # restart, ~1.5m locally) — still 32, 136m/142m.
       VSTREAM_PIPELINE_EXPECTED_TESTS: "32"
     steps:
       - uses: actions/checkout@v7

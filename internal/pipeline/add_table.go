@@ -590,6 +590,18 @@ func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, p
 	if err != nil {
 		return err
 	}
+	// Drained (the only mode a VStream source allows since
+	// NO-DRAIN-VSTREAM-SOURCE): the stream was stopped before this add and
+	// resumes from its pre-add persisted position, so it replays every change
+	// the source makes during the copy, in order. A change Vitess replays
+	// INSIDE the copy (the keyspace-wide copy's catch-up before each later
+	// table) that the copy cannot apply in order is therefore left to that
+	// stream instead of failing the add (ir.CopyReplayDeferrer; the premise
+	// is measured by TestStreamer_VStreamAddTableKeyspaceWideCopy's Drained
+	// cells). Never in live mode, whose running stream is past the copy.
+	if d, ok := stream.Rows.(ir.CopyReplayDeferrer); ok && !a.LiveMode {
+		d.DeferCopyReplaysToStream()
+	}
 	// The table's id as its copy starts, verified when the add is recorded
 	// complete (coldstart_copy_identity.go).
 	a.copyTimeID = a.tableIdentity(ctx)

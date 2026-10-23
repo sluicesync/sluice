@@ -99,9 +99,26 @@ import (
 // its after image (a key change, leaving the old row); it is now refused
 // (VSTREAM-COPY-ROW-CHANGE-REFUSED) for the table it belongs to. The refusal
 // surfaces through Err once that table's rows are
-// read, so the keyspace-wide stream `schema add-table` opens, which streams
-// every table but reads one, is refused for the table it adds and not for the
-// tables it never reads.
+// read, so a keyspace-wide stream, which streams every table, is refused
+// only for the tables its caller reads.
+//
+// # Deferring instead of refusing
+//
+// The drained `schema add-table` (the only add-table mode a VStream source
+// allows since NO-DRAIN-VSTREAM-SOURCE) opens that keyspace-wide stream, so
+// any delete or key change on the added table during its copy is replayed by
+// the catch-up before the next table. Its stream was stopped before the add
+// and resumes from its pre-add position, replaying every change made during
+// the copy in order. So add-table calls DeferCopyReplaysToStream
+// ([ir.CopyReplayDeferrer]) and the copy leaves those changes unapplied for
+// that stream, counted and logged, instead of failing the add. Measured
+// exact with deletes by TestStreamer_VStreamAddTableKeyspaceWideCopy's
+// Drained cells (v0.163.8, which dropped the deletes the same way and was
+// exact for the same reason) and with deletes and key changes by
+// TestStreamer_VStreamShardSkewCopy/AddTable. The premise is the drain, and
+// it inherits DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED: an add run against
+// a stream that was never stopped loses those changes, exactly as it loses
+// every other change made during the copy.
 
 // copyRowChangeRefusedMarker names the refusal of a copy-phase row change the
 // copy cannot apply.
@@ -243,7 +260,11 @@ var errCopyRowChangeRefused = errors.New(copyRowChangeRefusedMarker)
 // start from a new snapshot (ADR-0109 §B). On a stream that copies several
 // tables in one VStream (the keyspace-wide open `schema add-table` uses)
 // vttablet also replays deterministically before every later table, so a
-// retry would meet it again: terminal.
+// retry would meet it again: terminal. Neither verdict applies when the
+// caller deferred replays ([ir.CopyReplayDeferrer]; the drained `schema
+// add-table`, whose stopped stream replays from before the copy): the
+// change is then left unapplied for that stream ([refuseTableLocked]), so in
+// practice the terminal verdict is reached by no shipping path.
 func copyRowChangeRefusal(keyspace, shard, table string, rc *binlogdata.RowChange, fields []*query.Field, singleTableStream bool) error {
 	var shape string
 	switch {
@@ -270,7 +291,7 @@ func copyRowChangeRefusal(keyspace, shard, table string, rc *binlogdata.RowChang
 	}
 	return fmt.Errorf("mysql/vstream: snapshot: %w: table %s.%s received %s on shard %s while that shard was still copying it. "+
 		"A copy row carries only an after image, so this is a change Vitess replayed inside the copy: this stream copies "+
-		"several tables in one VStream (`sluice schema add-table` copies the whole keyspace that way), and before each later "+
+		"several tables in one VStream, and before each later "+
 		"table vttablet replays the changes made to the tables it already copied (or vtgate restarted the shard's stream). "+
 		"The copy cannot apply it in order, and a retry would meet the same replay, so this copy stops. Bring the table in "+
 		"with a re-copy instead, which copies each table in its own stream: with the stream stopped, run "+
