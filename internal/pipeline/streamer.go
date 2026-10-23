@@ -291,7 +291,9 @@ type Streamer struct {
 	// SlotName, when non-empty, overrides the engine's default
 	// replication-slot name on engines that have a slot concept
 	// (Postgres). Engines without slots (MySQL: binlog stream is
-	// the slot) silently ignore this field. Used to run multiple
+	// the slot; VStream) ignore this field, and their snapshot open is
+	// the one they get without it (VSTREAM-SLOT-NAME-UNSCOPED-COPY:
+	// until that fix it was the unscoped open). Used to run multiple
 	// concurrent sluice instances against the same source —
 	// without a per-instance slot name they'd collide on the
 	// hard-coded `sluice_slot` default. v0.10.2.

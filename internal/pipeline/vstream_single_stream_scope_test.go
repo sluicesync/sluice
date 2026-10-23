@@ -81,17 +81,28 @@ func (a *marksRecordingApplier) ClearApplyMarks(context.Context, string) error {
 // read, before the stream's apply marks are cleared and before anything
 // opens on the target (the target is a stubEngine, which panics on any
 // open), for each cold-start reason that reaches coldStart (a first cold
-// start, --restart-from-scratch, the invalid-position re-snapshot). The
-// refusal carries the sentinel the fleet supervisor and runWithRetry key on.
+// start, --restart-from-scratch, --reset-target-data, the invalid-position
+// re-snapshot). The refusal carries the sentinel the fleet supervisor and
+// runWithRetry key on.
 func TestColdStart_SingleStreamMultiTable_RefusesBeforeAnyWrite(t *testing.T) {
 	captureSlog(t)
+	entries := []struct {
+		name  string
+		fresh freshCopyReason
+		reset bool
+	}{
+		{"first", freshCopyNone, false},
+		{"restart-from-scratch", freshCopyOperatorRestart, false},
+		{"reset-target-data", freshCopyNone, true},
+		{"auto-resnapshot", freshCopyAutoResnapshot, false},
+	}
 	for _, n := range []int{2, 9} {
-		for _, fresh := range []freshCopyReason{freshCopyNone, freshCopyOperatorRestart, freshCopyAutoResnapshot} {
-			t.Run(fmt.Sprintf("tables=%d/fresh=%d", n, fresh), func(t *testing.T) {
+		for _, entry := range entries {
+			t.Run(fmt.Sprintf("tables=%d/%s", n, entry.name), func(t *testing.T) {
 				src := &singleStreamSource{schema: singleStreamSchema(n)}
 				app := &marksRecordingApplier{}
-				s := &Streamer{Source: src, Target: stubEngine{}, SourceDSN: singleStreamDSN}
-				_, _, err := s.coldStart(context.Background(), app, "st", fresh)
+				s := &Streamer{Source: src, Target: stubEngine{}, SourceDSN: singleStreamDSN, ResetTargetData: entry.reset}
+				_, _, err := s.coldStart(context.Background(), app, "st", entry.fresh)
 				if !errors.Is(err, ir.ErrVStreamSingleStreamMultiTable) {
 					t.Fatalf("coldStart = %v; want the VSTREAM-SINGLE-STREAM-MULTI-TABLE refusal", err)
 				}

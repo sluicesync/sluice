@@ -1638,9 +1638,11 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 // plain default open. It is the snapshot-stream sibling of
 // openCDCReaderWithOptionalSlot, extended with the table-scope dispatch.
 //
-//   - slotName != "" → [ir.SnapshotStreamWithSlotOpener] when the engine
-//     implements it (Postgres), else a debug note + default open. The
-//     slot is created at open time, so the name must flow in here.
+//   - slotName != "" AND the engine implements [ir.SnapshotStreamWithSlotOpener]
+//     (Postgres) → the slot-aware open. The slot is created at open time,
+//     so the name must flow in here. An engine without the surface ignores
+//     the name (a debug note) and takes the dispatch below exactly as if
+//     no --slot-name had been given.
 //   - len(tables) > 0 → [ir.FilteredSnapshotOpener] when a `--where` filter
 //     is set and the engine implements it (VStream), pushing the predicate
 //     into the COPY filter rules at open (ADR-0174 Piece 2 — the eager-COPY
@@ -1652,9 +1654,17 @@ func (s *Streamer) coldStartBeginCDC(ctx context.Context, stream *ir.SnapshotStr
 //     streamed/buffered (ADR-0071).
 //   - otherwise → the plain [ir.Engine.OpenSnapshotStream].
 //
-// Slot and table-scope never coexist on one engine (Postgres has the
-// slot; PlanetScale has the tables), but if both are somehow set the slot
-// wins — it's the more specific lifecycle requirement. The post-open
+// No engine implements both the slot surface and a table-scoped one
+// (Postgres has the slot; the MySQL family has the tables); if one ever
+// does, the slot wins — it's the more specific lifecycle requirement.
+// The FLAG is another matter: --slot-name can be set against any source,
+// and until VSTREAM-SLOT-NAME-UNSCOPED-COPY a name given to a source
+// without the slot surface returned the plain no-table open here. On a
+// VStream source that is one keyspace-wide stream: every table in the
+// keyspace copied regardless of --include-table, the --where push-down
+// skipped (the post-open RowFilterSetter is a no-op on VStream, so rows
+// outside the filter were copied), and the multi-table catch-up that
+// drops deletes (VSTREAM-SINGLE-STREAM-CATCHUP-DELETE-DROPPED). The post-open
 // [migcore.ApplyRowFilters] gate in [coldStartOpenSnapshot] still runs for
 // every path — it is the loud-failure authority for a source that supports
 // neither push-down — and is a harmless no-op re-store on the VStream path
@@ -1665,10 +1675,9 @@ func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotNa
 			return opener.OpenSnapshotStreamWithSlot(ctx, dsn, slotName)
 		}
 		slog.DebugContext(
-			ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name silently ignored",
+			ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name ignored for the snapshot open",
 			slog.String("engine", source.Name()),
 		)
-		return source.OpenSnapshotStream(ctx, dsn)
 	}
 	if len(tables) > 0 {
 		if len(rowFilters) > 0 {
