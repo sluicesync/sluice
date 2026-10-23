@@ -88,6 +88,19 @@ type notesAmendment struct {
 
 var declaredNotesAmendments = []notesAmendment{
 	{
+		amended:     semver{0, 163, 6},
+		fixedIn:     semver{0, 163, 6},
+		claimMarker: "a vtgate outage longer than about 13 seconds uses all 8",
+		why: "holds only when each restarted copy reaches vtgate and fails mid-read. A refused or dropped " +
+			"connection fails the restarted copy's stream open, whose error is not classified retriable " +
+			"(cdc_vstream_snapshot.go returns it without classifyReaderError), so a first cold copy exits " +
+			"after one retry whatever --apply-retry-attempts says (measured: a 3 s refused outage ended the " +
+			"run, also at --apply-retry-attempts=30; v0.163.5 the same). Loud, no row lost. fixedIn is the " +
+			"amended version itself because the correction is to the statement of a cost, not to a fix an " +
+			"operator must upgrade for; the retry fix is planned separately. Found by the v0.163.6 regression " +
+			"cycle (sluice-testing Bug 330)",
+	},
+	{
 		amended:     semver{0, 163, 4},
 		fixedIn:     semver{0, 163, 5},
 		claimMarker: "after you have compared the target's row count with the source's, table by table, and they match",
