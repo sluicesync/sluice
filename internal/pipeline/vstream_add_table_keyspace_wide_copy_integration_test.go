@@ -34,12 +34,13 @@
 //     50,101..); in _1est 20 deletes + 10 updates (ids 201.., 301..).
 //
 // Then the add returns, the stream runs (drained: it is restarted from its
-// pre-add position; --no-drain: it was never stopped, and the test waits out
-// the live-added poll), a marker row goes into both tables, and the verdict
-// compares the SOURCE's (id, payload) set read off vtgate with the TARGET's,
-// band by band, never consulting sluice's own state. Rows the add's copy
-// received for the tables it does NOT write are counted by draining the
-// snapshot's own buffer for them just before it closes (atkCountingEngine).
+// pre-add position; --no-drain, before NO-DRAIN-VSTREAM-SOURCE: it was never
+// stopped, and the test waited out the live-added poll), a marker row goes
+// into both tables, and the verdict compares the SOURCE's (id, payload) set
+// read off vtgate with the TARGET's, band by band, never consulting
+// sluice's own state. Rows the add's copy received for the tables it does
+// NOT write are counted by draining the snapshot's own buffer for them just
+// before it closes (atkCountingEngine).
 //
 // MEASURED 2026-10-22 (vttestserver mysql80 = Vitess 24, one shard, 3 runs
 // per cell; Postgres 16 target drained, MySQL 8.0 target --no-drain):
@@ -69,13 +70,20 @@
 //     _1est): the post-add marker never lands, and after a restart the
 //     first marker is missing for good while a second one lands.
 //
+// SINCE NO-DRAIN-VSTREAM-SOURCE (`schema add-table --no-drain` refuses on a
+// VStream source): the two NoDrain cells require that refusal, with nothing
+// written to the target and the running stream unaffected (the measuring
+// code for those modes was removed with them; commit 8c9baaee carries it).
+// The Drained cell stays the exact pin. (a) is still open: the BufferCap
+// cell stays a measurement.
+//
 // Usage (Windows; see CLAUDE.md for the Rancher Desktop env):
 //
 //	SLUICE_ATK_MEASURE=1 SLUICE_ATK_RUNS=3 go test -tags='integration vstream' \
 //	  -count=1 -timeout=120m -v -run 'TestStreamer_VStreamAddTableKeyspaceWideCopy' ./internal/pipeline/
 //
-// Cells that reproduced a loss skip unless SLUICE_ATK_MEASURE=1 (the item is
-// open); each cell runs SLUICE_ATK_RUNS times (default 1).
+// The BufferCap measurement skips unless SLUICE_ATK_MEASURE=1 (the item is
+// open); the Drained cell runs SLUICE_ATK_RUNS times (default 1).
 
 package pipeline
 
@@ -97,6 +105,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/engines/mysql"
 	"sluicesync.dev/sluice/internal/ir"
@@ -324,12 +333,6 @@ type atkResult struct {
 	bigOnTarget   bool            // the out-of-scope table reached the target
 	markersLanded map[string]bool // the post-add marker reached the target
 	note          string
-
-	// --no-drain only: the same table after the stream is later restarted
-	// (stop, warm resume) and a second marker written.
-	restarted                      bool
-	restartMarker1, restartMarker2 bool
-	afterRestart                   []atkBandResult
 }
 
 func (r atkResult) String() string {
@@ -343,12 +346,6 @@ func (r atkResult) String() string {
 		fmt.Fprintf(&b, "\n    final              %-16s stale-rows=%d (e.g. %v) stale-values=%d (e.g. %v)", a.arm, a.staleRows, a.staleRowEx, a.staleVals, a.staleValEx)
 	}
 	fmt.Fprintf(&b, "\n    outside the bands: extra-on-target=%v missing-or-different-on-target=%v", r.extra, r.missing)
-	if r.restarted {
-		fmt.Fprintf(&b, "\n    after a later restart of the stream: first marker on target=%v, second marker on target=%v", r.restartMarker1, r.restartMarker2)
-		for _, a := range r.afterRestart {
-			fmt.Fprintf(&b, "\n    after-restart      %-16s stale-rows=%d (e.g. %v) stale-values=%d (e.g. %v)", a.arm, a.staleRows, a.staleRowEx, a.staleVals, a.staleValEx)
-		}
-	}
 	if r.note != "" {
 		fmt.Fprintf(&b, "\n    note: %s", r.note)
 	}
@@ -437,23 +434,41 @@ func atkApply(t *testing.T, dsn string, bands []atkBand) {
 	}
 }
 
-// atkMode is one cell's shape.
-type atkMode struct {
-	prefix string
-	live   bool // --no-drain
-	// warmBeforeAdd restarts the stream once before the add, so the add runs
-	// against a warm-resumed stream rather than the process that cold-started.
-	warmBeforeAdd bool
-	// knownLoss skips the cell unless SLUICE_ATK_MEASURE=1: it reproduced the
-	// item in every measured run.
-	knownLoss bool
+// atkEstablish starts a stream scoped to est and waits until it applies a
+// change. warm restarts it once first, so the running stream is a warm
+// resume (its tail the standalone VStream CDC reader) rather than the
+// process that cold-started (its tail the cold start's snapshot stream
+// carried on into CDC). The caller stops the returned run.
+func atkEstablish(t *testing.T, r vcrRig, p, est string, warm bool) (*twfbRun, func() *Streamer) {
+	t.Helper()
+	mk := func() *Streamer { return r.streamer(p, []string{est}, "") }
+	cell := twfbCell{tgt: r.tgt(), streamID: p}
+	stream := startTWFBRun(mk())
+	cell.waitStreaming(t, stream)
+	vcrSeed(t, r.mysqlDSN, est, "pre", []int64{atkMarkerID - 1})
+	if !r.tgt().waitRow(t, est, atkMarkerID-1, stream, 120*time.Second) {
+		_ = stream.stop(t)
+		t.Fatalf("RIG: the established stream never applied a change (exited=%v err=%v)", stream.exited(), stream.err)
+	}
+	if warm {
+		if err := stream.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("RIG: stop before the warm resume: %v", err)
+		}
+		stream = startTWFBRun(mk())
+		vcrSeed(t, r.mysqlDSN, est, "pre", []int64{atkMarkerID - 2})
+		if !r.tgt().waitRow(t, est, atkMarkerID-2, stream, 120*time.Second) {
+			_ = stream.stop(t)
+			t.Fatalf("RIG: the warm-resumed stream never applied a change (exited=%v err=%v)", stream.exited(), stream.err)
+		}
+	}
+	return stream, mk
 }
 
-// atkRunCell runs one add of _2add into a stream established on _1est, with
-// two rounds of source changes during the add's copy.
-func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, m atkMode, run int) atkResult {
+// atkRunCell runs one drained add of _2add into a stream established on
+// _1est, with two rounds of source changes during the add's copy.
+func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix string, run int) atkResult {
 	t.Helper()
-	p := fmt.Sprintf("%s%d", m.prefix, run)
+	p := fmt.Sprintf("%s%d", prefix, run)
 	est, add, big := p+"_1est", p+"_2add", p+"_3big"
 	vcrCreate(t, r, est, add, big)
 	defer func() {
@@ -473,32 +488,9 @@ func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, m atkM
 			_ = os.WriteFile(filepath.Join(dir, p+".log"), []byte(r.logs.String()[logStart:]), 0o600)
 		}
 	}()
-	mk := func() *Streamer { return r.streamer(p, []string{est}, "") }
-	cell := twfbCell{tgt: r.tgt(), streamID: p}
-	stream := startTWFBRun(mk())
-	defer func() { _ = stream.stop(t) }()
-	cell.waitStreaming(t, stream)
-	vcrSeed(t, r.mysqlDSN, est, "pre", []int64{atkMarkerID - 1})
-	if !r.tgt().waitRow(t, est, atkMarkerID-1, stream, 120*time.Second) {
-		t.Fatalf("RIG: the established stream never applied a change (exited=%v err=%v)", stream.exited(), stream.err)
-	}
-	if m.warmBeforeAdd {
-		// Restart so the running stream is a warm resume: its tail is the
-		// standalone VStream CDC reader, not the cold start's snapshot stream
-		// carried on into CDC.
-		if err := stream.stop(t); err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("RIG: stop before the warm resume: %v", err)
-		}
-		stream = startTWFBRun(mk())
-		vcrSeed(t, r.mysqlDSN, est, "pre", []int64{atkMarkerID - 2})
-		if !r.tgt().waitRow(t, est, atkMarkerID-2, stream, 120*time.Second) {
-			t.Fatalf("RIG: the warm-resumed stream never applied a change (exited=%v err=%v)", stream.exited(), stream.err)
-		}
-	}
-	if !m.live {
-		if err := stream.stop(t); err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("RIG: drained stop: %v", err)
-		}
+	stream, mk := atkEstablish(t, r, p, est, false)
+	if err := stream.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("RIG: drained stop: %v", err)
 	}
 
 	pe, ok := engines.Get("planetscale")
@@ -512,7 +504,6 @@ func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, m atkM
 		SourceDSN: proxyDSN, TargetDSN: r.tgtDSN,
 		StreamID:  p,
 		TableName: add,
-		LiveMode:  m.live,
 	}
 	proxy.down.Store(0)
 	addStart := time.Now()
@@ -600,19 +591,13 @@ func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, m atkM
 	if addErr != nil {
 		return res
 	}
-	// The add's own result. Drained: the stream is stopped. --no-drain: its
-	// dispatch filter admits the table only at the next live-added poll, and
-	// round 1 and 2 changes reached it before the add recorded the table, so
-	// it dropped them; this read is the copy's work alone.
+	// The add's own result, with the stream stopped: the copy's work alone.
 	res.copyOnly = atkStale(t, r, add, append(round1, round2...))
 
-	// The stream carries the table from here.
-	if m.live {
-		waitForLiveAddPollObservation(t)
-	} else {
-		stream = startTWFBRun(mk())
-		defer func() { _ = stream.stop(t) }()
-	}
+	// The stream carries the table from here, restarted from its pre-add
+	// position.
+	stream = startTWFBRun(mk())
+	defer func() { _ = stream.stop(t) }()
 	res.markersLanded = map[string]bool{}
 	for _, tbl := range []string{est, add} {
 		vcrSeed(t, r.mysqlDSN, tbl, "marker", []int64{atkMarkerID})
@@ -682,20 +667,6 @@ func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, m atkM
 		}
 	}
 	res.bigOnTarget = atkRows(t, r.tgt(), big) != nil
-
-	if m.live {
-		// Does an operator's later restart heal it, or lock it in?
-		if err := stream.stop(t); err != nil && !errors.Is(err, context.Canceled) {
-			res.note += fmt.Sprintf("; stop before the later restart: %v", err)
-		}
-		stream = startTWFBRun(mk())
-		res.restarted = true
-		vcrSeed(t, r.mysqlDSN, add, "marker", []int64{atkMarkerID + 1})
-		res.restartMarker2 = r.tgt().waitRow(t, add, atkMarkerID+1, stream, 180*time.Second)
-		time.Sleep(2 * time.Second)
-		res.restartMarker1 = r.tgt().hasRow(t, add, atkMarkerID)
-		res.afterRestart = atkStale(t, r, add, append(round1, round2...))
-	}
 	return res
 }
 
@@ -706,14 +677,11 @@ func atkRuns() int {
 	return 1
 }
 
-func atkCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, m atkMode) {
+func atkCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix string) {
 	t.Helper()
-	if m.knownLoss && os.Getenv("SLUICE_ATK_MEASURE") != "1" {
-		t.Skip("reproduces VSTREAM-ADD-TABLE-KEYSPACE-WIDE-COPY (docs/dev/audit-backlog.md); set SLUICE_ATK_MEASURE=1 to measure")
-	}
 	runs := atkRuns()
 	for i := 1; i <= runs; i++ {
-		res := atkRunCell(t, r, proxyDSN, proxy, m, i)
+		res := atkRunCell(t, r, proxyDSN, proxy, prefix, i)
 		t.Logf("RUN %d/%d: %s", i, runs, res)
 		if res.addErr != nil {
 			t.Errorf("RUN %d: the add failed: %v", i, res.addErr)
@@ -722,6 +690,79 @@ func atkCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, m atkMode
 		if res.diverged() {
 			t.Errorf("RUN %d: SILENT DIVERGENCE (add succeeded, stream running): %s", i, res)
 		}
+	}
+}
+
+// atkControlColumn reads one of the stream's control-row table-set columns
+// on the MySQL target, "" when NULL.
+func atkControlColumn(t *testing.T, r vcrRig, streamID, column string) string {
+	t.Helper()
+	v := r.tgt().scalar(t, "SELECT COALESCE(CAST("+column+" AS CHAR), '') FROM "+appliershared.ControlTableName+" WHERE stream_id = ?", streamID)
+	if strings.HasPrefix(v, "<") {
+		t.Fatalf("RIG: read %s of stream %s: %s", column, streamID, v)
+	}
+	return v
+}
+
+// atkNoDrainRefusalCell runs `schema add-table --no-drain` of _2add into a
+// RUNNING stream established on _1est, on a MySQL target. Before
+// NO-DRAIN-VSTREAM-SOURCE this pair took the filter-flip live path, which
+// left 80 deletes and 10 updates of the added table stale (the header's
+// measurement). Now the add must refuse, naming the marker and the drained
+// flow, having written nothing to the target: no table, no live-added or
+// pending record. The running stream must be unaffected.
+func atkNoDrainRefusalCell(t *testing.T, r vcrRig, prefix string, warm bool) {
+	t.Helper()
+	p := prefix + "1"
+	est, add := p+"_1est", p+"_2add"
+	vcrCreate(t, r, est, add)
+	defer func() {
+		for _, tbl := range []string{est, add} {
+			r.src().exec(t, "DROP TABLE IF EXISTS "+tbl)
+		}
+	}()
+	vcrSeed(t, r.mysqlDSN, est, "v1", vcrRange(1, 1, atkEstRows))
+	vcrSeed(t, r.mysqlDSN, add, "v1", vcrRange(1, 1, 1000))
+	time.Sleep(3 * time.Second) // the schema tracker
+
+	stream, _ := atkEstablish(t, r, p, est, warm)
+	defer func() { _ = stream.stop(t) }()
+	liveBefore := atkControlColumn(t, r, p, "live_added_tables")
+	pendingBefore := atkControlColumn(t, r, p, "pending_added_tables")
+
+	srcEng, ok := engines.Get("planetscale")
+	if !ok {
+		t.Fatal("engine not registered: planetscale")
+	}
+	tgtEng, _ := engines.Get(r.targetEngine())
+	err := (&AddTable{
+		Source: srcEng, Target: tgtEng,
+		SourceDSN: r.streamDSN, TargetDSN: r.tgtDSN,
+		StreamID: p, TableName: add,
+		LiveMode: true,
+	}).Run(context.Background())
+	if err == nil {
+		t.Fatalf("schema add-table --no-drain on a VStream source succeeded; want the %s refusal", noDrainVStreamSourceMarker)
+	}
+	for _, want := range []string{noDrainVStreamSourceMarker, "sluice sync stop --wait", "without --no-drain", "sluice sync start"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal = %v; want it to contain %q", err, want)
+		}
+	}
+	if rows := atkRows(t, r.tgt(), add); rows != nil {
+		t.Errorf("the refused add left %s on the target (%d rows); want it absent", add, len(rows))
+	}
+	if got := atkControlColumn(t, r, p, "live_added_tables"); got != liveBefore {
+		t.Errorf("live_added_tables = %q after the refusal; want it unchanged (%q)", got, liveBefore)
+	}
+	if got := atkControlColumn(t, r, p, "pending_added_tables"); got != pendingBefore {
+		t.Errorf("pending_added_tables = %q after the refusal; want it unchanged (%q)", got, pendingBefore)
+	}
+
+	// The running stream is unaffected: it still applies its own table.
+	vcrSeed(t, r.mysqlDSN, est, "post", []int64{atkMarkerID})
+	if !r.tgt().waitRow(t, est, atkMarkerID, stream, 120*time.Second) {
+		t.Errorf("the running stream stopped applying %s after the refusal (exited=%v err=%v)", est, stream.exited(), stream.err)
 	}
 }
 
@@ -804,28 +845,25 @@ func TestStreamer_VStreamAddTableKeyspaceWideCopy(t *testing.T) {
 		tgtDSN, cleanupTgt := startPGTarget(t)
 		defer cleanupTgt()
 		r := vcrRig{mysqlDSN: mysqlDSN, streamDSN: streamDSN, tgtDSN: tgtDSN, logs: &logs}
-		atkCell(t, r, proxyDSN, proxy, atkMode{prefix: "dr"})
+		atkCell(t, r, proxyDSN, proxy, "dr")
 	})
+	// --no-drain refuses (NO-DRAIN-VSTREAM-SOURCE). Before the refusal both
+	// cells left 80 deletes and 10 updates of the added table stale in every
+	// measured run, the cold-start one never delivering the post-add marker
+	// either (see the header).
 	t.Run("NoDrain/MySQLTarget", func(t *testing.T) {
-		if os.Getenv("SLUICE_ATK_MEASURE") != "1" {
-			t.Skip("reproduces VSTREAM-ADD-TABLE-KEYSPACE-WIDE-COPY (docs/dev/audit-backlog.md); set SLUICE_ATK_MEASURE=1 to measure")
-		}
 		tgtDSN, cleanupTgt := startMySQLTarget(t)
 		defer cleanupTgt()
 		r := vcrRig{mysqlDSN: mysqlDSN, streamDSN: streamDSN, tgtDSN: tgtDSN, logs: &logs, tgtEngine: "mysql"}
-		// Stale in every measured run: 80 deletes and 10 updates of the added
-		// table, and the post-add marker never delivered by the running
-		// process (and lost for good across the next restart).
 		t.Run("AfterColdStart", func(t *testing.T) {
-			atkCell(t, r, proxyDSN, proxy, atkMode{prefix: "nd", live: true, knownLoss: true})
+			atkNoDrainRefusalCell(t, r, "nd", false)
 		})
-		// Stale in every measured run: the same 80 deletes and 10 updates; the
-		// post-add marker is delivered.
 		t.Run("AfterWarmResume", func(t *testing.T) {
-			atkCell(t, r, proxyDSN, proxy, atkMode{prefix: "nw", live: true, warmBeforeAdd: true, knownLoss: true})
+			atkNoDrainRefusalCell(t, r, "nw", true)
 		})
 	})
-	// Refused in every measured run: the keyspace-wide copy buffers the
+	// A measurement, not a pin (a loud failure, filed separately): refused in
+	// every measured run, because the keyspace-wide copy buffers the
 	// out-of-scope table past the 64 MiB default cap, and `schema add-table`
 	// has no --max-buffer-bytes to raise it.
 	t.Run("BufferCap", func(t *testing.T) {

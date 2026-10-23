@@ -525,6 +525,8 @@ func TestAddTable_LiveMode_RefusesEngineWithoutEitherSurface(t *testing.T) {
 // canonical engine pair this covers.
 func TestAddTable_LiveMode_BinlogPath_SucceedsWithFilterFlipWriter(t *testing.T) {
 	src := newAddTableSourceEngine("binlog-source") // no publicationAdder
+	// The filter-flip path needs a binlog source (NO-DRAIN-VSTREAM-SOURCE).
+	src.cdc = ir.CDCBinlog
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
@@ -557,6 +559,8 @@ func TestAddTable_LiveMode_BinlogPath_SucceedsWithFilterFlipWriter(t *testing.T)
 // otherwise the running streamer's poll never observes the addition.
 func TestAddTable_LiveMode_BinlogPath_RecordsBeforeReturning(t *testing.T) {
 	src := newAddTableSourceEngine("binlog-source")
+	// The filter-flip path needs a binlog source (NO-DRAIN-VSTREAM-SOURCE).
+	src.cdc = ir.CDCBinlog
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "events", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
@@ -724,11 +728,12 @@ func TestTempSlotName(t *testing.T) {
 // ---- mocks ----
 
 // addTableSourceEngine wraps recordingEngine with snapshot-stream
-// support and CDC=LogicalReplication so AddTable.validate accepts
-// it.
+// support and CDC=LogicalReplication (or cdc, when set) so
+// AddTable.validate accepts it.
 type addTableSourceEngine struct {
 	*recordingEngine
 	snapshotCalls int
+	cdc           ir.CDCMethod
 }
 
 func newAddTableSourceEngine(name string) *addTableSourceEngine {
@@ -736,6 +741,9 @@ func newAddTableSourceEngine(name string) *addTableSourceEngine {
 }
 
 func (e *addTableSourceEngine) Capabilities() ir.Capabilities {
+	if e.cdc != ir.CDCNone {
+		return ir.Capabilities{CDC: e.cdc}
+	}
 	return ir.Capabilities{CDC: ir.CDCLogicalReplication}
 }
 
