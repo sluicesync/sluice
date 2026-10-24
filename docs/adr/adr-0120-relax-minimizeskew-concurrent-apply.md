@@ -46,7 +46,9 @@ on v0.99.81): the ahead shard's delivery is frozen until the behind shard fully
 drains — observed as shard `80-` frozen for many minutes while `-80` drained at
 ~123 GTID/s. The merged ordering buys correctness only if some consumer relies on
 cross-shard commit order. Range-sharding guarantees a given `(table, PK)` lives
-in exactly ONE shard, so there is no cross-shard same-key dependency; the
+in exactly ONE shard (FALSE under `--allow-cross-shard-merge` when the vindex is
+not the key — see the premise correction in §2), so there is no cross-shard
+same-key dependency; the
 concurrent key-hash apply lanes (ADR-0104) already serialize same-key changes
 within a lane; and `StopOnReshard=true` closes the only window (a reshard) where
 a key could transiently exist on two shards.
@@ -78,12 +80,22 @@ degree) for zero safety benefit, so the flag controls `MinimizeSkew` directly. T
 the intended pairing and what the help text recommends; a serial-apply operator
 who sets it gets relaxed delivery with little upside but no correctness risk.
 
-Scope: only the steady-state CDC stream. The COPY-phase streams
-(`cdc_vstream_snapshot.go:323/1345`, `cdc_vstream_copy_concurrency_pump.go:299`)
-keep `MinimizeSkew=true` — the cold-copy snapshot wants the shards synchronized at
+Scope: every request that carries CDC. As landed, the decision named "only the
+steady-state CDC stream", and the snapshot stream's post-copy tail (the
+copy→CDC handoff reopen, the in-place continuation of a single-stream copy, and
+the reshard tail) kept the copy's `MinimizeSkew=true`. That gap was Bug 334
+(VSTREAM-TAIL-SKEW-HOLD): after a skewed multi-shard cold start the tail opened
+with several shards rewound to their copy-finish GTIDs, vtgate's skew hold
+froze one of them in the past, and three of four shards delivered nothing until
+vtgate's 10-minute skew timeout. The tail now follows this policy too
+(`vstreamCDCMinimizeSkew`, `cdc_vstream_relax_skew_override.go`). The COPY
+requests (`vstreamCopyMinimizeSkew`: the snapshot's first request, the
+auto-shard per-table reopen, the concurrent COPY streams) keep
+`MinimizeSkew=true` — the cold-copy snapshot wants the shards synchronized at
 the cut, and item 27's win is purely the backlog-drain latency on the *tail*, not
-the copy. (A future amendment may revisit the copy path if a copy-phase A/B
-warrants it.)
+the copy. `TestVStreamRequestSkewRoster_EveryBuilderClassified` classifies every
+request builder as one or the other. (A future amendment may revisit the copy
+path if a copy-phase A/B warrants it.)
 
 ### 2. Why it is correctness-safe (the consumer audit, roadmap-mandated)
 
@@ -99,6 +111,22 @@ makes **no** cross-shard commit-time-ordering assumption. Audited 2026-06-25:
 | Snapshot→CDC stitch | `cdc_vstream_snapshot_stitch.go:58–156` | per-shard GTID-set **minimum** (intersection), computed independently per shard | SAFE |
 | Per-shard watchdog | `cdc_vstream_shard_progress.go:83–266` | already built to *tolerate* asymmetric advancement (it distinguishes a real wedge from the MinimizeSkew hold) — relaxing skew only makes the "peer advanced" signal more often legitimately true | SAFE (see §3) |
 | Resume reachability | `cdc_vstream.go:756–804` | verifies each shard against **its own** `@@global.gtid_purged`; already handles widely-divergent per-shard positions (incl. one shard mid-COPY, another pure-CDC) | SAFE |
+
+**Premise correction (Bug 334 review, 2026-10-24): "a `(table, PK)` lives in
+exactly ONE shard" is FALSE under `--allow-cross-shard-merge`.** Range-sharding
+places a row by its primary vindex, and when the vindex column is not the key an
+application can move a row between shards: a DELETE on shard A and an INSERT of
+the same key on shard B. Those are two changes on two shards, and nothing orders
+them across shards. With `MinimizeSkew=false` they can arrive in either order at
+any skew; `MinimizeSkew=true` narrows that to changes within ~2s of each other
+but does not close it. Applied INSERT-first, the DELETE removes the row the
+INSERT wrote and the target loses a row the source still holds
+(CROSS-SHARD-ROW-MOVE-UNORDERED). The audit table above holds for every key that
+stays on one shard, and `--allow-cross-shard-merge` is the opt-in that admits
+keys that do not. The exposure is ACCEPTED, not closed: the relaxed default has
+carried it since the flip, the hold only narrows it, and Bug 334's warm-restart
+remedy ran relaxed too. `--allow-cross-shard-merge`'s help names it; the class
+is being measured separately.
 
 The position token is a sorted `[]shardGtid` (`encodeVStreamPos`,
 `cdc_vstream_position.go:151`); per-shard positions are independent, and resume

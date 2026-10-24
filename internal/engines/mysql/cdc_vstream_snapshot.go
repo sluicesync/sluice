@@ -397,7 +397,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		shards:               shards,
 		rowFilters:           rowFilters,
 		preserveSkew:         vstreamPreserveSkewFromDSN(cfg, e.opts.preserveSkew),
-		streamMinimizeSkew:   vstreamCopyMinimizeSkew,
+		streamSkewRelaxed:    !vstreamCopyMinimizeSkew,
 		copyTables:           openScope,
 		copyTablesSeq:        seq,
 		concurrentCopy:       concurrent,
@@ -655,11 +655,17 @@ type vstreamSnapshotStream struct {
 	// the relaxed default. Read-only after construction.
 	preserveSkew bool
 
-	// streamMinimizeSkew is the MinimizeSkew the currently open grpcStream
-	// was opened with. A stream's flags cannot change once it is open, so
-	// [startPump] reopens the tail when this differs from the CDC policy
-	// rather than continue the copy stream in place. Guarded by mu.
-	streamMinimizeSkew bool
+	// streamSkewRelaxed records that the currently open grpcStream was opened
+	// with MinimizeSkew=false. A stream's flags cannot change once it is open,
+	// so [startPump] reopens the tail when the open stream's MinimizeSkew
+	// differs from the CDC policy rather than continue the copy stream in
+	// place. Named for the relaxed case so the zero value is the safe one: a
+	// stream whose open forgot to set it reads as MinimizeSkew=true, which
+	// under the relaxed default makes the handoff REOPEN rather than continue
+	// a held stream in place; under --vstream-preserve-skew the worst a
+	// forgotten set can do is continue a stream that was in fact relaxed.
+	// Guarded by mu.
+	streamSkewRelaxed bool
 
 	// copyTables is the COPY filter scope captured at open: empty means
 	// keyspace-wide (every table), non-empty restricts the COPY to those
@@ -1565,7 +1571,7 @@ func (s *vstreamSnapshotStream) reopenForTableSeeded(ctx context.Context, table 
 	}
 	s.mu.Lock()
 	s.grpcStream = grpcStream
-	s.streamMinimizeSkew = vstreamCopyMinimizeSkew
+	s.streamSkewRelaxed = !vstreamCopyMinimizeSkew
 	s.copyTables = []string{table}
 	s.mu.Unlock()
 	if seed != nil {
@@ -1667,7 +1673,7 @@ func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *Sh
 	s.reshardWindowRetries = 0 // fresh journal ⇒ fresh window budget
 	clear(s.fields)            // post-reshard tablets re-emit FIELD events
 	s.grpcStream = grpcStream
-	s.streamMinimizeSkew = vstreamCDCMinimizeSkew(s.preserveSkew)
+	s.streamSkewRelaxed = !vstreamCDCMinimizeSkew(s.preserveSkew)
 	s.grpcCancel = streamCancel
 	s.mu.Unlock()
 
@@ -1775,7 +1781,7 @@ func (s *vstreamSnapshotStream) reopenReshardWindow(ctx context.Context) (change
 	s.err = nil // clear the ridden-out window error; a fresh failure re-sets it
 	clear(s.fields)
 	s.grpcStream = grpcStream
-	s.streamMinimizeSkew = vstreamCDCMinimizeSkew(s.preserveSkew)
+	s.streamSkewRelaxed = !vstreamCDCMinimizeSkew(s.preserveSkew)
 	s.grpcCancel = streamCancel
 	s.mu.Unlock()
 
@@ -2369,11 +2375,36 @@ func (s *vstreamSnapshotStream) cdcHandoffReopenReason() string {
 		return "per_table_copy"
 	case s.cdcResumeRewound:
 		return "shard_finished_copy_early"
-	case s.streamMinimizeSkew != vstreamCDCMinimizeSkew(s.preserveSkew):
+	case !s.streamSkewRelaxed != vstreamCDCMinimizeSkew(s.preserveSkew):
 		return "skew_policy"
 	default:
 		return ""
 	}
+}
+
+// vstreamTailCopyCursorMarker names the refusal of a CDC tail whose snapshot
+// position still carries a copy cursor.
+const vstreamTailCopyCursorMarker = "VSTREAM-TAIL-COPY-CURSOR"
+
+// refuseTailCopyCursor refuses to open the CDC tail at a position that still
+// carries a per-shard TablePKs copy cursor. The handoff's argument that the
+// reopen neither skips nor adds anything rests on the position at the
+// stream-wide COPY_COMPLETED being a pure GTID position: vtgate drops a
+// shard's cursor with the LASTPK that closes its copy, the auto-shard stitch
+// keeps only GTIDs, and the single-stream copy boundary drops it for every
+// shard it moves. A cursor left on a shard it did not move would turn the
+// tail's request into a copy resume, and vtgate would re-copy that shard's
+// rows past the cursor into a stream that applies them as changes. That is a
+// premise about vtgate, so it is checked rather than assumed.
+func refuseTailCopyCursor(reason string, resume []shardGtid) error {
+	for _, sg := range resume {
+		if len(sg.TablePKs) > 0 {
+			return fmt.Errorf("mysql/vstream: snapshot: CDC handoff (%s): %s: the snapshot position still carries a copy cursor "+
+				"for shard %s/%s, so opening the tail there would resume a copy instead of streaming changes; refusing rather than "+
+				"re-copying rows into the change stream. No tested vtgate leaves one there; please report it with this log", reason, vstreamTailCopyCursorMarker, sg.Keyspace, sg.Shard)
+		}
+	}
+	return nil
 }
 
 // reopenForCDC replaces the last per-table COPY stream with a fresh
@@ -2395,11 +2426,14 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context, reason string)
 	copy(resume, s.currentVgtid)
 	s.mu.Unlock()
 	if len(resume) == 0 {
-		return errors.New("mysql/vstream: snapshot: auto-shard CDC handoff: no stitched resume position")
+		return fmt.Errorf("mysql/vstream: snapshot: CDC handoff (%s): no snapshot position to open the tail at", reason)
+	}
+	if err := refuseTailCopyCursor(reason, resume); err != nil {
+		return err
 	}
 	protoShardGtids, err := toProtoShardGtids(resume)
 	if err != nil {
-		return fmt.Errorf("mysql/vstream: snapshot: auto-shard CDC handoff: build resume position: %w", err)
+		return fmt.Errorf("mysql/vstream: snapshot: CDC handoff (%s): build resume position: %w", reason, err)
 	}
 	// Keyspace-wide by default: the CDC tail follows every table, not just
 	// the last one copied. ADR-0073 internal-table exclusion still strips
@@ -2446,14 +2480,14 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context, reason string)
 	grpcStream, err := s.client.VStream(streamCtx, req)
 	if err != nil {
 		streamCancel()
-		return fmt.Errorf("mysql/vstream: snapshot: auto-shard CDC handoff: open stream: %w", err)
+		return fmt.Errorf("mysql/vstream: snapshot: CDC handoff (%s): open stream: %w", reason, err)
 	}
 	s.mu.Lock()
 	if s.grpcCancel != nil {
 		s.grpcCancel() // free the finished COPY stream's context
 	}
 	s.grpcStream = grpcStream
-	s.streamMinimizeSkew = req.GetFlags().GetMinimizeSkew()
+	s.streamSkewRelaxed = !req.GetFlags().GetMinimizeSkew()
 	s.grpcCancel = streamCancel
 	clear(s.fields) // the keyspace-wide stream re-emits FIELD per table
 	s.mu.Unlock()

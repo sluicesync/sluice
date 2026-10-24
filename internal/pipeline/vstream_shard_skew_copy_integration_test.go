@@ -106,6 +106,11 @@ type vskShape struct {
 	extraDSN   string
 	backup     bool // drive backup full + incremental + chain restore instead of sync
 	remedy     bool // establish the stream, leave stale rows, then re-copy with --restart-from-scratch
+	// perShardMarkers writes one marker through each shard after the hand-off
+	// and requires every one on the target within vskShardMarkerBudget: the
+	// CDC tail must keep every shard delivering after shards finished their
+	// copy at different times (VSTREAM-TAIL-SKEW-HOLD, Bug 334).
+	perShardMarkers bool
 }
 
 // vskArm is a set of changes and what the source must read afterwards.
@@ -114,6 +119,37 @@ type vskArm struct {
 	table   string
 	deleted []int64 // must be absent on the target
 	updated []int64 // must read upd-<id>
+}
+
+// vskShardMarkerBudget is how long a per-shard marker may take to reach the
+// target after it commits (perShardMarkers).
+const vskShardMarkerBudget = 30 * time.Second
+
+// vskPerShardMarkers writes one row through each shard of the layout into
+// every table, then requires each on the target within vskShardMarkerBudget
+// of the writes. It returns a note naming every late marker, "" when all
+// landed. Through v0.163.10 a skewed cold start's tail held every shard but
+// one behind vtgate's skew hold (Bug 334), and only the shard the routed
+// marker happened to land on delivered.
+func vskPerShardMarkers(t *testing.T, r vskRig, tables []string, running *twfbRun) string {
+	t.Helper()
+	for i, shard := range r.layout.shards {
+		id := int64(9_100_000 + i)
+		for _, tbl := range tables {
+			vskSeed(t, vskShardDSN(r.mysqlDSN, r.keyspace, shard), tbl, []int64{id}, []int64{id})
+		}
+	}
+	deadline := time.Now().Add(vskShardMarkerBudget)
+	var note string
+	for i, shard := range r.layout.shards {
+		for _, tbl := range tables {
+			if !r.tgt().waitRow(t, tbl, 9_100_000+i, running, max(time.Until(deadline), time.Millisecond)) {
+				note += fmt.Sprintf("%s's marker on shard %s did not reach the target within %s (exited=%v err=%v); ",
+					tbl, shard, vskShardMarkerBudget, running.exited(), running.err)
+			}
+		}
+	}
+	return note
 }
 
 func vskShardDSN(mysqlDSN, keyspace, shard string) string {
@@ -609,6 +645,9 @@ func vskRunCell(t *testing.T, r vskRig, sh vskShape, run int) vskCellResult {
 				res.note += fmt.Sprintf("%s's marker never reached the target (exited=%v err=%v); ", tbl, running.exited(), running.err)
 			}
 		}
+		if sh.perShardMarkers {
+			res.note += vskPerShardMarkers(t, r, tables, running)
+		}
 		time.Sleep(2 * time.Second)
 	}
 	cellLogs := r.logs.String()[logStart:]
@@ -943,6 +982,6 @@ func TestStreamer_VStreamShardSkewCopy(t *testing.T) {
 			last:     "c0-",
 		})
 		defer done()
-		t.Run("OneTable", func(t *testing.T) { vskCell(t, r, vskShape{prefix: "fo", tables: 1}) })
+		t.Run("OneTable", func(t *testing.T) { vskCell(t, r, vskShape{prefix: "fo", tables: 1, perShardMarkers: true}) })
 	})
 }

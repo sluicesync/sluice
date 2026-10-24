@@ -127,6 +127,10 @@ func newStreamingHarnessCapped(t *testing.T, resp []*vtgate.VStreamResponse, cap
 	}
 	s.copyDone = make(chan struct{})
 	s.grpcStream = &fakeVStreamClient{ctx: ctx, resp: resp}
+	// The scripted stream carries the CDC tail after the copy, so it stands
+	// for one opened relaxed: the handoff continues it in place instead of
+	// reopening (VSTREAM-TAIL-SKEW-HOLD) against a client this harness lacks.
+	s.streamSkewRelaxed = true
 
 	stream := &ir.SnapshotStream{
 		Rows:    &vstreamSnapshotRows{snap: s},

@@ -86,6 +86,9 @@ func newReshardWindowHarness(ctx context.Context, cancel context.CancelFunc, cli
 	s.shards = []string{"-"}
 	s.copyDone = make(chan struct{})
 	s.grpcStream = &scriptedStream{ctx: ctx, steps: initial}
+	// The tail continues this scripted stream in place (its JOURNAL is the
+	// point), so it stands for one opened relaxed (VSTREAM-TAIL-SKEW-HOLD).
+	s.streamSkewRelaxed = true
 
 	stream := &ir.SnapshotStream{
 		Rows:    &vstreamSnapshotRows{snap: s},

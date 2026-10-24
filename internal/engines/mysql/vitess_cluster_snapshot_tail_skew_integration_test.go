@@ -194,6 +194,13 @@ func TestVitessReshard_SnapshotTailSkew_EveryShardDelivers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamChanges: %v", err)
 	}
+	// The handoff must have taken the rewound reopen, relaxed: this is the
+	// path Bug 334 reproduced, so a run that reached the tail some other way
+	// (in place, or held) would not be testing the fix.
+	if !tskHandoffLogged(logs.String(), "reason=shard_finished_copy_early", "minimize_skew=false") {
+		t.Fatalf("RIG: the CDC handoff line does not carry reason=shard_finished_copy_early and minimize_skew=false. Logs:\n%s",
+			tskVStreamLines(logs.String()))
+	}
 	applyDone := make(chan struct{})
 	go func() {
 		defer close(applyDone)
@@ -355,6 +362,12 @@ const tskHeldLine = "replayed from its copy position"
 // COPY_COMPLETED, or the zero time when it has not.
 func tskShardFinishedAt(logs, shard string) time.Time {
 	return tskLoggedAt(logs, tskShardFinishedLine, " shard="+shard+" ")
+}
+
+// tskHandoffLogged reports whether the CDC handoff's INFO line
+// (reopenForCDC) carries every one of attrs.
+func tskHandoffLogged(logs string, attrs ...string) bool {
+	return !tskLoggedAt(logs, append([]string{`msg="mysql/vstream: snapshot: CDC handoff (tail opened at the snapshot position)"`}, attrs...)...).IsZero()
 }
 
 // tskLoggedAt is the time of the first log line containing every one of

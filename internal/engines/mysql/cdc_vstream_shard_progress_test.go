@@ -445,6 +445,8 @@ func TestVStreamShardStallWarnMessage_Actionable(t *testing.T) {
 		`"-80"`, `"main"`, "has not advanced",
 		"SHOW VITESS_THROTTLED_APPS", "MinimizeSkew",
 		"stays connected",
+		// The preserve-skew remedy names both ways the hold is turned on.
+		"--vstream-preserve-skew", "vstream_preserve_skew=true",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("shard-stall message missing %q: %v", want, msg)

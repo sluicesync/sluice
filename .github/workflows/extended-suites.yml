@@ -222,7 +222,7 @@ jobs:
 
       - name: Run the reshard suite
         run: |
-          # 9 selected, 4 PASS — 5 are quarantined t.Skip()s: the 4 RelaxSkew
+          # 10 selected, 5 PASS — 5 are quarantined t.Skip()s: the 4 RelaxSkew
           # A/B *skew* tests (skipReshardSkewABQuarantine — drained-shard
           # incompatible with the non-default MinimizeSkew harness) PLUS
           # TestVitessReshard_RelaxSkewReshardMidStream. The roadmap item 72(b)
@@ -234,10 +234,12 @@ jobs:
           # sluice-vitess:latest widened the NEW PRIMARY's healthcheck-settling
           # window to >24s, past any sane retry budget (see the test's skip note +
           # roadmap 72(b)). Un-quarantine when the image window is fixed.
-          # The 4 that PASS are the exactly-once oracles: ProofOfReshardability,
-          # ChaosExactlyOnce, StreamerFollowsReshardEndToEnd, ShardedColdCopy.
+          # The 5 that PASS are the exactly-once oracles: ProofOfReshardability,
+          # ChaosExactlyOnce, StreamerFollowsReshardEndToEnd, ShardedColdCopy,
+          # and SnapshotTailSkew_EveryShardDelivers (Bug 334: the four-shard
+          # cold start whose CDC tail must keep every shard delivering).
           bash scripts/check-leg-nonvacuity.sh \
-            'integration vitessreshard' '^TestVitessReshard_' ./internal/engines/mysql/... 9 4 \
+            'integration vitessreshard' '^TestVitessReshard_' ./internal/engines/mysql/... 10 5 \
             -race -timeout=95m
 
   # The NOBLOB partial-row-image belt suite (item-74 / ADR-0172): boots the

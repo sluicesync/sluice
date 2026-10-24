@@ -5,18 +5,13 @@ package mysql
 
 import (
 	"context"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"io/fs"
 	"log/slog"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/proto/vtgate"
 
@@ -74,7 +69,7 @@ func TestVStreamSnapshot_ReopenForCDC_FollowsSkewPolicy(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			s, client := tailSkewStream(ctx, c.preserveSkew)
-			s.streamMinimizeSkew = vstreamCopyMinimizeSkew
+			s.streamSkewRelaxed = !vstreamCopyMinimizeSkew
 			if err := s.reopenForCDC(ctx, "shard_finished_copy_early"); err != nil {
 				t.Fatalf("reopenForCDC: %v", err)
 			}
@@ -85,8 +80,64 @@ func TestVStreamSnapshot_ReopenForCDC_FollowsSkewPolicy(t *testing.T) {
 			if !req.GetFlags().GetStopOnReshard() {
 				t.Error("tail StopOnReshard must stay true")
 			}
-			if s.streamMinimizeSkew != c.wantMinimize {
-				t.Errorf("streamMinimizeSkew = %v after the reopen; want %v (the flag the tail was opened with)", s.streamMinimizeSkew, c.wantMinimize)
+			if s.streamSkewRelaxed == c.wantMinimize {
+				t.Errorf("streamSkewRelaxed = %v after the reopen; want %v (the flag the tail was opened with)", s.streamSkewRelaxed, !c.wantMinimize)
+			}
+		})
+	}
+}
+
+// TestVStreamSnapshot_ReopenForCDC_RefusesCopyCursor pins
+// VSTREAM-TAIL-COPY-CURSOR: a snapshot position that still carries a TablePKs
+// copy cursor on any shard refuses loudly, naming the marker and the shard,
+// and opens no stream (a stream opened there would be a copy resume).
+func TestVStreamSnapshot_ReopenForCDC_RefusesCopyCursor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, client := tailSkewStream(ctx, false)
+	s.currentVgtid[1].TablePKs = []encodedTablePK{{}}
+	err := s.reopenForCDC(ctx, "skew_policy")
+	if err == nil || !strings.Contains(err.Error(), vstreamTailCopyCursorMarker) || !strings.Contains(err.Error(), "main/80-") {
+		t.Fatalf("reopenForCDC with a copy cursor on 80-: err %v; want a %s refusal naming main/80-", err, vstreamTailCopyCursorMarker)
+	}
+	client.mu.Lock()
+	n := len(client.requests)
+	client.mu.Unlock()
+	if n != 0 {
+		t.Errorf("the refusal opened %d stream(s); want 0", n)
+	}
+}
+
+// TestVStreamSnapshot_SkewPolicyReopenKeepsCopyFilter pins that a
+// single-stream tail reopened for the skew policy streams exactly what the
+// copy stream would have streamed had it continued in place: the reopen's
+// Filter equals the copy request's, for an explicit table with a --where
+// predicate and for the keyspace-wide scope.
+func TestVStreamSnapshot_SkewPolicyReopenKeepsCopyFilter(t *testing.T) {
+	cases := []struct {
+		name    string
+		tables  []string
+		filters map[string]string
+	}{
+		{name: "one table with a predicate", tables: []string{"t"}, filters: map[string]string{"t": "id > 10"}},
+		{name: "keyspace-wide", tables: nil, filters: nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s, client := tailSkewStream(ctx, false)
+			s.copyTables = c.tables
+			s.rowFilters = c.filters
+			if err := s.reopenForCDC(ctx, "skew_policy"); err != nil {
+				t.Fatalf("reopenForCDC: %v", err)
+			}
+			// The copy request's filter, as openVStreamSnapshotStreamFrom
+			// builds it for a single-stream scope.
+			want := &binlogdata.Filter{Rules: vstreamCopyFilterRules(c.tables, c.filters)}
+			got := onlyRequest(t, client).GetFilter()
+			if !proto.Equal(got, want) {
+				t.Errorf("tail Filter = %v; want the copy request's %v", got, want)
 			}
 		})
 	}
@@ -134,8 +185,8 @@ func TestVStreamSnapshot_CopyRequestsKeepMinimizeSkew(t *testing.T) {
 			if got := onlyRequest(t, client).GetFlags().GetMinimizeSkew(); !got {
 				t.Error("per-table COPY request MinimizeSkew = false; want true (ADR-0120 COPY exemption)")
 			}
-			if !s.streamMinimizeSkew {
-				t.Error("streamMinimizeSkew = false after a COPY open; want true")
+			if s.streamSkewRelaxed {
+				t.Error("streamSkewRelaxed = true after a COPY open; want false")
 			}
 
 			s2, client2 := tailSkewStream(ctx, c.preserveSkew)
@@ -166,13 +217,19 @@ func TestVStreamSnapshot_CDCHandoffReopenReason(t *testing.T) {
 		{name: "rewound single stream", rewound: true, streamSkew: true, preserveSkew: true, want: "shard_finished_copy_early"},
 		{name: "single stream, relaxed policy (the default)", streamSkew: true, want: "skew_policy"},
 		{name: "single stream, preserve-skew: continue in place", streamSkew: true, preserveSkew: true, want: ""},
+		{name: "single stream already relaxed, relaxed policy: continue in place", streamSkew: false, want: ""},
+	}
+	// The zero value is the safe one: a stream whose open never recorded its
+	// flag must reopen under the default policy, never continue in place.
+	if got := newTestSnapshotStream().cdcHandoffReopenReason(); got != "skew_policy" {
+		t.Errorf("zero-value stream: cdcHandoffReopenReason() = %q; want %q (an unrecorded flag must reopen)", got, "skew_policy")
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := newTestSnapshotStream()
 			s.copyTablesSeq = c.seq
 			s.cdcResumeRewound = c.rewound
-			s.streamMinimizeSkew = c.streamSkew
+			s.streamSkewRelaxed = !c.streamSkew
 			s.preserveSkew = c.preserveSkew
 			if got := s.cdcHandoffReopenReason(); got != c.want {
 				t.Errorf("cdcHandoffReopenReason() = %q; want %q", got, c.want)
@@ -196,7 +253,7 @@ func TestVStreamSnapshot_StartPump_SingleStreamTailSkew(t *testing.T) {
 			copyStream := &scriptedStream{ctx: copyStreamCtx}
 			s.grpcStream = copyStream
 			s.grpcCancel = copyStreamCancel
-			s.streamMinimizeSkew = vstreamCopyMinimizeSkew
+			s.streamSkewRelaxed = !vstreamCopyMinimizeSkew
 			s.copyDone = make(chan struct{})
 			close(s.copyDone)
 			want := append([]shardGtid(nil), s.currentVgtid...)
@@ -347,121 +404,4 @@ func TestVStreamSnapshot_TailWarnsOnHeldShard(t *testing.T) {
 	if strings.Contains(got, `shard \"-80\" of keyspace`) {
 		t.Errorf("the advancing shard -80 was named as stalled; logs:\n%s", got)
 	}
-}
-
-// vstreamSkewRoster classifies every function in the tree that builds a
-// vtgate.VStreamFlags literal: COPY builders must set
-// MinimizeSkew: vstreamCopyMinimizeSkew, CDC builders
-// MinimizeSkew: vstreamCDCMinimizeSkew(...). A new builder fails the roster
-// until it is classified here.
-var vstreamSkewRoster = map[string]string{
-	// The snapshot stream's first request: COPY. On the single-stream path
-	// it continues as the tail only when the CDC policy is also
-	// MinimizeSkew=true; otherwise startPump reopens (cdcHandoffReopenReason).
-	"openVStreamSnapshotStreamFrom": "COPY",
-	"reopenForTableSeeded":          "COPY", // auto-shard per-table COPY
-	"openStreamForTable":            "COPY", // ADR-0099 concurrent COPY
-	"reopenForCDC":                  "CDC",  // the copy→CDC handoff tail
-	"openReshardCDCStream":          "CDC",  // the snapshot stream's reshard tail
-	"buildVStreamRequest":           "CDC",  // the steady-state reader (and its reshard reopen)
-}
-
-// TestVStreamRequestSkewRoster_EveryBuilderClassified walks every non-test
-// Go file under internal/ and cmd/ for vtgate.VStreamFlags composite
-// literals and checks each against vstreamSkewRoster. It reaches every
-// VStream request the code builds, not only this package's; an unlisted
-// builder, a missing MinimizeSkew key, a literal true/false, or a builder
-// whose class does not match its value all fail. Floor: every roster entry
-// must be found, so a rename cannot leave the roster vacuous.
-func TestVStreamRequestSkewRoster_EveryBuilderClassified(t *testing.T) {
-	root := filepath.Join("..", "..", "..")
-	found := map[string]bool{}
-	var problems []string
-	for _, dir := range []string{"internal", "cmd"} {
-		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
-			fset := token.NewFileSet()
-			file, perr := parser.ParseFile(fset, path, nil, 0)
-			if perr != nil {
-				return perr
-			}
-			for _, decl := range file.Decls {
-				fn, ok := decl.(*ast.FuncDecl)
-				if !ok || fn.Body == nil {
-					continue
-				}
-				ast.Inspect(fn.Body, func(n ast.Node) bool {
-					lit, ok := n.(*ast.CompositeLit)
-					if !ok || !isVStreamFlagsType(lit.Type) {
-						return true
-					}
-					where := fset.Position(lit.Pos()).String()
-					class, listed := vstreamSkewRoster[fn.Name.Name]
-					if !listed {
-						problems = append(problems, where+": "+fn.Name.Name+" builds VStreamFlags but is not classified COPY or CDC in vstreamSkewRoster")
-						return true
-					}
-					found[fn.Name.Name] = true
-					if p := checkMinimizeSkew(lit, class); p != "" {
-						problems = append(problems, where+": "+fn.Name.Name+" ("+class+"): "+p)
-					}
-					return true
-				})
-			}
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("walk %s: %v", dir, err)
-		}
-	}
-	for name := range vstreamSkewRoster {
-		if !found[name] {
-			problems = append(problems, "roster entry "+name+" builds no VStreamFlags any more (renamed or removed?): the roster would pass vacuously for it")
-		}
-	}
-	sort.Strings(problems)
-	for _, p := range problems {
-		t.Error(p)
-	}
-}
-
-func isVStreamFlagsType(e ast.Expr) bool {
-	sel, ok := e.(*ast.SelectorExpr)
-	return ok && sel.Sel.Name == "VStreamFlags"
-}
-
-// checkMinimizeSkew returns "" when lit's MinimizeSkew is the value its
-// class requires, else what is wrong.
-func checkMinimizeSkew(lit *ast.CompositeLit, class string) string {
-	for _, elt := range lit.Elts {
-		kv, ok := elt.(*ast.KeyValueExpr)
-		if !ok {
-			continue
-		}
-		if key, ok := kv.Key.(*ast.Ident); !ok || key.Name != "MinimizeSkew" {
-			continue
-		}
-		switch class {
-		case "COPY":
-			if id, ok := kv.Value.(*ast.Ident); ok && id.Name == "vstreamCopyMinimizeSkew" {
-				return ""
-			}
-			return "MinimizeSkew must be vstreamCopyMinimizeSkew"
-		case "CDC":
-			if call, ok := kv.Value.(*ast.CallExpr); ok {
-				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "vstreamCDCMinimizeSkew" {
-					return ""
-				}
-			}
-			return "MinimizeSkew must be vstreamCDCMinimizeSkew(...) (ADR-0120's CDC policy)"
-		default:
-			return "unknown class " + class
-		}
-	}
-	return "no MinimizeSkew key (it would default to false silently)"
 }

@@ -66,20 +66,32 @@ func vstreamPreserveSkewFromDSN(cfg *gomysql.Config, cliPreserve bool) bool {
 // four-shard Vitess 24 cluster). The steady-state reader never hit it because
 // it was already relaxed; a warm restart through it converged exactly.
 //
-// Relaxing is ordering-safe for the tail for the reason it is for the
-// steady-state reader (ADR-0120 §2): MinimizeSkew only delays a shard's
-// events. It never changes their per-shard order or the transaction-sized
-// batches vtgate interleaves across shards, which interleave under
-// MinimizeSkew=true too whenever the shards are within 2s of each other. No
-// consumer orders across shards: positions are per-shard GTID sets, the apply
-// lanes route by key, and a key lives on one shard. The tail's dispatch
-// ([vstreamSnapshotStream.dispatchCDCEvent]) mirrors the steady-state
-// reader's, which has run relaxed by default since ADR-0120.
+// What relaxing does and does not change for the tail is what it changes for
+// the steady-state reader. MinimizeSkew only delays a shard's events: it
+// never changes their per-shard order or the transaction-sized batches vtgate
+// interleaves across shards, and those batches interleave under
+// MinimizeSkew=true too whenever the shards are within 2s of each other.
+// Positions are per-shard GTID sets and the apply lanes route by key. The
+// tail's dispatch ([vstreamSnapshotStream.dispatchCDCEvent]) mirrors the
+// steady-state reader's, which has run relaxed by default since ADR-0120.
+//
+// CROSS-SHARD-ROW-MOVE-UNORDERED: ADR-0120 §2's audit also rested on "a key
+// lives on one shard", and that premise is FALSE under
+// --allow-cross-shard-merge. When the primary vindex is not the key, an
+// application can move a row by DELETE on shard A and INSERT of the same key
+// on shard B. Those are two changes on two shards, and nothing orders them
+// across shards: relaxed, they can arrive in either order at any skew; under
+// MinimizeSkew=true, in either order when they are within 2s. Applied INSERT
+// first, the DELETE then removes the row the INSERT wrote, and the target has
+// lost a row the source holds. The exposure is accepted here, not closed:
+// the steady-state default has carried it since ADR-0120, MinimizeSkew=true
+// narrows it to 2s rather than closing it, and Bug 334's own warm-restart
+// remedy ran relaxed. The class is being measured separately;
+// --allow-cross-shard-merge's help names it.
 //
 // An operator who sets --vstream-preserve-skew gets MinimizeSkew=true on the
-// tail too, and with it this hold's risk, which the flag's help already names
-// ("accept the catch-up wedge risk"). The per-shard stall WARN covers the
-// tail, so that case is not silent.
+// tail too, and with it this hold's risk, which the flag's help names. The
+// per-shard stall WARN covers the tail, so that case is not silent.
 
 // vstreamCopyMinimizeSkew is the MinimizeSkew every COPY request carries.
 const vstreamCopyMinimizeSkew = true

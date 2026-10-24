@@ -391,6 +391,7 @@ func vstreamShardStallWarnMessage(window time.Duration, keyspace, shard string, 
 			"(the stream stays connected and will catch up when the shard resumes). "+
 			"A hold can also wedge: vtgate keeps it until every shard's clock is within 2s, waits up to 10 minutes, "+
 			"then re-forms it (Bug 334). If this repeats, restart the sync without --vstream-preserve-skew "+
+			"and without vstream_preserve_skew=true in the source DSN "+
 			"(MinimizeSkew is relaxed by default, ADR-0120)",
 		shard, keyspace, window, shard,
 	)
