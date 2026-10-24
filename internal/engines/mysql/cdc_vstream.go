@@ -1377,7 +1377,7 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStre
 			// ON default FREEZES the lagging shard under an apply-deficit backlog.
 			// --vstream-preserve-skew (relaxSkew=false) restores the old ON
 			// behaviour. Correctness-safe under range-sharding (the consumer audit).
-			MinimizeSkew:      !r.relaxSkew,
+			MinimizeSkew:      vstreamCDCMinimizeSkew(!r.relaxSkew),
 			StopOnReshard:     true,
 			HeartbeatInterval: 5,
 		},

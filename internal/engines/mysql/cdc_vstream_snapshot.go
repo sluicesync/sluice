@@ -360,8 +360,12 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 				ShardGtids: protoShardGtids,
 			},
 			Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(firstFilterTables, rowFilters)},
+			// A COPY request: the single-stream path continues this stream as
+			// its CDC tail only when the CDC policy is also MinimizeSkew=true
+			// (--vstream-preserve-skew); otherwise [startPump] reopens the
+			// tail relaxed (VSTREAM-TAIL-SKEW-HOLD).
 			Flags: &vtgate.VStreamFlags{
-				MinimizeSkew:      true,
+				MinimizeSkew:      vstreamCopyMinimizeSkew,
 				StopOnReshard:     true,
 				HeartbeatInterval: 5,
 			},
@@ -387,31 +391,34 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	}
 
 	snap := &vstreamSnapshotStream{
-		keyspace:            keyspace,
-		zeroDate:            zeroDate,
-		client:              client,
-		shards:              shards,
-		rowFilters:          rowFilters,
-		copyTables:          openScope,
-		copyTablesSeq:       seq,
-		concurrentCopy:      concurrent,
-		concurrentGroups:    concurrentGroups,
-		resumeSeed:          resumeSeed,
-		resumeSeedTable:     resumeSeedTable,
-		tableCopyComplete:   make(map[string]bool),
-		fields:              make(map[string][]*query.Field),
-		rowBuffer:           make(map[string][]ir.Row),
-		copyCompletedShards: make(map[string]bool),
-		maxBufferBytes:      defaultSnapshotMaxBufferBytes,
-		checkpointRows:      defaultCopyCheckpointRows,
-		checkpointInterval:  defaultCopyCheckpointInterval,
-		livenessWindow:      tuning.livenessWindow,
-		progressWindow:      tuning.progressWindow,
-		copyProgressWindow:  tuning.copyProgressWindow,
-		idleWarnWindow:      tuning.idleWarnWindow,
-		conn:                conn,
-		grpcStream:          grpcStream,
-		grpcCancel:          streamCancel,
+		keyspace:             keyspace,
+		zeroDate:             zeroDate,
+		client:               client,
+		shards:               shards,
+		rowFilters:           rowFilters,
+		preserveSkew:         vstreamPreserveSkewFromDSN(cfg, e.opts.preserveSkew),
+		streamMinimizeSkew:   vstreamCopyMinimizeSkew,
+		copyTables:           openScope,
+		copyTablesSeq:        seq,
+		concurrentCopy:       concurrent,
+		concurrentGroups:     concurrentGroups,
+		resumeSeed:           resumeSeed,
+		resumeSeedTable:      resumeSeedTable,
+		tableCopyComplete:    make(map[string]bool),
+		fields:               make(map[string][]*query.Field),
+		rowBuffer:            make(map[string][]ir.Row),
+		copyCompletedShards:  make(map[string]bool),
+		maxBufferBytes:       defaultSnapshotMaxBufferBytes,
+		checkpointRows:       defaultCopyCheckpointRows,
+		checkpointInterval:   defaultCopyCheckpointInterval,
+		livenessWindow:       tuning.livenessWindow,
+		progressWindow:       tuning.progressWindow,
+		copyProgressWindow:   tuning.copyProgressWindow,
+		idleWarnWindow:       tuning.idleWarnWindow,
+		shardStallWarnWindow: tuning.shardStallWarnWindow,
+		conn:                 conn,
+		grpcStream:           grpcStream,
+		grpcCancel:           streamCancel,
 	}
 	snap.cond = sync.NewCond(&snap.mu)
 
@@ -484,14 +491,15 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 
 // vstreamSnapshotTuning bundles the per-DSN window + parallelism knobs
 // openVStreamSnapshotStreamFrom threads onto the snapshot stream, so the
-// five loud-on-malformed parses read as one call instead of five
+// six loud-on-malformed parses read as one call instead of six
 // conn-close-on-error blocks inline.
 type vstreamSnapshotTuning struct {
-	livenessWindow      time.Duration
-	progressWindow      time.Duration
-	copyProgressWindow  time.Duration
-	idleWarnWindow      time.Duration
-	rawTableParallelism int
+	livenessWindow       time.Duration
+	progressWindow       time.Duration
+	copyProgressWindow   time.Duration
+	idleWarnWindow       time.Duration
+	shardStallWarnWindow time.Duration
+	rawTableParallelism  int
 }
 
 // resolveVStreamSnapshotTuning parses the snapshot stream's DSN tuning
@@ -515,6 +523,9 @@ func (e Engine) resolveVStreamSnapshotTuning(cfg *gomysql.Config) (vstreamSnapsh
 		return t, err
 	}
 	if t.idleWarnWindow, err = vstreamIdleWarnWindowFromDSN(cfg); err != nil {
+		return t, err
+	}
+	if t.shardStallWarnWindow, err = vstreamShardStallWarnWindowFromDSN(cfg); err != nil {
 		return t, err
 	}
 	if t.rawTableParallelism, err = vstreamCopyTableParallelismFromDSN(cfg, e.opts.vstreamCopyTableParallelism); err != nil {
@@ -634,6 +645,21 @@ type vstreamSnapshotStream struct {
 	// applied uniformly across the COPY and the streaming phase. Nil (the
 	// default) leaves every rule unfiltered. Read-only after construction.
 	rowFilters map[string]string
+
+	// preserveSkew is the operator's ADR-0120 opt-out (--vstream-preserve-skew
+	// / vstream_preserve_skew), resolved at open exactly as the steady-state
+	// reader resolves it. Every request this stream opens that carries CDC
+	// takes its MinimizeSkew from it ([vstreamCDCMinimizeSkew]); the COPY
+	// requests keep [vstreamCopyMinimizeSkew] (VSTREAM-TAIL-SKEW-HOLD, see
+	// cdc_vstream_relax_skew_override.go). Opt-out-named so the zero value is
+	// the relaxed default. Read-only after construction.
+	preserveSkew bool
+
+	// streamMinimizeSkew is the MinimizeSkew the currently open grpcStream
+	// was opened with. A stream's flags cannot change once it is open, so
+	// [startPump] reopens the tail when this differs from the CDC policy
+	// rather than continue the copy stream in place. Guarded by mu.
+	streamMinimizeSkew bool
 
 	// copyTables is the COPY filter scope captured at open: empty means
 	// keyspace-wide (every table), non-empty restricts the COPY to those
@@ -779,6 +805,22 @@ type vstreamSnapshotStream struct {
 	// never fails the stream. From vstream_idle_warn_timeout; 0 disables the
 	// soft WARN only.
 	idleWarnWindow time.Duration
+
+	// shardStallWarnWindow is the per-shard progress WARN window for the
+	// post-COPY CDC tail (item 23 B-1's watchdog, which through v0.163.10
+	// covered only the steady-state reader; Bug 334): how long one shard may
+	// go without advancing while a peer advances before a WARN names it. The
+	// whole-stream watchdog above cannot see that case, because one shard's
+	// events and every shard's heartbeats keep it re-armed. From
+	// vstream_shard_stall_warn_timeout; 0 (and a bare struct literal) disables
+	// it. OBSERVABILITY ONLY.
+	shardStallWarnWindow time.Duration
+
+	// shardProgress is the tail's per-shard watchdog, set and cleared by
+	// [vstreamSnapshotStream.pump] and fed only on its goroutine (by
+	// [dispatchCDCEvent]'s VGTID arm). nil outside that pump; every method is
+	// nil-safe.
+	shardProgress *shardProgressWatchdog
 
 	// cdcLive is the post-COPY CDC pump's liveness watchdog, set and
 	// cleared by [vstreamSnapshotStream.pump] and read only on its goroutine
@@ -1512,7 +1554,7 @@ func (s *vstreamSnapshotStream) reopenForTableSeeded(ctx context.Context, table 
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
 		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{table}, s.rowFilters)},
 		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
+			MinimizeSkew:      vstreamCopyMinimizeSkew,
 			StopOnReshard:     true,
 			HeartbeatInterval: 5,
 		},
@@ -1523,6 +1565,7 @@ func (s *vstreamSnapshotStream) reopenForTableSeeded(ctx context.Context, table 
 	}
 	s.mu.Lock()
 	s.grpcStream = grpcStream
+	s.streamMinimizeSkew = vstreamCopyMinimizeSkew
 	s.copyTables = []string{table}
 	s.mu.Unlock()
 	if seed != nil {
@@ -1624,6 +1667,7 @@ func (s *vstreamSnapshotStream) reopenAfterReshard(ctx context.Context, resh *Sh
 	s.reshardWindowRetries = 0 // fresh journal ⇒ fresh window budget
 	clear(s.fields)            // post-reshard tablets re-emit FIELD events
 	s.grpcStream = grpcStream
+	s.streamMinimizeSkew = vstreamCDCMinimizeSkew(s.preserveSkew)
 	s.grpcCancel = streamCancel
 	s.mu.Unlock()
 
@@ -1655,8 +1699,12 @@ func (s *vstreamSnapshotStream) openReshardCDCStream(position []shardGtid) (vtga
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
 		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables, s.rowFilters)},
+		// The reshard tail carries CDC, so it follows ADR-0120's policy
+		// (VSTREAM-TAIL-SKEW-HOLD): a resharded tail opens every new shard at
+		// the journal's GTIDs, and a held shard there could freeze the rest
+		// exactly as on the cold-start handoff.
 		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
+			MinimizeSkew:      vstreamCDCMinimizeSkew(s.preserveSkew),
 			StopOnReshard:     true,
 			HeartbeatInterval: 5,
 		},
@@ -1727,6 +1775,7 @@ func (s *vstreamSnapshotStream) reopenReshardWindow(ctx context.Context) (change
 	s.err = nil // clear the ridden-out window error; a fresh failure re-sets it
 	clear(s.fields)
 	s.grpcStream = grpcStream
+	s.streamMinimizeSkew = vstreamCDCMinimizeSkew(s.preserveSkew)
 	s.grpcCancel = streamCancel
 	s.mu.Unlock()
 
@@ -2286,11 +2335,19 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 	// moved back behind the stream (a shard finished its copy early and its
 	// later changes were held, [finishCopy]): continuing in place would
 	// skip them.
-	s.mu.Lock()
-	rewound := s.cdcResumeRewound
-	s.mu.Unlock()
-	if len(s.copyTablesSeq) > 0 || rewound {
-		if err := s.reopenForCDC(ctx); err != nil {
+	//
+	// And it reopens whenever the copy stream's MinimizeSkew differs from
+	// the CDC policy (VSTREAM-TAIL-SKEW-HOLD, Bug 334): a stream's flags
+	// cannot change once open, so continuing the copy stream in place would
+	// run the tail with the copy's MinimizeSkew=true and risk vtgate's skew
+	// hold. With the ADR-0120 default that is every single-stream cold start;
+	// under --vstream-preserve-skew the two agree and the stream continues in
+	// place as before. The reopen starts at currentVgtid, which is the
+	// snapshot position the caller just passed to StreamChanges (checked
+	// there) and the one a restart would resume from, so it neither skips
+	// nor adds anything a restart would not.
+	if reason := s.cdcHandoffReopenReason(); reason != "" {
+		if err := s.reopenForCDC(ctx, reason); err != nil {
 			return nil, err
 		}
 	}
@@ -2298,6 +2355,25 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 	out := make(chan ir.Change, vstreamChannelBuffer)
 	s.launchCDCPump(ctx, out)
 	return out, nil
+}
+
+// cdcHandoffReopenReason says why the copy→CDC handoff must open a fresh
+// tail instead of continuing the copy stream in place, or "" when it may
+// continue. Every reason [startPump] reopens for is here, so the handoff's
+// one decision reads as a list.
+func (s *vstreamSnapshotStream) cdcHandoffReopenReason() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case len(s.copyTablesSeq) > 0:
+		return "per_table_copy"
+	case s.cdcResumeRewound:
+		return "shard_finished_copy_early"
+	case s.streamMinimizeSkew != vstreamCDCMinimizeSkew(s.preserveSkew):
+		return "skew_policy"
+	default:
+		return ""
+	}
 }
 
 // reopenForCDC replaces the last per-table COPY stream with a fresh
@@ -2308,7 +2384,12 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 // connection is reused; only the stream is replaced. currentVgtid holds
 // P_start (seeded by [finishCopyAutoShard]); a from-scratch keyspace
 // filter ("/.*/") with that position resumes CDC for the whole keyspace.
-func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
+//
+// The single-stream path reopens through here too, for the other reasons
+// [cdcHandoffReopenReason] lists; reason is logged. The tail carries CDC, so
+// its MinimizeSkew follows ADR-0120's policy, never the copy's
+// (VSTREAM-TAIL-SKEW-HOLD).
+func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context, reason string) error {
 	s.mu.Lock()
 	resume := make([]shardGtid, len(s.currentVgtid))
 	copy(resume, s.currentVgtid)
@@ -2333,10 +2414,8 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 	// in-scope tables are streamed, and each carries its filter; unfiltered
 	// syncs keep the keyspace-wide catch-all byte-for-byte.
 	//
-	// The single-stream path (no copyTablesSeq) reaches here only when its
-	// position was moved back ([finishCopy]); its tail keeps exactly the
-	// filter its copy stream carried, which is what continuing in place
-	// would have used.
+	// The single-stream path (no copyTablesSeq) keeps exactly the filter its
+	// copy stream carried, which is what continuing in place would have used.
 	rules := vstreamCopyFilterRules(nil, nil)
 	switch {
 	case len(s.copyTablesSeq) == 0:
@@ -2349,7 +2428,7 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
 		Filter:     &binlogdata.Filter{Rules: rules},
 		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
+			MinimizeSkew:      vstreamCDCMinimizeSkew(s.preserveSkew),
 			StopOnReshard:     true,
 			HeartbeatInterval: 5,
 		},
@@ -2374,12 +2453,15 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 		s.grpcCancel() // free the finished COPY stream's context
 	}
 	s.grpcStream = grpcStream
+	s.streamMinimizeSkew = req.GetFlags().GetMinimizeSkew()
 	s.grpcCancel = streamCancel
 	clear(s.fields) // the keyspace-wide stream re-emits FIELD per table
 	s.mu.Unlock()
 	slog.InfoContext(ctx, "mysql/vstream: snapshot: CDC handoff (tail opened at the snapshot position)",
 		slog.String("keyspace", s.keyspace),
-		slog.Bool("per_table_copy", len(s.copyTablesSeq) > 0))
+		slog.String("reason", reason),
+		slog.Bool("per_table_copy", len(s.copyTablesSeq) > 0),
+		slog.Bool("minimize_skew", req.GetFlags().GetMinimizeSkew()))
 	return nil
 }
 
@@ -2438,6 +2520,26 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, streamCancel context.C
 	s.cdcLive = live
 	defer func() { s.cdcLive = nil }()
 
+	// PER-SHARD progress watchdog, the steady-state reader's (item 23 B-1),
+	// on the tail too (Bug 334): WARNs when one shard stops advancing while a
+	// peer keeps advancing — the shape of a vtgate skew hold, which the
+	// whole-stream watchdog above cannot see because the advancing shard's
+	// events and every shard's heartbeats keep re-arming it. Through v0.163.10
+	// the tail had no such signal, and a held tail stayed silent for the
+	// whole hold. OBSERVABILITY ONLY: it must NOT setErr or cancel.
+	s.mu.Lock()
+	knownShards := append([]string(nil), s.shards...)
+	s.mu.Unlock()
+	relaxSkew := !s.preserveSkew
+	s.shardProgress = startShardProgressWatchdog(ctx, s.shardStallWarnWindow, knownShards,
+		func(shard string) {
+			slog.WarnContext(ctx, vstreamShardStallWarnMessage(s.shardStallWarnWindow, s.keyspace, shard, relaxSkew))
+		})
+	defer func() {
+		s.shardProgress.stop()
+		s.shardProgress = nil
+	}()
+
 	for {
 		// Honour caller cancellation independently of the stream's
 		// internal cancellation: ctx is the StreamChanges caller's
@@ -2469,6 +2571,8 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, streamCancel context.C
 				s.mu.Lock()
 				s.reshardWindowRetries = 0
 				s.mu.Unlock()
+				// The per-shard WARN is a Phase-2 signal; idempotent.
+				s.shardProgress.markServingProven()
 			}
 		}
 		for _, ev := range resp.GetEvents() {
@@ -2529,6 +2633,10 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		if err != nil {
 			return err
 		}
+		// Per-shard progress watchdog feed, exactly as the steady-state
+		// reader's dispatch does: the shards whose GTID moved on this VGTID.
+		// Nil-safe (disabled WARN / dispatch called outside the pump).
+		s.shardProgress.observeAdvance(advancedShards(s.currentVgtid, next))
 		s.currentVgtid = next
 		return nil
 

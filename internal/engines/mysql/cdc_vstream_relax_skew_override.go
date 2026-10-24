@@ -41,3 +41,51 @@ func vstreamPreserveSkewFromDSN(cfg *gomysql.Config, cliPreserve bool) bool {
 	}
 	return cfg.Params["vstream_preserve_skew"] == "true"
 }
+
+// The skew policy, per request (VSTREAM-TAIL-SKEW-HOLD, Bug 334). Every
+// VStream request the package builds carries one of the two values below;
+// TestVStreamRequestSkewRoster_EveryBuilderClassified walks the source and
+// fails on a request whose MinimizeSkew is anything else, or whose builder is
+// not classified COPY or CDC.
+//
+// COPY requests keep MinimizeSkew=true (ADR-0120's scope exemption: the copy
+// wants the shards synchronized at the cut). Requests that carry CDC follow
+// ADR-0120: relaxed unless the operator opted out with --vstream-preserve-skew.
+// That includes the snapshot stream's post-copy tail. Through v0.163.10 the
+// tail kept the copy's MinimizeSkew=true, and after a skewed multi-shard cold
+// start it stalled: the copy keeps every shard that finished early at its own
+// copy GTID (Bug 331), so the tail opens with two or more shards replaying a
+// window seconds in the past. vtgate (vendored vstream_manager.go
+// computeSkew/mustPause) names the oldest the laggard and pauses every other
+// shard on its next event. The second rewound shard pauses on its first
+// replayed event, its clock frozen in the past; the up-to-date shards' clocks
+// move on heartbeats until their own first event pauses them; and the hold
+// clears only when every clock is within MaxSkew (2s) of the others, which a
+// clock frozen in the past never is. Three of four shards delivered nothing
+// until vtgate's 10-minute skew timeout, then re-held (measured on a real
+// four-shard Vitess 24 cluster). The steady-state reader never hit it because
+// it was already relaxed; a warm restart through it converged exactly.
+//
+// Relaxing is ordering-safe for the tail for the reason it is for the
+// steady-state reader (ADR-0120 §2): MinimizeSkew only delays a shard's
+// events. It never changes their per-shard order or the transaction-sized
+// batches vtgate interleaves across shards, which interleave under
+// MinimizeSkew=true too whenever the shards are within 2s of each other. No
+// consumer orders across shards: positions are per-shard GTID sets, the apply
+// lanes route by key, and a key lives on one shard. The tail's dispatch
+// ([vstreamSnapshotStream.dispatchCDCEvent]) mirrors the steady-state
+// reader's, which has run relaxed by default since ADR-0120.
+//
+// An operator who sets --vstream-preserve-skew gets MinimizeSkew=true on the
+// tail too, and with it this hold's risk, which the flag's help already names
+// ("accept the catch-up wedge risk"). The per-shard stall WARN covers the
+// tail, so that case is not silent.
+
+// vstreamCopyMinimizeSkew is the MinimizeSkew every COPY request carries.
+const vstreamCopyMinimizeSkew = true
+
+// vstreamCDCMinimizeSkew is the MinimizeSkew a request carrying CDC sets: on
+// only when the operator preserved the skew hold.
+func vstreamCDCMinimizeSkew(preserveSkew bool) bool {
+	return preserveSkew
+}

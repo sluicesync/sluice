@@ -311,7 +311,7 @@ func (cs *copyStream) openStreamForTable(ctx context.Context, table string, seed
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
 		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules([]string{table}, s.rowFilters)},
 		Flags: &vtgate.VStreamFlags{
-			MinimizeSkew:      true,
+			MinimizeSkew:      vstreamCopyMinimizeSkew,
 			StopOnReshard:     true,
 			HeartbeatInterval: 5,
 		},

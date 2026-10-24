@@ -388,7 +388,10 @@ func vstreamShardStallWarnMessage(window time.Duration, keyspace, shard string, 
 			"either a genuine per-shard source stall (source-tablet throttle, a large transaction, or a tablet issue; "+
 			"check `SHOW VITESS_THROTTLED_APPS` on shard %q's primary), or a normal MinimizeSkew catch-up hold "+
 			"(vtgate holding this ahead shard back while a behind peer drains a backlog) "+
-			"(the stream stays connected and will catch up when the shard resumes)",
+			"(the stream stays connected and will catch up when the shard resumes). "+
+			"A hold can also wedge: vtgate keeps it until every shard's clock is within 2s, waits up to 10 minutes, "+
+			"then re-forms it (Bug 334). If this repeats, restart the sync without --vstream-preserve-skew "+
+			"(MinimizeSkew is relaxed by default, ADR-0120)",
 		shard, keyspace, window, shard,
 	)
 }

@@ -62,8 +62,9 @@ import (
 func TestVitessReshard_ShardedColdCopy_AllShardsCopied(t *testing.T) {
 	// Reach a genuinely 2-shard keyspace via the harness's PROVEN path:
 	// boot UNSHARDED, seed, then reshard 1->2 + SwitchTraffic. (Booting a
-	// multi-shard source directly reparents the second shard unreliably on
-	// this harness; resharding from "-" is the tested flow — the same one
+	// multi-shard source directly used to reparent the second shard
+	// unreliably on this harness — a bring-up script scoping bug, fixed
+	// with Bug 334; resharding from "-" stays the tested flow — the same one
 	// TestVitessReshard_ProofOfReshardability pins.) After SwitchTraffic the
 	// keyspace presents cleanly as [-80,80-] — exactly the layout the
 	// cold-copy must auto-discover; the drained source "-" shard drops out

@@ -202,8 +202,17 @@ $VC AddCellInfo --root /vitess/${CELL} --server-address ${ETCD_ADDR} ${CELL} || 
 # NOTE: bash reserves $UID (readonly); use TUID for the tablet uid.
 # one_tablet brings up a single mysqld+vttablet pair.
 # args: <shard> <tablet-uid> <mysql-port> <vttablet-port> <grpc-port>
+#
+# Every helper variable is LOCAL. They used to be globals with the same
+# names as the bring-up loop's counters below, so start_shard's second
+# one_tablet call (the replica, TUID+50) left TUID/MYP/VTP/GRP at the
+# replica's values, the loop then advanced from there, and the second
+# and later shards came up with uids the reparent loop does not name
+# (151 instead of 101): PlannedReparentShard never found its tablet.
+# That is why booting a multi-shard source "reparented the second
+# shard unreliably" (Bug 334's real-cluster check found it).
 one_tablet() {
-  SHARD=$1; TUID=$2; MYP=$3; VTP=$4; GRP=$5
+  local SHARD=$1 TUID=$2 MYP=$3 VTP=$4 GRP=$5 TABLETDIR
   TABLETDIR=$VTDATAROOT/vt_$(printf '%010d' $TUID)
   mkdir -p $TABLETDIR
   MYSQL_FLAVOR=MySQL80 /vt/bin/mysqlctl \
@@ -241,7 +250,7 @@ one_tablet() {
 # would leave VStream with "failed to find a REPLICA tablet"
 # (ground-truthed, Track-1a Phase A).
 start_shard() {
-  SHARD=$1; TUID=$2; MYP=$3; VTP=$4; GRP=$5
+  local SHARD=$1 TUID=$2 MYP=$3 VTP=$4 GRP=$5
   one_tablet "$SHARD" $TUID $MYP $VTP $GRP
   one_tablet "$SHARD" $((TUID+50)) $((MYP+50)) $((VTP+50)) $((GRP+50))
 }

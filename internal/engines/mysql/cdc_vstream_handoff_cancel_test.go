@@ -55,7 +55,7 @@ func TestVStreamSnapshot_ReopenForCDC_InstallsCancellableStreamCtx(t *testing.T)
 	oldCtx, oldCancel := context.WithCancel(context.Background())
 	s.grpcCancel = oldCancel
 
-	if err := s.reopenForCDC(callerCtx); err != nil {
+	if err := s.reopenForCDC(callerCtx, "per_table_copy"); err != nil {
 		t.Fatalf("reopenForCDC: %v", err)
 	}
 
