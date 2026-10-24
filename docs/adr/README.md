@@ -52,7 +52,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 
 | ADR | Decision |
 |---|---|
-| [0030](adr-0030-mid-stream-live-add-table.md) | Mid-stream live add-table — `--no-drain` (PG path; Phase 2). **Withdrawn** in v0.163.9 (Bug 332, `NO-DRAIN-POSTGRES-SOURCE`): the running stream undid or dropped the new table's deletes and updates (and, filtered, its inserts) during the add; `--no-drain` now refuses on every source |
+| [0030](adr-0030-mid-stream-live-add-table.md) | Mid-stream live add-table — `--no-drain` (PG path; Phase 2). **Withdrawn** in v0.163.10 (Bug 332, `NO-DRAIN-POSTGRES-SOURCE`): the running stream undid or dropped the new table's deletes and updates (and, filtered, its inserts) during the add; `--no-drain` now refuses on every source |
 | [0031](adr-0031-multi-source-aggregation-target-schema.md) | Multi-source aggregation via `--target-schema NAME` (PG-only) |
 | [0032](adr-0032-pg-extension-passthrough.md) | PG extension passthrough catalog — 7-extension enumerated allowlist |
 | [0033](adr-0033-mid-stream-live-add-strict-zero-loss.md) | Strict zero-loss correctness for live add-table (Bug 36 closure). **Correction** (Bug 332): the strict zero-loss held for inserts alone; the path is withdrawn |

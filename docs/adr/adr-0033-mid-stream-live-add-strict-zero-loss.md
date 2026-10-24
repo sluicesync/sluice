@@ -26,7 +26,7 @@ B/C/D for this surface. (Status reconciled 2026-05-18 during an
 ADR-status audit; the prior "no strict-zero-loss implementation has
 shipped / paths remain on the table" wording predated v0.32.0.)
 
-**Correction (2026-10-23, Bug 332): "strict-zero-loss SHIPPED v0.32.0" was false, and the live add-table path is withdrawn (v0.163.9, NO-DRAIN-POSTGRES-SOURCE).** The v0.32.0 fix closed the `errUnknownTable` drop ADR-0036 found, and its pin (`TestStreamer_AddTable_LiveMode_PG_UnderLoad`, now deleted) wrote INSERTs only. Inserts are the one change kind that commutes with an idempotent copy. Deletes and updates made during the add were lost or undone by the copy, and on a filtered stream every change was dropped until the live-added poll admitted the table (measured at v0.163.8, see ADR-0030's withdrawal note). The Path A slot-pause finding below is unaffected.
+**Correction (2026-10-23, Bug 332): "strict-zero-loss SHIPPED v0.32.0" was false, and the live add-table path is withdrawn (v0.163.10, NO-DRAIN-POSTGRES-SOURCE).** The v0.32.0 fix closed the `errUnknownTable` drop ADR-0036 found, and its pin (`TestStreamer_AddTable_LiveMode_PG_UnderLoad`, now deleted) wrote INSERTs only. Inserts are the one change kind that commutes with an idempotent copy. Deletes and updates made during the add were lost or undone by the copy, and on a filtered stream every change was dropped until the live-added poll admitted the table (measured at v0.163.8, see ADR-0030's withdrawal note). The Path A slot-pause finding below is unaffected.
 
 ## Context
 
