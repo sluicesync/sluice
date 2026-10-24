@@ -33,6 +33,8 @@ ADR-0033's Phase A verification falsified Path A (slot-pause): pgoutput's per-LS
 
 ## Phase A: empirical verification
 
+*Note (v0.163.10): the test files cited throughout this section and the ones below, `internal/pipeline/add_table_live_pg_diagnose_integration_test.go` and `internal/pipeline/add_table_live_pg_integration_test.go`, were deleted in v0.163.10 with the live add-table path (Bug 332). They remain in git history before that release; the window that withdrew the path is measured by `internal/pipeline/add_table_no_drain_window_pg_integration_test.go`.*
+
 ### Diagnostic instrumentation — what we capture and where
 
 The instrumentation is gated behind DEBUG-level slog (invisible in normal runs; surfaces with `--log-level=debug` or in the diagnostic test which forces a JSON debug-handler). Four log-tag families:
@@ -249,8 +251,8 @@ Two targeted changes in `internal/pipeline/`:
 The change is engine-symmetric: PG and MySQL schema writers both use `CREATE TABLE IF NOT EXISTS`, both engines implement `ir.IdempotentRowWriter`. MySQL's filter-flip mechanism (ADR-0034) gates dispatch on `live_added_tables` membership and didn't manifest the race in v0.24.0, but the early-create + idempotent-copy shape removes engine-specific timing assumptions from the orchestrator and is correct for both engines.
 
 **Regression artifact:**
-- `internal/pipeline/add_table_live_pg_integration_test.go::TestAddTable_LiveMode_PG_UnderLoad` is tightened from a best-effort log (`if got < maxTotal { t.Logf(...) }`) to a strict zero-loss assertion (`if got != maxTotal { t.Errorf(...) }`). The Phase 2 best-effort caveat in ADR-0030 § "What could go wrong" item 3 is closed; the under-load test now pins the contract.
-- `internal/pipeline/add_table_live_pg_diagnose_integration_test.go::TestAddTable_LiveMode_PG_DiagnoseLossSurface` stays as a permanent regression artifact. Its VERDICT_M[1-5] lines remain the on-call diagnostic should a future regression re-introduce loss in any of the characterized mechanisms; the Phase A.3 applier-side capture probe stays as DEBUG-level instrumentation in `change_applier.go::dispatch` for the same reason (mirrors how ADR-0033's slot-pause verify test stays as proof-of-falsification).
+- `internal/pipeline/add_table_live_pg_integration_test.go::TestAddTable_LiveMode_PG_UnderLoad` is tightened from a best-effort log (`if got < maxTotal { t.Logf(...) }`) to a strict zero-loss assertion (`if got != maxTotal { t.Errorf(...) }`). The Phase 2 best-effort caveat in ADR-0030 § "What could go wrong" item 3 is closed; the under-load test now pins the contract. (Superseded: that pin was INSERT-only and the contract held for inserts alone; the test was deleted in v0.163.10, see the Bug 332 correction under Status.)
+- `internal/pipeline/add_table_live_pg_diagnose_integration_test.go::TestAddTable_LiveMode_PG_DiagnoseLossSurface` stayed as a permanent regression artifact (until its deletion in v0.163.10). Its VERDICT_M[1-5] lines were the on-call diagnostic should a future regression re-introduce loss in any of the characterized mechanisms; the Phase A.3 applier-side capture probe stayed as DEBUG-level instrumentation in `change_applier.go::dispatch` for the same reason (still present, marked ORPHANED since Bug 332 for a follow-up removal) (mirrors how ADR-0033's slot-pause verify test stays as proof-of-falsification).
 
 **LOC actual:** ~150 LOC across `add_table.go`, `migrate.go`, the under-load test, and ADR/CHANGELOG. Well under the Phase A.3 estimate; the diagnose work narrowed the fix scope precisely.
 
@@ -320,5 +322,5 @@ Phase A.1 narrowed the hypothesis space but left M3 INCONCLUSIVE. Open questions
 
 - `docs/adr/adr-0030-mid-stream-live-add-table.md` — Phase 2 design and the "What could go wrong" entry this ADR characterizes.
 - `docs/adr/adr-0033-mid-stream-live-add-strict-zero-loss.md` — Phase A verification that falsified Path A; ADR-0036 is the next iteration of its "Forward options" Path D entry.
-- `internal/pipeline/add_table_live_pg_diagnose_integration_test.go` — the Phase A diagnostic test artifact. Re-run on any future chunk that revisits the v0.24.0 loss surface.
+- `internal/pipeline/add_table_live_pg_diagnose_integration_test.go` — the Phase A diagnostic test artifact (deleted in v0.163.10; recover it from git history before that release).
 - `docs/dev/notes/path-d-phase-a-status.md` — runbook for executing the diagnostic test on the Vultr box.

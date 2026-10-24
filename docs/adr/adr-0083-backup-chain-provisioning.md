@@ -34,7 +34,10 @@ surfaced three distinct failures of that contract, one per layer:
    `START_REPLICATION` to the slot's `confirmed_flush_lsn` without
    complaint. The live add-table flow already guards this exact class
    (`Engine.ReadSlotPosition`: "events in [snapshot-LSN,
-   confirmed_flush_lsn] would be silently dropped"); the backup chain
+   confirmed_flush_lsn] would be silently dropped" — removed in
+   v0.163.10 with the live add-table path; the chain's own check,
+   `PreflightChainResume` in `chain_preflight.go`, reads
+   `confirmed_flush_lsn` itself and never used it); the backup chain
    had no counterpart.
 3. **The publication has the same creation-time rule, sharper.**
    pgoutput resolves publication membership with a **historic catalog
