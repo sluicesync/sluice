@@ -1624,6 +1624,14 @@ type Streamer struct {
 	whereFilter    *whereCDCFilter
 	whereFilterErr atomic.Pointer[error]
 
+	// replayWindows is this attempt's open added-table replay windows (Bug
+	// 333), loaded at a warm resume by
+	// [Streamer.phaseLoadAddedTableReplayWindows] and consumed by
+	// [interceptAddedTableReplay]; nil when none is open. replayWindowErr is
+	// that intercept's error sink, surfaced like whereFilterErr.
+	replayWindows   *replayWindows
+	replayWindowErr atomic.Pointer[error]
+
 	// uniqueKeyDoor is what the stream-open unique-key door learned for the
 	// mid-stream re-check: which tables to watch, per namespace
 	// (unique_key_door.go). uniqueKeyRecheckErr is the re-check intercept's
@@ -2400,6 +2408,14 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 		return err
 	}
 
+	// ---- 4b'. Added-table replay windows (Bug 333) ----
+	// A warm resume after a drained `schema add-table` replays the added
+	// table's changes from before its copy; the windows still open bound the
+	// span the intercept chain applies idempotently.
+	if err := s.phaseLoadAddedTableReplayWindows(ctx, applier, streamID, warmResumed, persisted); err != nil {
+		return err
+	}
+
 	// ---- 4c. Upsert-key preflight (Bug 211) ----
 	// The last check before changes start flowing: every in-scope target
 	// table must have a key the target engine's idempotent
@@ -2541,7 +2557,7 @@ const maxReshardReopensPerRun = 256
 // [phaseSettleDispatch] reads is listed here; the whereFilterErr sink was
 // missing until the unique-key one joined it.
 func (s *Streamer) interceptErrorPending() bool {
-	for _, sink := range []*atomic.Pointer[error]{&s.schemaSnapshotErr, &s.whereFilterErr, &s.uniqueKeyRecheckErr} {
+	for _, sink := range []*atomic.Pointer[error]{&s.schemaSnapshotErr, &s.whereFilterErr, &s.uniqueKeyRecheckErr, &s.replayWindowErr} {
 		if p := sink.Load(); p != nil && *p != nil {
 			return true
 		}

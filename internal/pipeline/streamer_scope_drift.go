@@ -1037,6 +1037,7 @@ func (s *Streamer) recordColdStartEstablished(ctx context.Context, applier ir.Ch
 	if keys == nil {
 		return
 	}
+	s.resetReplayWindowsAfterColdStart(ctx, applier, streamID)
 	if store, ok := applier.(ir.EstablishedTablesStore); ok {
 		if err := recordEstablishedAfterCopy(ctx, store, streamID, keys, s.recordedTableIDs(ctx, keys), s.sourceTableKeys); err != nil {
 			if rec, rerr := store.ReadEstablishedRecord(ctx, streamID); rerr == nil && !rec.Recorded {

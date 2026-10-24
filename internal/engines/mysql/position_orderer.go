@@ -119,6 +119,35 @@ func (e Engine) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
 	}
 }
 
+// AddedTableCopyPosition implements [ir.AddedTableReplayWindowSource] for
+// every MySQL flavor (Bugs 333 and 336): the binlog and the VStream carry
+// every table's changes, so a stream stopped for a drained add-table replays
+// the added table's changes from before its copy. The bound is the snapshot
+// position itself — the binlog snapshot's GTID set (or file/pos), read under
+// the write freeze; the VStream copy's per-shard finish VGTID — because a row
+// change here carries the position from BEFORE its own transaction: a
+// transaction the copy holds is never at or after the snapshot, and the
+// first one past it is exactly at it.
+//
+// What holds the two facts the window rests on:
+//
+//   - pre-transaction row positions: item 132 on binlog (the staged GTID is
+//     folded at the commit), ADR-0190 phase 4 on VStream (the rows and
+//     TxBegin carry the VGTID before the shard's VGTID event). Pinned on real
+//     servers by TestCDCReader_GTIDStaging_RowPositionExcludesOwnTransaction
+//     and TestVStream_ApplyIdentity_StableAcrossMidStreamResume; the window
+//     predicate over such positions, per position family, by
+//     TestAddedTableReplayWindow_OrdererBoundsTheCopy.
+//   - complete after-images: the readers refuse a partial one
+//     ([refusePartialRowImage] on binlog, Bug 193;
+//     [refuseVStreamPartialRowImage] on VStream, item 74).
+func (Engine) AddedTableCopyPosition(snapshot, _ ir.Position) (ir.Position, error) {
+	if snapshot.Token == "" {
+		return ir.Position{}, errors.New("mysql: added-table copy position: the snapshot reported no position")
+	}
+	return snapshot, nil
+}
+
 // binlogFileAfter reports whether binlog file a rotates strictly after b.
 //
 // # Why this is not a string comparison (audit 2026-08-05 C-13)

@@ -44,7 +44,12 @@ var (
 	_ ir.PositionMonotonicChecker       = Engine{}
 	_ ir.PositionOrderer                = Engine{}
 	_ ir.ServerCDCReaderOpener          = Engine{}
-	_ ir.SlotManagerOpener              = Engine{}
+	// Bug 336: a drained add-table records its copy's bound so the restart
+	// replays the window between the ALTER PUBLICATION and the snapshot
+	// idempotently. A drift here returns the key-addressed replay that moved
+	// the copy's row away and deleted it, at exit 0.
+	_ ir.AddedTableReplayWindowSource = Engine{}
+	_ ir.SlotManagerOpener            = Engine{}
 	// Bug 271: recovers the slot name a stream recorded in its own position,
 	// so `sync decommission` stops treating the EMPTY slot_name a default-named
 	// stream writes as "a legacy row" -- which skipped the drop AND, because

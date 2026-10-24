@@ -53,6 +53,11 @@ var (
 	// drift here would move the refusal to the snapshot open, after the cold
 	// start has cleared its apply marks and a backup has fallen back.
 	_ ir.SnapshotScopeChecker = Engine{}
+	// Bug 333: a drained add-table records its copy's position so the
+	// restarted stream replays the table idempotently up to it. A drift here
+	// silently returns both lanes to the unguarded replay (rows lost on
+	// VStream, a duplicate-key wedge on binlog).
+	_ ir.AddedTableReplayWindowSource = Engine{}
 	// ADR-0174 Piece 2 — continuous filtered sync (`sync --where`) pushes
 	// the predicate into the VStream COPY at OPEN time (a post-open
 	// RowFilterSetter is too late for the eager COPY). A method-set drift

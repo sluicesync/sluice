@@ -802,14 +802,19 @@ type IdempotentCopyReader interface {
 // (VSTREAM-COPY-ROW-CHANGE-REFUSED).
 //
 // A caller that GUARANTEES a later change stream replays every change from
-// a position at or before the copy's start calls DeferCopyReplaysToStream,
-// before or while it reads rows, and the copy then leaves those changes
-// unapplied for that stream to replay instead of refusing. The one caller
-// is the drained `schema add-table`: the stream it requires stopped resumes
-// from its pre-add persisted position (measured exact,
-// TestStreamer_VStreamAddTableKeyspaceWideCopy's Drained cells). A cold
-// start must never call it: its change stream starts at the copy's own
-// position, after the replayed changes.
+// a position at or before the copy's start, AND applies that replay
+// idempotently up to the copy's final position, calls
+// DeferCopyReplaysToStream, before or while it reads rows, and the copy then
+// leaves those changes unapplied for that stream to replay instead of
+// refusing. The one caller is the drained `schema add-table`: the stream it
+// requires stopped resumes from its pre-add persisted position, and the
+// add's recorded replay window ([AddedTableReplayWindow]) makes that replay
+// idempotent. Replaying "in order" alone is NOT enough, and was the premise
+// v0.163.9 shipped on: the copy upserts in-copy INSERTs, so a deferred key
+// change X→Y followed by an INSERT reusing X met the reused row at X, its
+// compare-and-set replay missed, and the moved row was lost at exit 0 (Bug
+// 333). A cold start must never call it: its change stream starts at the
+// copy's own position, after the replayed changes.
 type CopyReplayDeferrer interface {
 	DeferCopyReplaysToStream()
 }

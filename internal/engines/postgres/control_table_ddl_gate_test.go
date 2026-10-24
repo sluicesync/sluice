@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/appliershared"
 )
 
 // TestControlTableDDLPrintsEveryEnsuredColumn holds `sluice control-tables
@@ -119,6 +121,13 @@ func tableSetColumnLiteralArgs(t *testing.T) map[string]bool {
 				default:
 					t.Errorf("%s: tableSetColumn(%s) — the gate cannot resolve that argument; extend it",
 						fset.Position(call.Pos()), arg.Name)
+				}
+			case *ast.SelectorExpr:
+				x, ok := arg.X.(*ast.Ident)
+				if ok && x.Name == "appliershared" && arg.Sel.Name == "AddedTableCopyPositionsColumn" {
+					out[appliershared.AddedTableCopyPositionsColumn] = true
+				} else {
+					t.Errorf("%s: tableSetColumn with a selector the gate cannot resolve; extend it", fset.Position(call.Pos()))
 				}
 			default:
 				t.Errorf("%s: tableSetColumn with an argument the gate cannot resolve; extend it", fset.Position(call.Pos()))

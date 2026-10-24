@@ -151,14 +151,15 @@ func cdcStateTable(schema string) controlTable {
 }
 
 // firstWriteCDCStateColumns are the sluice_cdc_state columns ensured on the
-// first write that needs them (Bug 321): the three table-set columns and the
-// live-added set. Single-sourced from the lists the write paths ensure.
+// first write that needs them (Bug 321): the three table-set columns, the
+// live-added set, and the added-table copy positions (Bug 333, ensured by
+// its own writes alone). Single-sourced from what the write paths ensure.
 func firstWriteCDCStateColumns() []controlColumn {
-	out := make([]controlColumn, 0, len(tableSetColumnNames)+1)
+	out := make([]controlColumn, 0, len(tableSetColumnNames)+2)
 	for _, c := range tableSetColumnNames {
 		out = append(out, tableSetColumn(c))
 	}
-	return append(out, tableSetColumn(liveAddedTablesColumn))
+	return append(out, tableSetColumn(liveAddedTablesColumn), copyPositionsColumn())
 }
 
 // ensureControlTable brings sluice_cdc_state to its current shape,

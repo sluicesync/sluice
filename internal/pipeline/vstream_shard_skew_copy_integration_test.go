@@ -823,7 +823,7 @@ func vskAddTableDrainedDefersReplays(t *testing.T, r vskRig, c vskAddCase) {
 
 // vskDeferredLine is the snapshot's INFO record of the replayed changes a
 // copy left to the later change stream (logDeferredReplaysLocked).
-const vskDeferredLine = `msg="mysql/vstream: snapshot: the copy received changes Vitess replayed inside it and left them to the change stream, which resumes from before the copy and replays them in order"`
+const vskDeferredLine = `msg="mysql/vstream: snapshot: the copy received changes Vitess replayed inside it and left them to the change stream, which resumes from before the copy and replays them idempotently up to the copy's position (ADDED-TABLE-REPLAY-WINDOW)"`
 
 func vskLogTail(t *testing.T, r vskRig, from int) {
 	t.Helper()

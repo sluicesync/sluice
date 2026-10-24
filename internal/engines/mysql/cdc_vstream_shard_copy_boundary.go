@@ -109,7 +109,10 @@ import (
 // any delete or key change on the added table during its copy is replayed by
 // the catch-up before the next table. Its stream was stopped before the add
 // and resumes from its pre-add position, replaying every change made during
-// the copy in order. So add-table calls DeferCopyReplaysToStream
+// the copy, idempotently up to the position the add recorded for its copy
+// (ADDED-TABLE-REPLAY-WINDOW, Bug 333: replayed merely in order, a deferred
+// key change met the INSERT the copy had upserted at its old key, missed it,
+// and lost the moved row). So add-table calls DeferCopyReplaysToStream
 // ([ir.CopyReplayDeferrer]) and the copy leaves those changes unapplied for
 // that stream, counted and logged, instead of failing the add. Measured
 // exact with deletes by TestStreamer_VStreamAddTableKeyspaceWideCopy's

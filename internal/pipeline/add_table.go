@@ -49,8 +49,13 @@ package pipeline
 //  10. Drop the temp PG slot if one was created. The persisted
 //      cdc-state position is NOT updated — the stream's existing
 //      position is still the right resume point for the other
-//      tables, and the applier's idempotent upsert handles the
-//      [persisted_LSN, snapshot_LSN] overlap on the new table.
+//      tables. The overlap on the new table — the changes the restart
+//      replays that the copy already holds (on the binlog everything
+//      since the stop, on Postgres the span from the ALTER PUBLICATION
+//      to the snapshot) — is bounded by the copy's position, which the
+//      add records, and the restart replays that span idempotently
+//      (the replay window, Bugs 333 and 336;
+//      [ir.AddedTableReplayWindowSource]).
 //  11. Operator restarts via `sluice sync start` (same --stream-id) — the
 //      stream picks up CDC for every table including the new one
 //      from its persisted position.
@@ -498,6 +503,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// publication — so it is recorded as pending first and cleared only once
 	// the copy and the hand-off have succeeded. `sync start` refuses a warm
 	// resume whose scope includes a pending table.
+	//
+	// The replay window's record (Bug 333) is written after the copy, so the
+	// target is asked first whether it can hold one: a refusal here changes
+	// nothing.
+	if err := a.prepareReplayWindow(ctx, applier); err != nil {
+		return err
+	}
 	if err := a.recordPendingAdd(ctx, applier); err != nil {
 		return err
 	}
@@ -606,6 +618,13 @@ func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, p
 			ctx, "add-table: release snapshot rows failed; the snapshot tx may stay open until process exit",
 			slog.String("error", err.Error()),
 		)
+	}
+
+	// ---- 6b. The replay window (Bug 333): the position the copy is
+	// complete at, which bounds the span of the table's changes the
+	// restarted stream must replay idempotently onto it.
+	if err := a.recordReplayWindow(ctx, applier, stream, scoped.Tables[0]); err != nil {
+		return err
 	}
 
 	// ---- 7. MySQL-side filter-flip (ADR-0034): record the new table on
@@ -1433,10 +1452,11 @@ func (a *AddTable) openSnapshotForAdd(ctx context.Context) (string, *ir.Snapshot
 	// Drained (the only mode a VStream source allows since
 	// NO-DRAIN-VSTREAM-SOURCE): the stream was stopped before this add and
 	// resumes from its pre-add persisted position, so it replays every change
-	// the source makes during the copy, in order. A change Vitess replays
-	// INSIDE this keyspace-wide copy (the catch-up before each later table)
-	// that the copy cannot apply in order is therefore left to that stream
-	// instead of failing the add (ir.CopyReplayDeferrer; measured by
+	// the source makes during the copy, idempotently up to the copy's
+	// position ([AddTable.recordReplayWindow], Bug 333). A change Vitess
+	// replays INSIDE this keyspace-wide copy (the catch-up before each later
+	// table) that the copy cannot apply in order is therefore left to that
+	// stream instead of failing the add (ir.CopyReplayDeferrer; measured by
 	// TestStreamer_VStreamAddTableKeyspaceWideCopy's Drained cells). Never in
 	// live mode, whose running stream is past the copy (unreachable since
 	// --no-drain refuses on every source, Bug 332; the guard stays so a

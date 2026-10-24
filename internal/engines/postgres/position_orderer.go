@@ -67,3 +67,52 @@ func (Engine) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
 	}
 	return pLSN >= aLSN, nil
 }
+
+// AddedTableCopyPosition implements [ir.AddedTableReplayWindowSource] for
+// Postgres (Bug 336). The add puts the table in the publication and then
+// creates a temporary slot whose exported snapshot it copies from, so the
+// restarted stream decodes, and replays onto the copy, every change to the
+// table committed between the ALTER PUBLICATION and that snapshot's
+// consistent point (156 ms measured with autocommit writes, up to the commit
+// of any transaction open across the add).
+//
+// A row change's position is its transaction's commit LSN (the BeginMessage
+// FinalLSN the reader stamps on every row). A transaction the snapshot holds
+// committed before the consistent point C, so its commit LSN is < C (or <= C,
+// whichever end of the commit record FinalLSN names); one it does not hold
+// commits at or after C. The bound is therefore C+1: a change is in the
+// window unless its LSN is >= C+1, so every change the copy holds is in it,
+// and the one boundary case either reading leaves ambiguous (a commit LSN of
+// exactly C) is in it too, where the idempotent form is right whatever the
+// target holds. Pinned by TestAddedTableCopyPosition_BoundsTheSnapshot.
+//
+// The position names the STREAM's slot, system and timeline (resumeFrom):
+// the snapshot rode a temporary slot, and [Engine.PositionAtOrAfter] orders
+// positions of one slot only, so a bound in the temporary slot's name would
+// never be passed and the window would never close.
+func (Engine) AddedTableCopyPosition(snapshot, resumeFrom ir.Position) (ir.Position, error) {
+	snap, ok, err := decodePGPos(snapshot)
+	if err != nil {
+		return ir.Position{}, fmt.Errorf("postgres: added-table copy position: decode the snapshot position: %w", err)
+	}
+	if !ok {
+		return ir.Position{}, errors.New("postgres: added-table copy position: the snapshot reported no position")
+	}
+	resume, ok, err := decodePGPos(resumeFrom)
+	if err != nil {
+		return ir.Position{}, fmt.Errorf("postgres: added-table copy position: decode the stream's position: %w", err)
+	}
+	if !ok {
+		return ir.Position{}, errors.New("postgres: added-table copy position: the stream has no position to resume from")
+	}
+	if snap.SystemID != "" && resume.SystemID != "" && snap.SystemID != resume.SystemID {
+		return ir.Position{}, fmt.Errorf("postgres: added-table copy position: the snapshot was taken on system %s and the stream reads system %s",
+			snap.SystemID, resume.SystemID)
+	}
+	lsn, err := pglogrepl.ParseLSN(snap.LSN)
+	if err != nil {
+		return ir.Position{}, fmt.Errorf("postgres: added-table copy position: parse snapshot lsn %q: %w", snap.LSN, err)
+	}
+	resume.LSN = (lsn + 1).String()
+	return encodePGPos(resume)
+}

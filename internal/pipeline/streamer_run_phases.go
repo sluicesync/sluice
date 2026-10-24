@@ -1314,6 +1314,12 @@ func (s *Streamer) phaseWireInterceptChain(applyCtx context.Context, changes <-c
 			// once a later one persists (schema_change_ambiguous_ack.go).
 		}), &s.schemaSnapshotErr)
 	}
+	// Bug 333: the added-table replay window. Downstream of every stage that
+	// filters, moves or forwards a change (the --where row-move, the schema
+	// intercepts), so each of them still sees the change as the source sent
+	// it; upstream of the delay gate and the applier. A verbatim pass-through
+	// when no window is open (added_table_replay_window.go).
+	filtered = interceptAddedTableReplay(applyCtx, filtered, s.replayWindows, &s.replayWindowErr)
 	// Clear the cold-start seed after handing it to BOTH intercepts so
 	// a streamer restart picks up a fresh seed in its next coldStart
 	// run.
@@ -1424,6 +1430,13 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	if dispatchErr == nil {
 		if ukErrPtr := s.uniqueKeyRecheckErr.Load(); ukErrPtr != nil && *ukErrPtr != nil {
 			dispatchErr = *ukErrPtr
+		}
+	}
+	// Bug 333: the added-table replay window refuses an image it cannot
+	// apply idempotently the same way.
+	if dispatchErr == nil {
+		if rwErrPtr := s.replayWindowErr.Load(); rwErrPtr != nil && *rwErrPtr != nil {
+			dispatchErr = *rwErrPtr
 		}
 	}
 	// LIVE-ADDED-TABLE-EXCLUDED (R6-S1): the dispatch filter closes the

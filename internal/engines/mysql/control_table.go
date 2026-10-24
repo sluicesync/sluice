@@ -373,6 +373,7 @@ func controlTableDDL(controlKeyspace string) string {
 	pending_added_tables   ` + tableSetColumnDef + `,
 	established_tables     ` + tableSetColumnDef + `,
 	dropped_tables         ` + tableSetColumnDef + `,
+	added_table_copy_positions ` + tableSetColumnDef + `,
 	PRIMARY KEY (stream_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 }

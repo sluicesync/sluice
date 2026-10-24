@@ -210,6 +210,8 @@ func recoveryFor(column string) string {
 	switch column {
 	case PendingAddedTablesColumn:
 		return recoveryPending
+	case AddedTableCopyPositionsColumn:
+		return recoveryCopyPositions
 	case "live_added_tables":
 		return "clear it with `UPDATE sluice_cdc_state SET live_added_tables = NULL WHERE stream_id = '<stream>'` on the " +
 			"target, then name each added table in --include-table or bring it in again with `sluice schema add-table`"

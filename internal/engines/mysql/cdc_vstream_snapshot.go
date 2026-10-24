@@ -2924,7 +2924,7 @@ func (s *vstreamSnapshotStream) logDeferredReplaysLocked() {
 	sort.Strings(tables)
 	for _, t := range tables {
 		slog.Info("mysql/vstream: snapshot: the copy received changes Vitess replayed inside it and left them to the change stream, "+
-			"which resumes from before the copy and replays them in order",
+			"which resumes from before the copy and replays them idempotently up to the copy's position (ADDED-TABLE-REPLAY-WINDOW)",
 			slog.String("keyspace", s.keyspace),
 			slog.String("table", t),
 			slog.Int("changes", s.deferredReplays[t]))
