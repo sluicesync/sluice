@@ -472,8 +472,23 @@ func (s *Streamer) judgePendingAdds(ctx context.Context, applier ir.ChangeApplie
 				ir.ErrIncludeTableScopeDrift, streamID, p.Malformed, malformedPendingRecovery(streamID))
 		}
 		if !inScope(p.Table) {
-			if p.Abandoned() {
+			switch {
+			case p.Abandoned():
 				clearable = append(clearable, p.Table)
+			case p.Fresh(now):
+				// A running add of a table this stream does not stream yet:
+				// the table joins its scope only when the add records it, at
+				// the end of the copy on a source without a publication, so
+				// a stream let through now would drop every change to it
+				// until then (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED; a
+				// supervisor restart or a fleet reload revives a stopped
+				// stream mid-add exactly like this). Deferred like an
+				// in-scope add in progress; a dead add's entry goes stale
+				// after PendingAddStaleAfter and is ignored here again, as
+				// it always was.
+				e := entry(scopeTable{name: p.Table})
+				e.heartbeatAge = now.Sub(p.HeartbeatAt).Round(time.Second)
+				e.addInProgress = true
 			}
 			continue
 		}
@@ -711,7 +726,8 @@ func (s *Streamer) scopeDriftRefusal(ctx context.Context, streamID string, m *ir
 		return fmt.Errorf("pipeline: warm resume deferred: %w: stream %q has a `sluice schema add-table` still running "+
 			"for %s; it clears its record when the copy is handed to the stream. Start again once it finishes "+
 			"(a supervisor restarts this automatically). If the add-table process is gone, the entry goes stale after "+
-			"%s and this becomes INCLUDE-TABLE-SCOPE-DRIFT",
+			"%s: a table in this stream's scope then refuses INCLUDE-TABLE-SCOPE-DRIFT, and one outside it no longer "+
+			"holds the stream",
 			ir.ErrIncludeTableAddInProgress, streamID, strings.Join(names, ", "), ir.PendingAddStaleAfter)
 	}
 	publication := ""

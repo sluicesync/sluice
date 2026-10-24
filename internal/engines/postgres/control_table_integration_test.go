@@ -147,7 +147,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", "", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", "", "", "", "", 0, false); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -390,7 +390,7 @@ func TestWritePositionTx_RowsAppliedAccumulatesAndBackCompat(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if err := writePositionTx(ctx, tx, "public", streamID, token, "", "", "", "", "", delta); err != nil {
+		if err := writePositionTx(ctx, tx, "public", streamID, token, "", "", "", "", "", delta, false); err != nil {
 			t.Fatalf("writePositionTx: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -455,7 +455,7 @@ func TestWritePositionTx_TargetSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-1", "sluice_a", "", "", "fp-a", "customer_svc", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-1", "sluice_a", "", "", "fp-a", "customer_svc", 0, false); err != nil {
 		t.Fatalf("first writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -480,7 +480,7 @@ func TestWritePositionTx_TargetSchemaRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin 2: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-2", "", "", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-2", "", "", "", "", "", 0, false); err != nil {
 		t.Fatalf("second writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -613,7 +613,7 @@ func TestControlTable_PublicationNameRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin %s: %v", streamID, err)
 		}
-		if err := writePositionTx(ctx, tx, "public", streamID, "tok", "", pub, "", "", "", 0); err != nil {
+		if err := writePositionTx(ctx, tx, "public", streamID, "tok", "", pub, "", "", "", 0, false); err != nil {
 			t.Fatalf("writePositionTx(%s): %v", streamID, err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -633,7 +633,7 @@ func TestControlTable_PublicationNameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin preserve: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "rt-utf8", "tok-2", "", "", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "rt-utf8", "tok-2", "", "", "", "", "", 0, false); err != nil {
 		t.Fatalf("writePositionTx(preserve): %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -754,7 +754,7 @@ func TestControlTable_RowFilterHashRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin %s: %v", streamID, err)
 		}
-		if err := writePositionTx(ctx, tx, "public", streamID, "tok", "", "", hash, "", "", 0); err != nil {
+		if err := writePositionTx(ctx, tx, "public", streamID, "tok", "", "", hash, "", "", 0, false); err != nil {
 			t.Fatalf("writePositionTx(%s): %v", streamID, err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -774,7 +774,7 @@ func TestControlTable_RowFilterHashRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin preserve: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "rt-hash", "tok-2", "", "", "", "", "", 0); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "rt-hash", "tok-2", "", "", "", "", "", 0, false); err != nil {
 		t.Fatalf("writePositionTx(preserve): %v", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -105,6 +105,11 @@ type ChangeApplier struct {
 	// type sluice declares (table_sets_store.go, L2). Set once verified.
 	tableSetColumnsVerified atomic.Bool
 
+	// livenessColumn: the control table has the stream-liveness column, so
+	// every position write stamps it ([ChangeApplier.stampsLiveness]). Set by
+	// [ChangeApplier.EnsureControlTable], which runs before any apply.
+	livenessColumn atomic.Bool
+
 	// isNeki records that this applier's target is a PlanetScale Neki
 	// router, probed once per server at open (neki_probe.go). It gates the
 	// shard-key handling in the UPDATE path (neki_update_shardkey.go) and
@@ -1041,6 +1046,7 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	a.columnOrderEnsureErr = retryOnCatalogRace(ctx, func() error {
 		return ensureColumnOrderTable(ctx, a.db, a.controlSchema)
 	})
+	a.detectLivenessColumn(ctx)
 	if a.applyMarksEnsureErr == nil {
 		if err := ensureNekiControlTablePlacement(ctx, a.db, a.isNeki, a.serverKey, a.controlSchema, []string{
 			applyMarksTableName,
@@ -1306,7 +1312,7 @@ func (a *ChangeApplier) writePositionWith(ctx context.Context, streamID string, 
 	// A bare WritePosition (broker cold-start / schema-delta-only
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
-	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0)
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0, a.stampsLiveness())
 	if err == nil && inTx != nil {
 		err = inTx(posCtx, tx)
 	}
@@ -1583,7 +1589,7 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 	}
 	token := c.Pos().Token
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.stampsLiveness())
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
@@ -1711,7 +1717,7 @@ func (a *ChangeApplier) writeCheckpointTx(ctx context.Context, tx *sql.Tx, strea
 	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
 	defer posCancel()
-	if err := writePositionTx(posCtx, tx, a.controlSchema, streamID, at.Pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, at.RowsApplied); err != nil {
+	if err := writePositionTx(posCtx, tx, a.controlSchema, streamID, at.Pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, at.RowsApplied, a.stampsLiveness()); err != nil {
 		return applymarks.Plan{}, classifyApplierError(fmt.Errorf("postgres: applier: checkpoint position write: %w", err))
 	}
 	return marks, nil
@@ -1892,7 +1898,7 @@ func (a *ChangeApplier) writeOwnPositionTx(ctx context.Context, tx *sql.Tx, stre
 	if skipped {
 		delta = 0
 	}
-	if err := writePositionTx(posCtx, tx, a.controlSchema, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta); err != nil {
+	if err := writePositionTx(posCtx, tx, a.controlSchema, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta, a.stampsLiveness()); err != nil {
 		return applymarks.Plan{}, classifyApplierError(err)
 	}
 	return marks, nil

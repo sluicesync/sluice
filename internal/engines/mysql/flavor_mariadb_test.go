@@ -607,7 +607,7 @@ func TestMariaDBUpsertBuilders_BothSpellings(t *testing.T) {
 	})
 
 	t.Run("writePositionUpsertSQL", func(t *testing.T) {
-		got := writePositionUpsertSQL("", upsertValuesFunc)
+		got := writePositionUpsertSQL("", upsertValuesFunc, false)
 		want := "INSERT INTO `sluice_cdc_state` " +
 			"(stream_id, source_position, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied) " +
 			"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?) ON DUPLICATE KEY UPDATE " +

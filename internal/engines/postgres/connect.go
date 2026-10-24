@@ -8,8 +8,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -212,6 +214,51 @@ func afterConnectSessionPins(ctx context.Context, conn *pgx.Conn) error {
 	}
 	return nil
 }
+
+// applierAfterConnect is the AfterConnect chain of every change-applier pool
+// (the serial pool, the pipelined pool and the concurrent lane pool), one
+// value so the three cannot drift: the session pins, the PostGIS geometry
+// codec, and READ COMMITTED.
+func applierAfterConnect() func(context.Context, *pgx.Conn) error {
+	return composeAfterConnect(afterConnectSessionPins, afterConnectRegisterGeometry, afterConnectApplierReadCommitted)
+}
+
+// afterConnectApplierReadCommitted pins the applier session's default
+// transaction isolation to READ COMMITTED, Postgres's own default, whatever
+// `ALTER DATABASE/ROLE … SET default_transaction_isolation` says. The apply
+// transactions are written for it: the position upsert updates the stream's
+// control row, which the stream's liveness stamp also updates in a separate
+// short transaction, and under REPEATABLE READ or SERIALIZABLE an apply
+// transaction that began before such a stamp fails its upsert with 40001
+// (a serialization failure the applier retries by restarting the attempt).
+// The same holds for `sync stop`'s request on that row. Pinned per session,
+// as synchronous_commit is pinned per transaction.
+//
+// The pin overrides an operator's `ALTER ROLE/DATABASE … SET
+// default_transaction_isolation` for the applier's sessions — deliberately,
+// and not silently: the first applier session of the process that finds
+// another default logs it at INFO, naming the value it overrode.
+func afterConnectApplierReadCommitted(ctx context.Context, conn *pgx.Conn) error {
+	var prev string
+	if err := conn.QueryRow(ctx, "SHOW default_transaction_isolation").Scan(&prev); err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: read default_transaction_isolation: %w", err))
+	}
+	if prev == "read committed" {
+		return nil
+	}
+	if _, err := conn.Exec(ctx, "SET default_transaction_isolation = 'read committed'"); err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: pin default_transaction_isolation: %w", err))
+	}
+	readCommittedOverrideLogged.Do(func() {
+		slog.InfoContext(ctx, "postgres: the applier runs READ COMMITTED, overriding this role's or database's "+
+			"default_transaction_isolation for its own sessions", slog.String("overridden", prev))
+	})
+	return nil
+}
+
+// readCommittedOverrideLogged makes [afterConnectApplierReadCommitted]'s INFO
+// once per process.
+var readCommittedOverrideLogged sync.Once
 
 // composeAfterConnect chains AfterConnect hooks left to right, so call
 // sites that need their own hook (the applier's geometry-codec

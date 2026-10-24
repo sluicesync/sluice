@@ -86,7 +86,7 @@ func TestControlTables_TimestampsAreUTC_UnderANonUTCDatabaseZone(t *testing.T) {
 			if err != nil {
 				t.Fatalf("begin: %v", err)
 			}
-			if err := writePositionTx(ctx, tx, "public", "tz-stream", "tok", "", "", "", "", "", 0); err != nil {
+			if err := writePositionTx(ctx, tx, "public", "tz-stream", "tok", "", "", "", "", "", 0, false); err != nil {
 				t.Fatalf("writePositionTx: %v", err)
 			}
 			if err := tx.Commit(); err != nil {

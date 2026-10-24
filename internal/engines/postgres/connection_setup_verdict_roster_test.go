@@ -41,6 +41,11 @@ var connectionSetupFuncs = map[string]struct {
 		reason: "AfterConnect hook on four pools; the v0.152.1 defect. Its bare NK205 killed a live " +
 			"migration 3m40s into a storage-grow window",
 	},
+	"afterConnectApplierReadCommitted": {
+		mustClassify: true,
+		reason: "AfterConnect hook on the applier's three pools (applierAfterConnect), run after the " +
+			"session pins and the geometry codec on every new applier connection",
+	},
 	"detectPostGIS": {
 		mustClassify: true,
 		reason: "runs inside OpenRowWriter/OpenSchemaWriter three lines after the pool opens; a " +

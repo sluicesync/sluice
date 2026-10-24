@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
 	"time"
 
 	"sluicesync.dev/sluice/internal/appliercontrol"
@@ -99,7 +98,7 @@ func (s *Streamer) startLiveAddedTablesPoll(applyCtx context.Context, applier ir
 // entirely — the existing Ctrl-C / ctx-cancel path remains the only
 // way to stop those streams, which matches their pre-stop-signal
 // behavior.
-func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc, observed *atomic.Bool) {
+func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc, stop *stopSignal) {
 	reader, ok := applier.(stopFlagReader)
 	if !ok {
 		slog.DebugContext(
@@ -112,7 +111,7 @@ func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.Chan
 		applyCtx, "stop-signal poll started",
 		slog.String("stream_id", streamID),
 	)
-	go pollStopSignal(applyCtx, reader, streamID, cancelStream, cancelApply, observed)
+	go pollStopSignal(applyCtx, reader, streamID, cancelStream, cancelApply, stop)
 }
 
 // openApplier returns the applier to use plus a flag indicating
@@ -465,6 +464,12 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 			// (ARCH-4 — this runs on every retry re-establish).
 			return connectHint(fmt.Errorf("pipeline: clear stop signal: %w", err))
 		}
+		// DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED: the attempt stamps that
+		// the stream is running through its own applier, overwriting the
+		// previous run's stopped marker, before it opens its change stream
+		// (stream_liveness.go). It also lets this applier's position writes
+		// stamp on a control table that only now got the column.
+		stampAttemptStart(ctx, applier, streamID)
 	}
 
 	// ---- 2.6. Record the active stream's resolved slot name on the
@@ -1054,8 +1059,8 @@ func (s *Streamer) phasePreflightUpsertKeys(ctx context.Context, applier ir.Chan
 // heartbeat. Returns the live-added filter the dispatch-side change
 // filter merges additively. All three run for the duration of
 // applyCtx and shut down with it.
-func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc, stopObserved *atomic.Bool) *liveAddedFilter {
-	s.startStopSignalPoll(applyCtx, applier, streamID, cancelStream, cancelApply, stopObserved)
+func (s *Streamer) phaseStartApplySidecars(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc, stop *stopSignal) *liveAddedFilter {
+	s.startStopSignalPoll(applyCtx, applier, streamID, cancelStream, cancelApply, stop)
 
 	// ---- 4a. Live-added-tables poll for ADR-0034 (MySQL Phase 2
 	// mid-stream live add-table). The orchestrator's
@@ -1398,7 +1403,7 @@ func (s *Streamer) firstBoundaryWitness() *firstBoundaryWitness {
 // (GitHub issue #19), and clear the stop flag after a stop-signal-
 // driven graceful drain. ctx is the OUTER context — applyCtx may
 // already be cancelled by the time the drain completes.
-func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApplier, streamID string, dispatchErr error, stopObserved *atomic.Bool) error {
+func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApplier, streamID string, dispatchErr error, stop *stopSignal) error {
 	// ADR-0054 Phase 2d: a SchemaSnapshot intercept error short-
 	// circuits the changes channel; the dispatchErr path sees a clean
 	// close. Surface the intercept's stored error here so the
@@ -1438,6 +1443,15 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	// stalled) sync. Reads schemaSnapshotErr itself, so it fires only for a
 	// genuine schema refusal, never a generic apply error.
 	s.observeSchemaDriftForNotify(ctx, streamID)
+	// STOP-DRAIN-HARD-CANCELLED: the drain watchdog cut the apply off. Decided
+	// before the error classification below, because the cut-off apply's
+	// error can classify as retriable (a cancelled statement on a dead
+	// connection), and a retry would clear the stop flag at its start and
+	// keep streaming against the operator's stop.
+	hardCancelled := stop != nil && stop.hardCancelled.Load()
+	if hardCancelled {
+		return s.settleHardCancelledStop(ctx, streamID, dispatchErr)
+	}
 	if dispatchErr != nil {
 		// Bug 57 fix (v0.52.2): a wrapped [ir.RetriableError] containing
 		// context.DeadlineExceeded (from --apply-exec-timeout) MUST
@@ -1481,7 +1495,13 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	// so a CLI `sync stop --wait` polling for completion sees the
 	// cleared flag and returns success. Use the outer ctx because
 	// applyCtx may already be cancelled here.
-	if stopObserved.Load() {
+	if stop != nil && stop.observed.Load() {
+		// The stopped marker goes down BEFORE the flag clears: `sync stop
+		// --wait` returns on the clear, and a drained `schema add-table`
+		// run right after it must find the stop recorded rather than a
+		// running stamp a few seconds old. The Run's stamping ends first, so
+		// no stamp lands after the marker (stream_liveness.go).
+		s.recordDrainedStop(ctx, applier, streamID)
 		if err := applier.ClearStopRequested(ctx, streamID); err != nil {
 			slog.WarnContext(
 				ctx, "failed to clear stop_requested_at after graceful drain; sync stop --wait may time out",

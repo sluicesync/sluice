@@ -120,6 +120,11 @@ type ChangeApplier struct {
 	// (table_sets_store.go, L2). Set once verified.
 	tableSetColumnsVerified atomic.Bool
 
+	// livenessColumn: the control table has the stream-liveness column, so
+	// every position write stamps it ([ChangeApplier.stampsLiveness]). Set by
+	// [ChangeApplier.EnsureControlTable], which runs before any apply.
+	livenessColumn atomic.Bool
+
 	// barrierFoldCommitHookForTest, when non-nil, runs in a lane barrier's
 	// transaction that folds a checkpoint (ADR-0190 amendment E) after the
 	// position is written and before the COMMIT; an error rolls the whole
@@ -964,6 +969,7 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	// RENAME-SWAP-FORWARD: best-effort for the same reason; without it a
 	// column-order change refuses as unprovable (column_order.go).
 	a.columnOrderEnsureErr = ensureColumnOrderTable(ctx, a.db, a.controlKeyspace)
+	a.detectLivenessColumn(ctx)
 	return nil
 }
 
@@ -1189,7 +1195,7 @@ func (a *ChangeApplier) writePositionWith(ctx context.Context, streamID string, 
 	// A bare WritePosition (broker cold-start / schema-delta-only
 	// incremental) applies no row data, so it contributes 0 to the
 	// cumulative rows_applied counter.
-	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0, a.upsert)
+	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, 0, a.upsert, a.stampsLiveness())
 	if err == nil && inTx != nil {
 		err = inTx(posCtx, tx)
 	}
@@ -1429,7 +1435,7 @@ func (a *ChangeApplier) writeCheckpointTx(ctx context.Context, tx *sql.Tx, strea
 	}
 	posCtx, cancel := a.execTimeoutCtx(ctx)
 	defer cancel()
-	if err := writePositionTx(posCtx, tx, a.controlKeyspace, streamID, at.Pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, at.RowsApplied, a.upsert); err != nil {
+	if err := writePositionTx(posCtx, tx, a.controlKeyspace, streamID, at.Pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, at.RowsApplied, a.upsert, a.stampsLiveness()); err != nil {
 		return applymarks.Plan{}, classifyApplierError(fmt.Errorf("mysql: applier: checkpoint position write: %w", err))
 	}
 	return marks, nil
@@ -1655,7 +1661,7 @@ func (a *ChangeApplier) writeOwnPositionTx(ctx context.Context, tx *sql.Tx, stre
 	if skipped {
 		delta = 0
 	}
-	if err := writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta, a.upsert); err != nil {
+	if err := writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, delta, a.upsert, a.stampsLiveness()); err != nil {
 		return applymarks.Plan{}, classifyApplierError(err)
 	}
 	return marks, nil
@@ -1687,7 +1693,7 @@ func (a *ChangeApplier) persistSourceTxCommit(ctx context.Context, streamID stri
 		return applierErrorOrShutdown(ctx, err)
 	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
-	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert)
+	err = writePositionTx(posCtx, tx, a.controlKeyspace, streamID, c.Pos().Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.upsert, a.stampsLiveness())
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()

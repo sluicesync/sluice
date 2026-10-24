@@ -19,7 +19,6 @@ import (
 	"errors"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -99,9 +98,9 @@ func newReshardStreamer(reader ir.ReshardReopener) *Streamer {
 
 func runReshardFollow(t *testing.T, s *Streamer, applier ir.ChangeApplier, first <-chan ir.Change) error {
 	t.Helper()
-	var stopObserved atomic.Bool
+	var stop stopSignal
 	ctx := context.Background()
-	return s.applyWithReshardFollow(ctx, ctx, applier, "sid", first, &liveAddedFilter{}, &stopObserved)
+	return s.applyWithReshardFollow(ctx, ctx, applier, "sid", first, &liveAddedFilter{}, &stop)
 }
 
 func TestApplyWithReshardFollow_FollowsReshardExactlyOnce(t *testing.T) {

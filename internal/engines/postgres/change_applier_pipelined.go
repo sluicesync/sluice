@@ -230,7 +230,7 @@ func (a *ChangeApplier) pipelinePool() (*sql.DB, error) {
 	// being TEXT-refused (see [afterConnectRegisterGeometry]); a no-op when
 	// PostGIS isn't installed on the target.
 	db, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID,
-		stdlib.OptionAfterConnect(composeAfterConnect(afterConnectSessionPins, afterConnectRegisterGeometry)))
+		stdlib.OptionAfterConnect(applierAfterConnect()))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: applier: open pipelined pool: %w", err)
 	}
@@ -459,7 +459,7 @@ func (a *ChangeApplier) conflictKeyForPipelined(ctx context.Context, schema, tab
 // semantics are byte-identical to the serial writePositionTx). It is the
 // last statement queued before the SendBatch flush in flushAndCommit.
 func (a *ChangeApplier) writePositionPipelined(b *pgxBatchTx, streamID, token string, rowsApplied int64) {
-	stmt, args := buildWritePositionSQL(a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied)
+	stmt, args := buildWritePositionSQL(a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.stampsLiveness())
 	b.queue(stmt, args, queuedStmt{schema: a.controlSchema, table: controlTableName, kind: "position"})
 }
 

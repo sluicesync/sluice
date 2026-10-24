@@ -541,7 +541,7 @@ func (la *laneApplierAdapter) execFold(ctx context.Context, tx *sql.Tx, txMarks 
 	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
 	defer posCancel()
-	if err := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, fold.Pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, fold.RowsApplied); err != nil {
+	if err := writePositionTx(posCtx, tx, a.controlSchema, la.streamID, fold.Pos.Token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, fold.RowsApplied, a.stampsLiveness()); err != nil {
 		return fmt.Errorf("postgres: applier: fold position write: %w", err)
 	}
 	return nil
@@ -767,7 +767,7 @@ func (a *ChangeApplier) applyBatchConcurrent(ctx context.Context, streamID strin
 	// on the lane path while passing on the serial path: a Bug-74-class
 	// codec-coverage trap. Same role + DSN as those pools.
 	laneDB, err := openPgxDBDescribeExec(a.pipelineCfg.dsn, roleApplier, a.pipelineCfg.appID,
-		stdlib.OptionAfterConnect(composeAfterConnect(afterConnectSessionPins, afterConnectRegisterGeometry)))
+		stdlib.OptionAfterConnect(applierAfterConnect()))
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: open concurrent lane pool: %w", err))
 	}

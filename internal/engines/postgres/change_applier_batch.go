@@ -250,7 +250,7 @@ func (a *ChangeApplier) batchConfig() *appliershared.BatchConfig {
 			}
 			posCtx, posCancel := a.execTimeoutCtx(ctx)
 			defer posCancel()
-			if err := writePositionTx(posCtx, s.tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied); err != nil {
+			if err := writePositionTx(posCtx, s.tx, a.controlSchema, streamID, token, a.slotName, a.publicationName, a.rowFilterHash, a.sourceFingerprint, a.targetSchema, rowsApplied, a.stampsLiveness()); err != nil {
 				return err
 			}
 			// H-4: the shared loop calls WritePosition at exactly the

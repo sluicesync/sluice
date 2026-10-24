@@ -6,8 +6,10 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -101,10 +103,106 @@ func TestAddTableRefusesUnknownStream(t *testing.T) {
 	}
 }
 
+// TestAddTableRefusesRunningStream is DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED:
+// a drained add-table refuses a stream whose liveness stamp is fresh (and
+// one whose liveness cannot be read or was never recorded) before it
+// changes anything — on --dry-run too, which reports what a real run would
+// do — and passes only a recorded stop or no row: a stamp of any age refuses.
+func TestAddTableRefusesRunningStream(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name   string
+		l      ir.StreamLiveness
+		err    error
+		refuse bool
+	}{
+		{name: "fresh stamp", l: ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now.Add(-2 * time.Second), Now: now}, refuse: true},
+		{name: "unreadable", err: errors.New("connection reset by peer"), refuse: true},
+		{name: "never recorded", l: ir.StreamLiveness{Found: true, Now: now}, refuse: true},
+		{name: "recorded stop", l: ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}},
+		{name: "hour-old stamp (a crash, or an idle stream)", l: ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now.Add(-time.Hour), Now: now}, refuse: true},
+		{name: "no row", l: ir.StreamLiveness{}},
+	}
+	for _, tc := range cases {
+		for _, dry := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/dry-run=%v", tc.name, dry), func(t *testing.T) {
+				src := newAddTableSourceEngine("source")
+				src.schema = &ir.Schema{Tables: []*ir.Table{
+					{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+				}}
+				tgt := newAddTableTargetEngine("target")
+				tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+				tgt.applier.liveness, tgt.applier.livenessErr = tc.l, tc.err
+				err := (&AddTable{
+					Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt",
+					StreamID: "live", TableName: "new_table", DryRun: dry,
+				}).Run(context.Background())
+				if !tc.refuse {
+					if err != nil {
+						t.Fatalf("want the add to run, got %v", err)
+					}
+					return
+				}
+				if !errors.Is(err, errStreamNotStopped) || !strings.Contains(err.Error(), "sluice sync stop --wait --stream-id live") {
+					t.Fatalf("want the %s refusal naming the stop, got %v", DrainedAddTableStreamNotStoppedMarker, err)
+				}
+				if len(tgt.phaseLog) != 0 || src.snapshotCalls != 0 || tgt.openRowWriterCalls != 0 {
+					t.Fatalf("the refused add changed something: phases %v, snapshots %d, row writers %d",
+						tgt.phaseLog, src.snapshotCalls, tgt.openRowWriterCalls)
+				}
+			})
+		}
+	}
+	t.Run("a stream that starts after the first read is caught by the recheck", func(t *testing.T) {
+		src := newAddTableSourceEngine("source")
+		src.schema = &ir.Schema{Tables: []*ir.Table{
+			{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		}}
+		tgt := newAddTableTargetEngine("target")
+		tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+		tgt.applier.liveness = ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}
+		tgt.applier.livenessAfter = &ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now, Now: now}
+		err := (&AddTable{
+			Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt",
+			StreamID: "live", TableName: "new_table",
+		}).Run(context.Background())
+		if !errors.Is(err, errStreamNotStopped) {
+			t.Fatalf("want the %s refusal from the recheck, got %v", DrainedAddTableStreamNotStoppedMarker, err)
+		}
+		if tgt.applier.livenessReads != 2 || len(tgt.phaseLog) != 0 || src.snapshotCalls != 0 {
+			t.Fatalf("reads %d (want 2: the preflight and the recheck), phases %v, snapshots %d",
+				tgt.applier.livenessReads, tgt.phaseLog, src.snapshotCalls)
+		}
+	})
+	// --no-drain refuses on every source (Bug 332) before the door is
+	// reached, so it never reads the record; a recorded stop does not let
+	// it through.
+	t.Run("--no-drain refuses before it is consulted", func(t *testing.T) {
+		src := newAddTableSourceEngine("source")
+		src.schema = &ir.Schema{Tables: []*ir.Table{
+			{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		}}
+		tgt := newAddTableTargetEngine("target")
+		tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+		tgt.applier.liveness = ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}
+		err := (&AddTable{
+			Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt",
+			StreamID: "live", TableName: "new_table", LiveMode: true,
+		}).Run(context.Background())
+		if err == nil || errors.Is(err, errStreamNotStopped) || !strings.Contains(err.Error(), "--no-drain") {
+			t.Fatalf("want the --no-drain refusal, got %v", err)
+		}
+		if tgt.applier.livenessReads != 0 || len(tgt.phaseLog) != 0 || src.snapshotCalls != 0 {
+			t.Fatalf("reads %d, phases %v, snapshots %d; want none", tgt.applier.livenessReads, tgt.phaseLog, src.snapshotCalls)
+		}
+	})
+}
+
 // TestAddTableRefusesActiveStream confirms add-table refuses when
 // the stream's stop_requested_at is set — operator should run `sync
 // stop --wait` and let it complete (which clears the flag) before
-// invoking add-table.
+// invoking add-table. (Despite its name, a stream that is merely
+// running is TestAddTableRefusesRunningStream's case.)
 func TestAddTableRefusesActiveStream(t *testing.T) {
 	src := newAddTableSourceEngine("source")
 	src.schema = &ir.Schema{Tables: []*ir.Table{
@@ -658,6 +756,14 @@ type fakeApplier struct {
 	streams       []ir.StreamStatus
 	stopRequested bool
 
+	// liveness / livenessErr / livenessAfter drive ReadStreamLiveness
+	// (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED); livenessReads counts
+	// the reads.
+	liveness      ir.StreamLiveness
+	livenessErr   error
+	livenessAfter *ir.StreamLiveness
+	livenessReads int
+
 	// targetSchemaCalls captures the value the orchestrator passed to
 	// SetSchema (Bug 46) so tests assert the resolved namespace
 	// reached the applier post-resolution.
@@ -702,6 +808,26 @@ func (f *fakeApplier) ReadStopRequested(_ context.Context, _ string) (bool, erro
 
 func (f *fakeApplier) ClearStopRequested(context.Context, string) error {
 	panic("fakeApplier.ClearStopRequested called — add-table should not clear flags")
+}
+
+// ReadStreamLiveness implements [ir.StreamLivenessStore] from the
+// liveness / livenessErr fields; the zero value is "no control row",
+// which a drained add passes. livenessAfter, when set, is returned from
+// the second read on (the recheck after the pending entry is written).
+func (f *fakeApplier) ReadStreamLiveness(context.Context, string) (ir.StreamLiveness, error) {
+	f.livenessReads++
+	if f.livenessAfter != nil && f.livenessReads > 1 {
+		return *f.livenessAfter, nil
+	}
+	return f.liveness, f.livenessErr
+}
+
+func (f *fakeApplier) StampStreamAlive(context.Context, string) (bool, error) {
+	panic("fakeApplier.StampStreamAlive called — add-table must not stamp a stream's liveness")
+}
+
+func (f *fakeApplier) RecordStreamStopped(context.Context, string) error {
+	panic("fakeApplier.RecordStreamStopped called — add-table must not stamp a stream's liveness")
 }
 
 // recordingRowWriterEmpty extends recordingRowWriter with a

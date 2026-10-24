@@ -63,7 +63,10 @@ func ensuredCDCStateColumns(t *testing.T) map[string]bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	constants := map[string]string{"appliershared.UnforwardedRefusalColumn": appliershared.UnforwardedRefusalColumn}
+	constants := map[string]string{
+		"appliershared.UnforwardedRefusalColumn": appliershared.UnforwardedRefusalColumn,
+		"appliershared.StreamLivenessColumn":     appliershared.StreamLivenessColumn,
+	}
 	addColumn := regexp.MustCompile(`ADD COLUMN ([a-z_]+) `)
 	fset := token.NewFileSet()
 	out := map[string]bool{}

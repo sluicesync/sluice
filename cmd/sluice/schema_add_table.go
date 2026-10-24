@@ -39,11 +39,13 @@ import (
 // mirroring the friction tier of `--reset-target-data`.
 //
 // Phase 1 (default) is intentionally narrow: one table per invocation,
-// the stream must be drained first, and the source/target must be the
-// same engine pair the active stream uses. Phase 2 (`--no-drain`, ADR-0030)
-// lifted the drain precondition and is WITHDRAWN on every source: each live
-// path lost the changes made to the table during the add, the Postgres one
-// last (Bug 332). The flag stays and refuses (NO-DRAIN-POSTGRES-SOURCE,
+// the stream must be drained first (and the add checks that it is: it
+// refuses DRAINED-ADD-TABLE-STREAM-NOT-STOPPED unless the stream's control
+// row records a stop), and the source/target must be the same engine pair
+// the active stream uses. Phase 2 (`--no-drain`, ADR-0030) lifted the drain
+// precondition and is WITHDRAWN on every source: each live path lost the
+// changes made to the table during the add, the Postgres one last (Bug
+// 332). The flag stays and refuses (NO-DRAIN-POSTGRES-SOURCE,
 // NO-DRAIN-BINLOG-SOURCE, NO-DRAIN-VSTREAM-SOURCE). See
 // `docs/dev/design/mid-stream-add-table.md` and ADR-0030.
 type SchemaAddTableCmd struct {

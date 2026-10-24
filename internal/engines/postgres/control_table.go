@@ -109,6 +109,7 @@ func cdcStateTable(schema string) controlTable {
 			source_position   TEXT         NOT NULL,
 			updated_at        TIMESTAMP    NOT NULL DEFAULT (` + utcNowSQL + `),
 			stop_requested_at TIMESTAMP    NULL,
+			stream_alive_ms   BIGINT       NULL,
 			PRIMARY KEY (stream_id)
 		)`,
 		columns: []controlColumn{
@@ -146,7 +147,7 @@ func cdcStateTable(schema string) controlTable {
 			// the change. NULL == "no refusal recorded".
 			unforwardedRefusalColumn,
 		},
-		firstWrite: firstWriteCDCStateColumns(),
+		firstWrite: append(firstWriteCDCStateColumns(), streamLivenessColumn),
 	}
 }
 
@@ -658,8 +659,12 @@ func isUndefinedColumnErr(err error) bool {
 // cross-shard commit; what IS pinned is the order itself, on every
 // Postgres core, by TestWriteCoreStatementOrder, so the premise is the
 // only thing left to establish.
-func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64) error {
-	q, args := buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied)
+//
+// stampAlive also stamps the stream's liveness column in the same statement
+// ([buildWritePositionSQL]); every caller passes the applier's
+// [ChangeApplier.stampsLiveness] (TestPositionWritesStampLiveness).
+func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64, stampAlive bool) error {
+	q, args := buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied, stampAlive)
 	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 		// NK306 on the position write is the measured shape of the
 		// control-table half of NEKI-NK306 (the serial lane's data INSERT
@@ -682,10 +687,24 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 // existing row already carries — so a chain-handoff position-write that
 // lacks streamer context doesn't clobber the streamer's previously-
 // recorded values.
-func buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64) (stmt string, args []any) {
+//
+// stampAlive adds the stream's liveness stamp (the server's clock in Unix ms,
+// [appliershared.StreamLivenessColumn]) to the same upsert: a stream that
+// advances its position is running, and the stamp riding the position write
+// is what keeps a drained add-table from passing while the stream applies,
+// whatever happens to the Run's own stamping goroutine. It overwrites a stopped
+// marker, as the run's first stamp does. False only when the control table
+// has no such column (a role that could not add it).
+func buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64, stampAlive bool) (stmt string, args []any) {
 	tableRef := controlTableRef(schema)
-	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES ($1, $2, " + utcNowSQL + ", NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8) " +
+	aliveCol, aliveVal, aliveSet := "", "", ""
+	if stampAlive {
+		aliveCol = ", " + appliershared.StreamLivenessColumn
+		aliveVal = ", " + pgNowMillisExpr
+		aliveSet = ", " + appliershared.StreamLivenessColumn + " = EXCLUDED." + appliershared.StreamLivenessColumn
+	}
+	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied" + aliveCol + ") " +
+		"VALUES ($1, $2, " + utcNowSQL + ", NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8" + aliveVal + ") " +
 		"ON CONFLICT (stream_id) DO UPDATE SET " +
 		"source_position = EXCLUDED.source_position, " +
 		"updated_at = EXCLUDED.updated_at, " +
@@ -698,7 +717,7 @@ func buildWritePositionSQL(schema, streamID, token, slotName, publicationName, r
 		// count (COALESCE guards a legacy NULL row, though NOT NULL DEFAULT 0
 		// means the column is never NULL post-migration). EXCLUDED.rows_applied
 		// is the $8 delta, NOT a replacement value.
-		"rows_applied = COALESCE(" + tableRef + ".rows_applied, 0) + EXCLUDED.rows_applied"
+		"rows_applied = COALESCE(" + tableRef + ".rows_applied, 0) + EXCLUDED.rows_applied" + aliveSet
 	return q, []any{streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied}
 }
 

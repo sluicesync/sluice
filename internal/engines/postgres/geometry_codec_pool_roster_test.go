@@ -147,6 +147,22 @@ func TestPGPoolRoster_GeometryCodecRegistration(t *testing.T) {
 	type tally struct{ total, registering int }
 	found := map[string]*tally{}
 
+	// The applier's three pools pass applierAfterConnect(), the one chain
+	// they share; it counts as registering only while its own body still
+	// names the geometry hook (resolved here, not assumed).
+	applierChainRegisters := false
+	forEachPackageFunc(t, func(fnName string, body *ast.BlockStmt) {
+		if fnName != "applierAfterConnect" {
+			return
+		}
+		ast.Inspect(body, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && id.Name == "afterConnectRegisterGeometry" {
+				applierChainRegisters = true
+			}
+			return true
+		})
+	})
+
 	forEachPackageFunc(t, func(fnName string, body *ast.BlockStmt) {
 		ast.Inspect(body, func(n ast.Node) bool {
 			call, isCall := n.(*ast.CallExpr)
@@ -163,7 +179,8 @@ func TestPGPoolRoster_GeometryCodecRegistration(t *testing.T) {
 				found[fnName] = tl
 			}
 			tl.total++
-			if callMentionsIdent(call, "afterConnectRegisterGeometry") {
+			if callMentionsIdent(call, "afterConnectRegisterGeometry") ||
+				(applierChainRegisters && callMentionsIdent(call, "applierAfterConnect")) {
 				tl.registering++
 			}
 			return true
