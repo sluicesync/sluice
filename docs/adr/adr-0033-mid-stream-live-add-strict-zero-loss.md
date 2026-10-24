@@ -2,7 +2,7 @@
 
 ## Status
 
-**RESOLVED — superseded by [ADR-0036](adr-0036-mid-stream-loss-surface-characterization.md); strict-zero-loss SHIPPED v0.32.0.**
+**RESOLVED — superseded by [ADR-0036](adr-0036-mid-stream-loss-surface-characterization.md); strict-zero-loss SHIPPED v0.32.0 (a claim that was false — see the 2026-10-23 correction below; the path is withdrawn in v0.163.10).**
 Phase A here empirically falsified Path A (slot-pause) — that finding
 stands, permanently, and the verification test
 (`internal/engines/postgres/slot_pause_verify_integration_test.go`)
