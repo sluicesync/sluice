@@ -1237,33 +1237,65 @@ func (a *AddTable) recheckStreamStoppedAfterPending(ctx context.Context, applier
 // half. The add then fails like any failed add (its pending entry is aged
 // out, and on a Postgres source the publication add this run made is taken
 // back).
+//
+// One case waits instead of refusing at once: the position has not moved and
+// the record reads running. A start that a supervisor or fleet reload makes
+// while the add copies stamps running, defers (INCLUDE-TABLE-ADD-IN-PROGRESS)
+// and on its way out puts the stop back ([runLiveness]); a check landing in
+// that window would refuse an add whose copy is good. So it re-reads for up
+// to [postCopyStopGrace], still passing only on the stopped marker with the
+// position unmoved — a stream that really runs keeps its stamp (or moves its
+// position) and is refused when the grace runs out.
 func (a *AddTable) refuseStreamRanDuringAdd(ctx context.Context, applier ir.ChangeApplier) error {
 	store, ok := applier.(ir.StreamLivenessStore)
 	if !ok {
 		return nil // refused at the preflight already
 	}
-	l, err := store.ReadStreamLiveness(ctx, a.StreamID)
-	var pos ir.Position
-	var found bool
-	if err == nil {
-		pos, found, err = applier.ReadPosition(ctx, a.StreamID)
+	read := func() (ir.StreamLiveness, bool, error) {
+		l, err := store.ReadStreamLiveness(ctx, a.StreamID)
+		if err != nil {
+			return l, false, err
+		}
+		pos, found, err := applier.ReadPosition(ctx, a.StreamID)
+		moved := found != a.positionAtStart.found || pos.Token != a.positionAtStart.token
+		return l, moved, err
+	}
+	l, moved, err := read()
+	for deadline := time.Now().Add(postCopyStopGrace); err == nil && !moved && l.Found && !l.Stopped && time.Now().Before(deadline); {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(postCopyStopPoll):
+		}
+		l, moved, err = read()
 	}
 	if err != nil {
 		return fmt.Errorf("pipeline: add-table: %w: could not read whether stream %q ran during the add (%w); %s",
 			errStreamNotStopped, a.StreamID, err, a.notHandedOver())
 	}
-	moved := found != a.positionAtStart.found || pos.Token != a.positionAtStart.token
-	if (!l.Found || l.Stopped) && !moved {
+	if l.Stopped && !moved {
 		return nil
 	}
 	what := "its position moved during the add"
-	if !moved {
+	switch {
+	case moved:
+	case !l.Found:
+		what = "its control row disappeared during the add"
+	default:
 		what = "it recorded that it was running during the add"
 	}
 	return fmt.Errorf("pipeline: add-table: %w: stream %q ran while the table was being copied (%s), so it may have "+
 		"applied and dropped changes to %q that the copy did not hold; %s",
 		errStreamNotStopped, a.StreamID, what, a.TableName, a.notHandedOver())
 }
+
+// postCopyStopGrace and postCopyStopPoll bound
+// [AddTable.refuseStreamRanDuringAdd]'s wait for a deferring start to put
+// the stop back. Variables only so tests can shorten them.
+var (
+	postCopyStopGrace = 30 * time.Second
+	postCopyStopPoll  = time.Second
+)
 
 // notHandedOver is the last check's remedy, which depends on whether the
 // table had already joined the stream's scope: on a source with a

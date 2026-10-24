@@ -512,9 +512,9 @@ func TestStreamer_AddTableDrainedLivenessFromPositionWrites_Binlog(t *testing.T)
 // TestStreamer_AddTableDrainedCrashRemedy_Binlog: a stream that crashed
 // records no stop (simulated: a running stamp an hour old over a stopped
 // stream), and the drained add refuses it however old the stamp; the remedy
-// it names records the stop. Both halves of the remedy are measured: a start
-// that fails after reaching the target records the stop as it exits, and so
-// does a start followed by `sync stop --wait`, after which the add passes.
+// it names records the stop: a start followed by `sync stop --wait`, after
+// which the add passes. A start that fails before it streams does not record
+// it (it does not own the record), and the add keeps refusing.
 func TestStreamer_AddTableDrainedCrashRemedy_Binlog(t *testing.T) {
 	srcDSN, tgtDSN, eng, filter, cleanup := drainHBRig(t)
 	defer cleanup()
@@ -542,14 +542,19 @@ func TestStreamer_AddTableDrainedCrashRemedy_Binlog(t *testing.T) {
 		t.Errorf("the refused add left orders on the target (%d rows)", len(rows))
 	}
 
-	// A start that reaches the target and then fails (its source refuses the
-	// connection) records the stop as it exits.
+	// A start that fails before it streams (its source refuses the connection)
+	// does NOT record the stop: it never ran the stream, and over a crashed
+	// stream's stamp it cannot tell that stamp from a running stream's (the
+	// fix-aimed review of c421369a, HIGH). The add keeps refusing.
 	refused := mk("root:rootpw@tcp(127.0.0.1:1)/source_db?timeout=5s")
 	if err := refused.Run(context.Background()); err == nil {
 		t.Fatal("RIG: a start against an unreachable source succeeded")
 	}
-	if got := drainHBControl(t, tgtDSN, streamID, "stream_alive_ms"); got != "0" {
-		t.Fatalf("after a start that failed past the target, the record is %q; want the stopped marker", got)
+	if got := drainHBControl(t, tgtDSN, streamID, "stream_alive_ms"); got == "0" || got == "" {
+		t.Fatalf("after a start that failed before streaming, the record is %q; want the crashed stream's running stamp kept", got)
+	}
+	if err := add(); !errors.Is(err, errStreamNotStopped) {
+		t.Fatalf("a drained add after a start that failed before streaming: %v; want the %s refusal", err, DrainedAddTableStreamNotStoppedMarker)
 	}
 
 	// The remedy as the refusal states it: start, then `sync stop --wait`.
@@ -562,5 +567,64 @@ func TestStreamer_AddTableDrainedCrashRemedy_Binlog(t *testing.T) {
 	}
 	if err := add(); err != nil {
 		t.Fatalf("the drained add after the remedy: %v", err)
+	}
+}
+
+// TestStreamer_SecondStartNeverRecordsAStopOverARunningStream_Binlog is the
+// fix-aimed review of c421369a, HIGH: with stream A running, a second `sync
+// start` of the same stream id that fails before it streams must leave A's
+// running record alone. Two such starts: one refused at the stream-id
+// collision door (its source DSN names a different database, so its
+// fingerprint differs from the one A recorded), one whose source refuses the
+// connection. Before the fix each wrote the stopped marker on its way out,
+// and a drained add then passed its checks against the running stream. Now
+// the record still says running and the add refuses before it writes
+// anything.
+func TestStreamer_SecondStartNeverRecordsAStopOverARunningStream_Binlog(t *testing.T) {
+	srcDSN, tgtDSN, eng, filter, cleanup := drainHBRig(t)
+	defer cleanup()
+	const streamID = "second-start"
+	applyDDLMySQL(t, srcDSN, "CREATE DATABASE other_db; CREATE TABLE other_db.users (id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB;")
+	otherDSN, err := buildMySQLDSN(srcDSN, "other_db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(src string) *Streamer {
+		return &Streamer{Source: eng, Target: eng, SourceDSN: src, TargetDSN: tgtDSN, StreamID: streamID, Filter: filter}
+	}
+	a := startTWFBRun(mk(srcDSN))
+	defer func() { _ = a.stop(t) }()
+	(twfbCell{tgt: twfbDB{engine: "mysql", dsn: tgtDSN}, streamID: streamID}).waitStreaming(t, a)
+	drainHBWaitStamped(t, tgtDSN, streamID)
+
+	for _, b := range []struct {
+		name, src, want string
+	}{
+		{name: "refused at the stream-id collision door", src: otherDSN, want: "fingerprint"},
+		{name: "source unreachable", src: "root:rootpw@tcp(127.0.0.1:1)/source_db?timeout=5s"},
+	} {
+		err := mk(b.src).Run(context.Background())
+		if err == nil {
+			t.Fatalf("RIG: the second start (%s) succeeded", b.name)
+		}
+		if b.want != "" && !strings.Contains(strings.ToLower(err.Error()), b.want) {
+			t.Fatalf("RIG: the second start (%s) failed with %v; want the %s refusal", b.name, err, b.want)
+		}
+		if got := drainHBControl(t, tgtDSN, streamID, "stream_alive_ms"); got == "0" || got == "" {
+			t.Fatalf("after a second start (%s) the running stream's record is %q; want its running stamp kept", b.name, got)
+		}
+		if a.exited() {
+			t.Fatalf("RIG: stream A exited: %v", a.err)
+		}
+	}
+
+	err = (&AddTable{Source: eng, Target: eng, SourceDSN: srcDSN, TargetDSN: tgtDSN, StreamID: streamID, TableName: "orders"}).
+		Run(context.Background())
+	if !errors.Is(err, errStreamNotStopped) || !strings.Contains(err.Error(), "has not recorded that it stopped") {
+		t.Fatalf("a drained add against the running stream after two failed second starts: %v; want the %s refusal at its first check",
+			err, DrainedAddTableStreamNotStoppedMarker)
+	}
+	if rows := drainHBRows(t, tgtDSN, "orders"); rows != nil {
+		t.Errorf("the refused add left orders on the target (%d rows)", len(rows))
 	}
 }

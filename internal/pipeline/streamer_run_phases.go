@@ -468,8 +468,11 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 		// the stream is running through its own applier, overwriting the
 		// previous run's stopped marker, before it opens its change stream
 		// (stream_liveness.go). It also lets this applier's position writes
-		// stamp on a control table that only now got the column.
-		stampAttemptStart(ctx, applier, streamID)
+		// stamp on a control table that only now got the column. A failure
+		// over a recorded stop fails the attempt (stampAttemptStart).
+		if err := s.stampAttemptStart(ctx, applier, streamID); err != nil {
+			return connectHint(err)
+		}
 	}
 
 	// ---- 2.6. Record the active stream's resolved slot name on the
@@ -1450,7 +1453,7 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	// keep streaming against the operator's stop.
 	hardCancelled := stop != nil && stop.hardCancelled.Load()
 	if hardCancelled {
-		return s.settleHardCancelledStop(ctx, streamID, dispatchErr)
+		return s.settleUndrainedStop(ctx, streamID, dispatchErr)
 	}
 	if dispatchErr != nil {
 		// Bug 57 fix (v0.52.2): a wrapped [ir.RetriableError] containing

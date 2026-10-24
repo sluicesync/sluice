@@ -30,7 +30,7 @@ func TestJudgeStreamStopped(t *testing.T) {
 		readErr error
 		refuse  string // "" = passes
 	}{
-		{name: "no control row: a new stream passes", l: ir.StreamLiveness{}},
+		{name: "no control row refuses (every caller saw the row first)", l: ir.StreamLiveness{}, refuse: "control row is gone"},
 		{name: "a recorded stop passes", l: ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}},
 		{name: "a fresh stamp refuses", l: alive(3 * time.Second), refuse: "has not recorded that it stopped"},
 		{name: "an hour-old stamp refuses (a crash, or an idle stream)", l: alive(time.Hour), refuse: "has not recorded that it stopped"},
@@ -58,7 +58,7 @@ func TestJudgeStreamStopped(t *testing.T) {
 					t.Errorf("refusal %q does not contain %q", err, want)
 				}
 			}
-			if tc.readErr == nil && !strings.Contains(err.Error(), "`sluice sync start` with the same --stream-id") {
+			if tc.readErr == nil && tc.l.Found && !strings.Contains(err.Error(), "`sluice sync start` with the same --stream-id") {
 				t.Errorf("refusal %q does not give the crashed stream's remedy (start, then stop)", err)
 			}
 			if !errors.Is(err, errStreamNotStopped) {
@@ -71,28 +71,79 @@ func TestJudgeStreamStopped(t *testing.T) {
 	}
 }
 
-// fakeLivenessStore records the liveness calls a Streamer makes.
+// fakeLivenessStore models one control row's liveness column: value is what
+// it holds (0 = the stopped marker, the zero value: a stream that last
+// stopped cleanly), null a row no stamping release has touched. Stamps
+// write a strictly increasing clock and report what they replaced, and the
+// restore is a real compare-and-set, so ownership is exercised, not assumed.
 type fakeLivenessStore struct {
-	mu    sync.Mutex
-	calls []string // "stamp" / "stop"
+	mu       sync.Mutex
+	calls    []string // "stamp" / "stamp-failed" / "stop" / "restore" / "restore-refused"
+	value    int64
+	null     bool
+	clock    int64
+	stampErr error
+	readErr  error
 }
 
-func (f *fakeLivenessStore) StampStreamAlive(context.Context, string) (bool, error) {
+var _ ir.StreamLivenessStore = (*fakeLivenessStore)(nil)
+
+func (f *fakeLivenessStore) StampStreamAlive(context.Context, string) (ir.StreamStamp, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.stampErr != nil {
+		f.calls = append(f.calls, "stamp-failed")
+		return ir.StreamStamp{}, f.stampErr
+	}
 	f.calls = append(f.calls, "stamp")
-	return true, nil
+	f.clock = max(f.clock, f.value) + 1
+	st := ir.StreamStamp{Stamped: true, AliveMillis: f.clock, ReplacedNull: f.null, ReplacedMillis: f.value}
+	f.value, f.null = f.clock, false
+	return st, nil
+}
+
+// otherRunStamps is a stamp or position write by some other run.
+func (f *fakeLivenessStore) otherRunStamps() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clock = max(f.clock, f.value) + 1
+	f.value, f.null = f.clock, false
 }
 
 func (f *fakeLivenessStore) RecordStreamStopped(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, "stop")
+	f.value, f.null = 0, false
 	return nil
 }
 
+func (f *fakeLivenessStore) RestoreStreamStopped(_ context.Context, _ string, st ir.StreamStamp) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if st.Stamped && !f.null && f.value == st.AliveMillis {
+		f.calls = append(f.calls, "restore")
+		f.value = 0
+		return true, nil
+	}
+	f.calls = append(f.calls, "restore-refused")
+	return false, nil
+}
+
 func (f *fakeLivenessStore) ReadStreamLiveness(context.Context, string) (ir.StreamLiveness, error) {
-	panic("a stream does not read its own liveness")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readErr != nil {
+		return ir.StreamLiveness{}, f.readErr
+	}
+	return ir.StreamLiveness{Found: true, Recorded: !f.null, Stopped: !f.null && f.value == 0}, nil
+}
+
+// stopped reports whether the row holds the stopped marker.
+func (f *fakeLivenessStore) stopped() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.null && f.value == 0
 }
 
 func (f *fakeLivenessStore) snapshot() []string {
@@ -210,10 +261,15 @@ func (a livenessDriftApplier) ReadStreamLiveness(context.Context, string) (ir.St
 	return a.liveness, nil
 }
 
-func (livenessDriftApplier) StampStreamAlive(context.Context, string) (bool, error) {
-	return true, nil
+func (livenessDriftApplier) StampStreamAlive(context.Context, string) (ir.StreamStamp, error) {
+	return ir.StreamStamp{Stamped: true}, nil
 }
 func (livenessDriftApplier) RecordStreamStopped(context.Context, string) error { return nil }
+func (livenessDriftApplier) RestoreStreamStopped(context.Context, string, ir.StreamStamp) (bool, error) {
+	return false, nil
+}
+
+var _ ir.StreamLivenessStore = livenessDriftApplier{}
 
 // TestAddTableRecheckAfterPending is the race half: a stream that started
 // between the add's first read and its pending entry has stamped by the
@@ -319,12 +375,14 @@ func (a positionApplier) ReadPosition(context.Context, string) (ir.Position, boo
 // the position, so a stream that applied during the add and then stopped
 // cleanly — leaving the stopped marker — is caught by the position.
 func TestAddTableRefusesAStreamThatRanDuringTheAdd(t *testing.T) {
+	withPostCopyStopGrace(t, 200*time.Millisecond, 10*time.Millisecond)
 	now := time.Now()
 	stopped := ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}
 	running := ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now, Now: now}
 	start := streamPositionMark{token: "pos-1", found: true}
 	cases := []struct {
 		name   string
+		later  *ir.StreamLiveness // from the second read on
 		end    ir.StreamLiveness
 		pos    ir.Position
 		found  bool
@@ -336,13 +394,17 @@ func TestAddTableRefusesAStreamThatRanDuringTheAdd(t *testing.T) {
 		{name: "applied, then stopped cleanly: position moved", end: stopped, pos: ir.Position{Token: "pos-2"}, found: true, refuse: "position moved"},
 		{name: "running at the end, position unchanged", end: running, pos: ir.Position{Token: "pos-1"}, found: true, refuse: "recorded that it was running"},
 		{name: "running and moved", end: running, pos: ir.Position{Token: "pos-2"}, found: true, refuse: "position moved"},
+		// A start deferring while the add copies stamps running and then puts
+		// the stop back: the check waits it out rather than refusing a good copy.
+		{name: "running at first, stopped within the grace, position unchanged", end: running, later: &stopped, pos: ir.Position{Token: "pos-1"}, found: true},
+		{name: "control row gone", end: ir.StreamLiveness{Now: now}, pos: ir.Position{Token: "pos-1"}, found: true, refuse: "control row disappeared"},
 		{name: "position gone", end: stopped, refuse: "position moved"},
 		{name: "liveness unreadable", endErr: errors.New("connection reset"), refuse: "could not read whether"},
 		{name: "position unreadable", end: stopped, posErr: errors.New("connection reset"), refuse: "could not read whether"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			app := positionApplier{fakeApplier: &fakeApplier{liveness: tc.end, livenessErr: tc.endErr}, pos: tc.pos, found: tc.found, posErr: tc.posErr}
+			app := positionApplier{fakeApplier: &fakeApplier{liveness: tc.end, livenessErr: tc.endErr, livenessAfter: tc.later}, pos: tc.pos, found: tc.found, posErr: tc.posErr}
 			a := &AddTable{Source: newAddTableSourceEngine("source"), StreamID: "live", TableName: "nt", positionAtStart: start}
 			err := a.refuseStreamRanDuringAdd(context.Background(), app)
 			if tc.refuse == "" {

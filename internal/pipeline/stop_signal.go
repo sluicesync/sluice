@@ -114,7 +114,7 @@ const StopDrainHardCancelledMarker = "STOP-DRAIN-HARD-CANCELLED"
 // not restart the leg: the operator asked it to stop.
 var ErrStopDrainHardCancelled = errors.New(StopDrainHardCancelledMarker)
 
-// settleHardCancelledStop ends an attempt whose stop's drain the watchdog
+// settleUndrainedStop ends an attempt whose stop's drain the watchdog
 // hard-cancelled. It is deliberately NOT the graceful path:
 //
 //   - stop_requested_at stays set, so `sync stop --wait` (which returns on
@@ -135,7 +135,7 @@ var ErrStopDrainHardCancelled = errors.New(StopDrainHardCancelledMarker)
 //
 // dispatchErr is carried as text only: a retriable cause wrapped with %w
 // would send the attempt back through the retry loop.
-func (s *Streamer) settleHardCancelledStop(ctx context.Context, streamID string, dispatchErr error) error {
+func (s *Streamer) settleUndrainedStop(ctx context.Context, streamID string, dispatchErr error) error {
 	s.forgoStreamStopRecord()
 	cause := ""
 	if dispatchErr != nil && !errors.Is(dispatchErr, context.Canceled) {

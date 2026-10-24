@@ -38,6 +38,8 @@ func (a *ChangeApplier) streamLivenessQueries() appliershared.StreamLivenessQuer
 		Read:            "SELECT " + col + ", " + pgNowMillisExpr + " FROM " + ref + " WHERE stream_id = $1",
 		Stamp:           "UPDATE " + ref + " SET " + col + " = " + pgNowMillisExpr + " WHERE stream_id = $1",
 		Stop:            "UPDATE " + ref + " SET " + col + " = " + streamStoppedLiteral + " WHERE stream_id = $1",
+		StampAt:         "UPDATE " + ref + " SET " + col + " = $1 WHERE stream_id = $2",
+		RestoreStop:     "UPDATE " + ref + " SET " + col + " = " + streamStoppedLiteral + " WHERE stream_id = $1 AND " + col + " = $2",
 		IsMissingColumn: isUndefinedColumnErr,
 	}
 }
@@ -61,24 +63,34 @@ func (a *ChangeApplier) detectLivenessColumn(ctx context.Context) {
 	a.livenessColumn.Store(found && !missing[appliershared.StreamLivenessColumn])
 }
 
-// StampStreamAlive implements [ir.StreamLivenessStore]. It adds the column to
-// a control table an older release created; a missing control table is left
-// to the start's own ensure, which creates it with the column. Position writes
-// start stamping only once the stamp's own UPDATE has run against the column,
-// which proves it exists.
-func (a *ChangeApplier) StampStreamAlive(ctx context.Context, streamID string) (bool, error) {
+// StampStreamAlive implements [ir.StreamLivenessStore]. It first re-detects
+// the column, so position writes stamp even in a run that skipped the
+// ensure (--schema-already-applied) or whose stamp then fails; it adds the
+// column to a control table an older release created (a missing control
+// table is left to the start's own ensure, which creates it with the
+// column); and it stamps under a row lock that reads the value it replaces
+// ([appliershared.StampStreamAliveOwned]). Position writes start stamping
+// only once the column is proved to exist: by the detect, or by the stamp's
+// own UPDATE.
+func (a *ChangeApplier) StampStreamAlive(ctx context.Context, streamID string) (ir.StreamStamp, error) {
+	a.detectLivenessColumn(ctx)
 	present, err := relationPresent(ctx, a.db, controlTableRef(a.controlSchema))
 	if err != nil || !present {
-		return false, err
+		return ir.StreamStamp{}, err
 	}
 	if err := cdcStateTable(a.controlSchema).ensureColumns(ctx, a.db, []controlColumn{streamLivenessColumn}); err != nil {
-		return false, err
+		return ir.StreamStamp{}, err
 	}
-	stamped, err := appliershared.StampStreamLiveness(ctx, a.db, controlCfg, a.streamLivenessQueries().Stamp, streamID)
+	stamp, err := appliershared.StampStreamAliveOwned(ctx, a.db, controlCfg, a.streamLivenessQueries(), streamID)
 	if err == nil {
 		a.livenessColumn.Store(true)
 	}
-	return stamped, err
+	return stamp, err
+}
+
+// RestoreStreamStopped implements [ir.StreamLivenessStore].
+func (a *ChangeApplier) RestoreStreamStopped(ctx context.Context, streamID string, stamp ir.StreamStamp) (bool, error) {
+	return appliershared.RestoreStreamStopped(ctx, a.db, controlCfg, a.streamLivenessQueries(), streamID, stamp)
 }
 
 // RecordStreamStopped implements [ir.StreamLivenessStore].

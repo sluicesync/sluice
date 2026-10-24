@@ -43,6 +43,8 @@ func (a *ChangeApplier) streamLivenessQueries() appliershared.StreamLivenessQuer
 		Read:            "SELECT " + col + ", " + mysqlNowMillisExpr + " FROM " + ref + " WHERE stream_id = ?",
 		Stamp:           set + mysqlNowMillisExpr + keep,
 		Stop:            set + streamStoppedLiteral + keep,
+		StampAt:         set + "?" + keep,
+		RestoreStop:     set + streamStoppedLiteral + keep + " AND " + col + " = ?",
 		IsMissingColumn: isMySQLUnknownColumnErr,
 	}
 }
@@ -78,19 +80,31 @@ func (a *ChangeApplier) detectLivenessColumn(ctx context.Context) {
 // under a Vitess ddl_strategy that queues the ALTER as an online migration,
 // the column does not exist yet when the ALTER returns, and a position write
 // naming it would fail every apply until the migration landed.
-func (a *ChangeApplier) StampStreamAlive(ctx context.Context, streamID string) (bool, error) {
+//
+// It first re-detects the column (detect only, from information_schema, so
+// a queued ALTER is not mistaken for a column), so position writes stamp even
+// in a run that skipped the ensure (--schema-already-applied) or whose stamp
+// then fails; and it stamps under a row lock that reads the value it
+// replaces ([appliershared.StampStreamAliveOwned]).
+func (a *ChangeApplier) StampStreamAlive(ctx context.Context, streamID string) (ir.StreamStamp, error) {
+	a.detectLivenessColumn(ctx)
 	present, err := controlTableExists(ctx, a.db, a.controlKeyspace, controlTableName)
 	if err != nil || !present {
-		return false, err
+		return ir.StreamStamp{}, err
 	}
 	if err := ensureCrossEngineParityColumn(ctx, a.db, a.controlKeyspace, appliershared.StreamLivenessColumn, streamLivenessColumnDef); err != nil {
-		return false, err
+		return ir.StreamStamp{}, err
 	}
-	stamped, err := appliershared.StampStreamLiveness(ctx, a.db, controlCfg, a.streamLivenessQueries().Stamp, streamID)
+	stamp, err := appliershared.StampStreamAliveOwned(ctx, a.db, controlCfg, a.streamLivenessQueries(), streamID)
 	if err == nil {
 		a.livenessColumn.Store(true)
 	}
-	return stamped, err
+	return stamp, err
+}
+
+// RestoreStreamStopped implements [ir.StreamLivenessStore].
+func (a *ChangeApplier) RestoreStreamStopped(ctx context.Context, streamID string, stamp ir.StreamStamp) (bool, error) {
+	return appliershared.RestoreStreamStopped(ctx, a.db, controlCfg, a.streamLivenessQueries(), streamID, stamp)
 }
 
 // RecordStreamStopped implements [ir.StreamLivenessStore].

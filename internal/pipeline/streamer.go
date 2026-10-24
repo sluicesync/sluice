@@ -1797,9 +1797,9 @@ type Streamer struct {
 	// the stop through (tests: one that always fails); nil is
 	// [Streamer.openLivenessStore].
 	livenessOpen func(context.Context) (ir.StreamLivenessStore, func(), error)
-	// liveness is this Run's liveness record-keeping, armed by the first
-	// attempt that reaches the target ([Streamer.armStreamLiveness]) and
-	// discharged when Run returns. nil outside Run.
+	// liveness is this Run's liveness record-keeping (stream_liveness.go:
+	// [runLiveness] says when a Run owns the record), discharged when Run
+	// returns. nil outside Run.
 	liveness *runLiveness
 
 	// resolvedApplyConcurrency is the per-attempt resolution of the operator's
@@ -1912,9 +1912,9 @@ func (s *Streamer) Run(ctx context.Context) error {
 		return err
 	}
 
-	// DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED: a Run that reaches the
-	// target records the stream's stop on its way out, however it ends
-	// (stream_liveness.go).
+	// DRAINED-ADD-TABLE-STREAM-NOT-STOPPED: a Run that owns the stream's
+	// record (it streamed, or it only undid its own stamp over a stop) records
+	// the stop on its way out, however it ends ([runLiveness]).
 	s.liveness = &runLiveness{ctx: ctx}
 	defer s.stopStreamLiveness()
 
@@ -2067,10 +2067,6 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	// From here on this Run records the stream's stop when it ends
-	// (stream_liveness.go).
-	s.armStreamLiveness(streamID)
-
 	// ---- 0.5. Resolve the adaptive apply-concurrency default (ADR-0106) ----
 	// `--apply-concurrency 0` (unset) → auto:N (connection-budget-bounded);
 	// `1` stays explicit serial; `N > 1` honored. Resolved HERE (per attempt,
@@ -2462,6 +2458,10 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// / outer ctx cancel — the operator's stop request, if any, didn't
 	// drive this exit — or a drain the watchdog hard-cancelled). The
 	// cleared flag is the signal `sync stop --wait` polls for.
+	// An attempt that gets here has its change stream open: from now on this
+	// Run owns the stream's record and records its stop when it ends
+	// ([runLiveness]).
+	s.armStreamLiveness(streamID)
 	var stopSig stopSignal
 	liveFilter := s.phaseStartApplySidecars(applyCtx, applier, streamID, cancelStream, cancelApply, &stopSig)
 
