@@ -111,17 +111,18 @@ func TestAddTableRefusesUnknownStream(t *testing.T) {
 func TestAddTableRefusesRunningStream(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
-		name   string
-		l      ir.StreamLiveness
-		err    error
-		refuse bool
+		name    string
+		l       ir.StreamLiveness
+		err     error
+		rowGone bool
+		refuse  bool
 	}{
 		{name: "fresh stamp", l: ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now.Add(-2 * time.Second), Now: now}, refuse: true},
 		{name: "unreadable", err: errors.New("connection reset by peer"), refuse: true},
 		{name: "never recorded", l: ir.StreamLiveness{Found: true, Now: now}, refuse: true},
 		{name: "recorded stop", l: ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}},
 		{name: "hour-old stamp (a crash, or an idle stream)", l: ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now.Add(-time.Hour), Now: now}, refuse: true},
-		{name: "no row", l: ir.StreamLiveness{}},
+		{name: "no row (it vanished after the stream was listed)", rowGone: true, refuse: true},
 	}
 	for _, tc := range cases {
 		for _, dry := range []bool{false, true} {
@@ -132,7 +133,7 @@ func TestAddTableRefusesRunningStream(t *testing.T) {
 				}}
 				tgt := newAddTableTargetEngine("target")
 				tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
-				tgt.applier.liveness, tgt.applier.livenessErr = tc.l, tc.err
+				tgt.applier.liveness, tgt.applier.livenessErr, tgt.applier.livenessRowGone = tc.l, tc.err, tc.rowGone
 				err := (&AddTable{
 					Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt",
 					StreamID: "live", TableName: "new_table", DryRun: dry,
@@ -763,6 +764,9 @@ type fakeApplier struct {
 	livenessErr   error
 	livenessAfter *ir.StreamLiveness
 	livenessReads int
+	// livenessRowGone makes the zero liveness a missing row rather than
+	// the default recorded stop.
+	livenessRowGone bool
 
 	// targetSchemaCalls captures the value the orchestrator passed to
 	// SetSchema (Bug 46) so tests assert the resolved namespace
@@ -811,24 +815,34 @@ func (f *fakeApplier) ClearStopRequested(context.Context, string) error {
 }
 
 // ReadStreamLiveness implements [ir.StreamLivenessStore] from the
-// liveness / livenessErr fields; the zero value is "no control row",
-// which a drained add passes. livenessAfter, when set, is returned from
+// liveness / livenessErr fields; the zero value is a recorded stop (the
+// stream was stopped with `sync stop --wait`), which a drained add passes,
+// and livenessRowGone a missing row. livenessAfter, when set, is returned from
 // the second read on (the recheck after the pending entry is written).
 func (f *fakeApplier) ReadStreamLiveness(context.Context, string) (ir.StreamLiveness, error) {
 	f.livenessReads++
 	if f.livenessAfter != nil && f.livenessReads > 1 {
 		return *f.livenessAfter, nil
 	}
+	if f.liveness == (ir.StreamLiveness{}) && !f.livenessRowGone {
+		return ir.StreamLiveness{Found: true, Recorded: true, Stopped: true}, f.livenessErr
+	}
 	return f.liveness, f.livenessErr
 }
 
-func (f *fakeApplier) StampStreamAlive(context.Context, string) (bool, error) {
+func (f *fakeApplier) StampStreamAlive(context.Context, string) (ir.StreamStamp, error) {
 	panic("fakeApplier.StampStreamAlive called — add-table must not stamp a stream's liveness")
 }
 
 func (f *fakeApplier) RecordStreamStopped(context.Context, string) error {
 	panic("fakeApplier.RecordStreamStopped called — add-table must not stamp a stream's liveness")
 }
+
+func (f *fakeApplier) RestoreStreamStopped(context.Context, string, ir.StreamStamp) (bool, error) {
+	panic("fakeApplier.RestoreStreamStopped called — add-table must not stamp a stream's liveness")
+}
+
+var _ ir.StreamLivenessStore = (*fakeApplier)(nil)
 
 // recordingRowWriterEmpty extends recordingRowWriter with a
 // configurable IsTableEmpty so the per-table preflight can be

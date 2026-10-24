@@ -42,15 +42,16 @@ func RoundTrip(ctx context.Context, t *testing.T, store ir.StreamLivenessStore, 
 	}
 	// stamp runs one stamp and requires it to report wantStamped: whether
 	// the stream's row took it.
-	stamp := func(stream string, wantStamped bool) {
+	stamp := func(stream string, wantStamped bool) ir.StreamStamp {
 		t.Helper()
-		stamped, err := store.StampStreamAlive(ctx, stream)
+		st, err := store.StampStreamAlive(ctx, stream)
 		if err != nil {
 			t.Fatalf("stamp %s: %v", stream, err)
 		}
-		if stamped != wantStamped {
-			t.Fatalf("stamp %s reported stamped=%v; want %v", stream, stamped, wantStamped)
+		if st.Stamped != wantStamped {
+			t.Fatalf("stamp %s reported stamped=%v; want %v", stream, st.Stamped, wantStamped)
 		}
+		return st
 	}
 	running := func(l ir.StreamLiveness) bool {
 		return l.Found && l.Recorded && !l.Stopped && l.Age() > -time.Minute && l.Age() < time.Minute
@@ -87,9 +88,44 @@ func RoundTrip(ctx context.Context, t *testing.T, store ir.StreamLivenessStore, 
 	if l := read("s1"); !l.Stopped {
 		t.Fatalf("after the stop: %+v; want Stopped", l)
 	}
-	stamp("s1", true)
+	over := stamp("s1", true)
 	if l := read("s1"); l.Stopped || !running(l) {
 		t.Fatalf("after a stamp over the stop: %+v; want running", l)
+	}
+	if !over.ReplacedStop() {
+		t.Fatalf("a stamp over the stopped marker reported %+v; want ReplacedStop", over)
+	}
+
+	// Ownership: a run that stamped over a stop and never streamed puts the
+	// stop back by compare-and-set on its own stamp...
+	if ok, err := store.RestoreStreamStopped(ctx, "s1", over); err != nil || !ok {
+		t.Fatalf("restore over its own stamp: restored=%v err=%v; want restored", ok, err)
+	}
+	if l := read("s1"); !l.Stopped {
+		t.Fatalf("after restoring its own stamp: %+v; want Stopped", l)
+	}
+	// ...but never over a value anyone else wrote since (another run's stamp
+	// or position write): the running record survives.
+	mine := stamp("s1", true)
+	if !mine.ReplacedStop() {
+		t.Fatalf("second stamp over the restored stop reported %+v; want ReplacedStop", mine)
+	}
+	theirs := stamp("s1", true) // another run, stamping over mine
+	if !theirs.Replaced(mine) || theirs.AliveMillis == mine.AliveMillis {
+		t.Fatalf("a stamp over %+v reported %+v; want it to replace that exact value with a different one", mine, theirs)
+	}
+	if ok, err := store.RestoreStreamStopped(ctx, "s1", mine); err != nil || ok {
+		t.Fatalf("restore over a stamp another run made since: restored=%v err=%v; want not restored", ok, err)
+	}
+	if l := read("s1"); !running(l) {
+		t.Fatalf("after a refused restore: %+v; want the other run's running stamp", l)
+	}
+	// A stamp never writes the value it replaces, even over one from the
+	// future (a skewed clock), so the compare-and-set can tell them apart.
+	future := time.Now().Add(time.Hour).UnixMilli()
+	raw.Set(&future)
+	if st := stamp("s1", true); st.AliveMillis <= future || !st.Replaced(ir.StreamStamp{Stamped: true, AliveMillis: future}) {
+		t.Fatalf("a stamp over a future value %d wrote %+v; want a larger value replacing it", future, st)
 	}
 
 	// An old stamp (a crashed stream's, or an idle one's) reads as running,

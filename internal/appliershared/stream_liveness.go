@@ -46,6 +46,11 @@ type StreamLivenessQueries struct {
 	Stamp string
 	// Stop sets the column to the stopped marker.
 	Stop string
+	// StampAt sets the column to an explicit value; args (value, stream_id).
+	StampAt string
+	// RestoreStop sets the column to the stopped marker only where it still
+	// holds an exact value; args (stream_id, value).
+	RestoreStop string
 	// IsMissingColumn classifies the dialect's "no such column" error.
 	IsMissingColumn func(error) bool
 }
@@ -79,6 +84,66 @@ func ReadStreamLiveness(ctx context.Context, db *sql.DB, cfg *ControlTableConfig
 		l.AliveAt = time.UnixMilli(stored.Int64).UTC()
 	}
 	return l, nil
+}
+
+// StampStreamAliveOwned implements [ir.StreamLivenessStore.StampStreamAlive]'s
+// stamp: in one transaction it locks the stream's row (q.Read + FOR UPDATE),
+// reads the value it is about to replace and the server's clock, and writes
+// the clock explicitly (q.StampAt), raised to one past the replaced value if
+// that is not older, so the written value differs from what it replaced and
+// [RestoreStreamStopped] can tell its own stamp from anyone else's. A missing
+// row or control table is not stamped and not an error.
+func StampStreamAliveOwned(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q StreamLivenessQueries, streamID string) (ir.StreamStamp, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return ir.StreamStamp{}, fmt.Errorf("%s: stamp %s: %w", cfg.EngineName, StreamLivenessColumn, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var (
+		stored sql.NullInt64
+		nowMs  int64
+	)
+	err = tx.QueryRowContext(ctx, q.Read+" FOR UPDATE", streamID).Scan(&stored, &nowMs)
+	switch {
+	case errors.Is(err, sql.ErrNoRows), cfg.IsMissingTable(err):
+		return ir.StreamStamp{}, nil
+	case err != nil:
+		return ir.StreamStamp{}, fmt.Errorf("%s: stamp %s: %w", cfg.EngineName, StreamLivenessColumn, err)
+	}
+	value := nowMs
+	if stored.Valid && stored.Int64 >= value {
+		value = stored.Int64 + 1
+	}
+	if _, err := tx.ExecContext(ctx, q.StampAt, value, streamID); err != nil {
+		return ir.StreamStamp{}, fmt.Errorf("%s: stamp %s: %w", cfg.EngineName, StreamLivenessColumn, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ir.StreamStamp{}, fmt.Errorf("%s: stamp %s: %w", cfg.EngineName, StreamLivenessColumn, err)
+	}
+	return ir.StreamStamp{
+		Stamped:        true,
+		AliveMillis:    value,
+		ReplacedNull:   !stored.Valid,
+		ReplacedMillis: stored.Int64,
+	}, nil
+}
+
+// RestoreStreamStopped implements [ir.StreamLivenessStore.RestoreStreamStopped]:
+// the stopped marker goes back only where the row still holds stamp's exact
+// value. A stamp that never landed restores nothing.
+func RestoreStreamStopped(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, q StreamLivenessQueries, streamID string, stamp ir.StreamStamp) (bool, error) {
+	if !stamp.Stamped {
+		return false, nil
+	}
+	res, err := db.ExecContext(ctx, q.RestoreStop, streamID, stamp.AliveMillis)
+	if err != nil {
+		return false, fmt.Errorf("%s: restore %s: %w", cfg.EngineName, StreamLivenessColumn, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("%s: restore %s: %w", cfg.EngineName, StreamLivenessColumn, err)
+	}
+	return n > 0, nil
 }
 
 // StampStreamLiveness runs one liveness stamp (q.Stamp or q.Stop) and reports
