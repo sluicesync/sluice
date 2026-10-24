@@ -110,6 +110,15 @@ type vskShape struct {
 	// and requires every one on the target within vskShardMarkerBudget: the
 	// CDC tail must keep every shard delivering after shards finished their
 	// copy at different times (VSTREAM-TAIL-SKEW-HOLD, Bug 334).
+	//
+	// SCOPE, measured: this is a per-PR delivery check, NOT a regression gate
+	// for Bug 334. With the tail mutated back to MinimizeSkew=true the
+	// FourShards cell still passed (2026-10-24): this cell's finished shards
+	// commit their changes in one burst, so the rewound windows are not the
+	// >2s apart the hold needs, and vttestserver runs every shard on one
+	// mysqld. The gate that fails on that mutant is
+	// TestVitessReshard_SnapshotTailSkew_EveryShardDelivers (vitessreshard,
+	// extended-suites reshard leg).
 	perShardMarkers bool
 }
 
