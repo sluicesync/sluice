@@ -200,7 +200,7 @@ A field repair of exactly this shape verified clean (`all chunks OK chunks=17 de
 
 ## Exit codes
 
-sluice historically exited 0 on success and 1 on everything else. The taxonomy below keeps those two meanings stable and carves two classes out of the generic-failure bucket, so nothing that checks `!= 0` changes behaviour.
+sluice historically exited 0 on success and 1 on everything else. The taxonomy below keeps those two meanings stable and carves three classes out of the generic-failure bucket, so nothing that checks `!= 0` changes behaviour.
 
 | Exit code | Meaning |
 |---|---|
@@ -208,6 +208,7 @@ sluice historically exited 0 on success and 1 on everything else. The taxonomy b
 | 1 | Generic runtime failure. For `verify`/`diff`/`sync-health` this is those commands' long-standing per-command meaning: the check ran and found a mismatch / drift / stale stream. |
 | 2 | Config error: the `--config` file could not be loaded or parsed. (The read-side commands `verify`/`diff`/`sync-health`/`metrics-watch` have always used 2 more broadly for "the check could not run at all" — that per-command contract is unchanged. For `verify` this includes a run that completed but could not verify one or more tables — a per-table count/sample error, or a source table missing on the target: an unverified table is not a pass, so those runs exit 2 rather than a misleading 0. Tables deliberately excluded via `--include-table`/`--exclude-table` or config filters stay exit-neutral.) |
 | 3 | Named refusal: sluice declined to proceed (or to silently alter a value) and named the remedy — the refusal-class codes in the table above. Retrying without acting on the hint will fail identically. |
+| 4 | Undrained stop: a `sync start` / `sync run` process that `sluice sync stop` asked to stop exited without draining (`STOP-DRAIN-HARD-CANCELLED`: its drain was hard-cancelled after the 30-second drain timeout, or ended in an error sluice would otherwise retry). `stop_requested_at` stays set and no stop is recorded; the stop was asked for, so a service manager should not restart it (systemd `RestartPreventExitStatus=4`). See [running-as-a-service](running-as-a-service.md). |
 | 80 | Usage error: kong (the CLI parser) exits 80 on unknown flags/commands and missing required arguments before any sluice code runs. sluice adopts this rather than remapping it. |
 
 **Backward compatibility.** Scripts and unit files that check `exit != 0` (including the systemd `Restart=on-failure` pattern in [running-as-a-service](running-as-a-service.md)) are unaffected — every failure class is still non-zero. Scripts that check `exit == 1` specifically should be updated: config errors and named refusals that previously exited 1 now exit 2 and 3 respectively.

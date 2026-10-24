@@ -1453,8 +1453,16 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	// keep streaming against the operator's stop.
 	hardCancelled := stop != nil && stop.hardCancelled.Load()
 	if hardCancelled {
-		return s.settleUndrainedStop(ctx, streamID, dispatchErr)
+		return s.settleUndrainedStop(ctx, streamID, dispatchErr, stopCutOffByWatchdog)
 	}
+	// stopObserved: the drain was asked for by `sync stop`. A drain that then
+	// ends in an error the retry loop would retry did not drain either
+	// (--apply-exec-timeout shorter than the watchdog, a transient fault at
+	// the last batch, a source pump error): a retry would clear the stop flag
+	// at its start and keep streaming against the stop, so it settles like a
+	// hard cancel (the fix-aimed review of c421369a: the watchdog case's
+	// unenumerated sibling).
+	stopObserved := stop != nil && stop.observed.Load()
 	if dispatchErr != nil {
 		// Bug 57 fix (v0.52.2): a wrapped [ir.RetriableError] containing
 		// context.DeadlineExceeded (from --apply-exec-timeout) MUST
@@ -1466,6 +1474,9 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 		// genuine ctx termination AND not retriable.
 		_, isRetriable := classifyRetriable(dispatchErr)
 		isCtxTermination := errors.Is(dispatchErr, context.Canceled) || errors.Is(dispatchErr, context.DeadlineExceeded)
+		if stopObserved && (isRetriable || isRetriableConnectFailure(dispatchErr)) {
+			return s.settleUndrainedStop(ctx, streamID, dispatchErr, stopEndedRetriable)
+		}
 		if isRetriable || !isCtxTermination {
 			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
 		}
@@ -1483,6 +1494,9 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	// applier.
 	if dispatchErr == nil {
 		if srcErr := surfaceSourceError(s.sourceErrFn); srcErr != nil {
+			if stopObserved {
+				return s.settleUndrainedStop(ctx, streamID, srcErr, stopEndedRetriable)
+			}
 			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: source cdc reader: %w", srcErr))
 		}
 	}

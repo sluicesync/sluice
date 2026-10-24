@@ -22,13 +22,14 @@ import (
 // or a stream that last recorded a stop (or whose attempt-start stamp failed)
 // could advance its position past a new table's changes while reading as
 // stopped. Every position write in this package goes through writePositionTx
-// (and writePositionUpsertSQL, from it); the walk holds each call of writePositionTx, anywhere in the
-// package's non-test files, to passing the applier's stampsLiveness() as its
-// stamp argument.
+// and writePositionUpsertSQL; the walk holds every call of either, anywhere in
+// the package's non-test files, to passing the applier's stampsLiveness() as
+// its stamp argument (writePositionTx's own call passes its parameter
+// through).
 //
-// WHAT IT REACHES: writePositionTx's call sites in this package. A position
-// write that bypassed it would not be seen, which is why the floor below
-// counts the known sites.
+// WHAT IT REACHES: the call sites of those two functions in this package. A
+// position write spelled without either would not be seen here;
+// TestSourcePositionWrittenOnlyByTheBuilder catches that one.
 func TestPositionWritesStampLiveness(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -48,31 +49,45 @@ func TestPositionWritesStampLiveness(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				id, ok := call.Fun.(*ast.Ident)
+				if !ok || (id.Name != "writePositionTx" && id.Name != "writePositionUpsertSQL") {
+					return true
+				}
+				sites++
+				last := call.Args[len(call.Args)-1]
+				// writePositionTx passes its own stamp parameter through.
+				if fn.Name.Name == "writePositionTx" && id.Name == "writePositionUpsertSQL" {
+					if p, ok := last.(*ast.Ident); ok && p.Name == "stampAlive" {
+						return true
+					}
+				}
+				lastCall, ok := last.(*ast.CallExpr)
+				sel, isSel := (*ast.SelectorExpr)(nil), false
+				if ok {
+					sel, isSel = lastCall.Fun.(*ast.SelectorExpr)
+				}
+				if !isSel || sel.Sel.Name != "stampsLiveness" {
+					t.Errorf("%s: %s calls %s without the applier's stampsLiveness(): its position writes would not stamp liveness",
+						fset.Position(call.Pos()), fn.Name.Name, id.Name)
+				}
 				return true
-			}
-			id, ok := call.Fun.(*ast.Ident)
-			if !ok || id.Name != "writePositionTx" {
-				return true
-			}
-			sites++
-			last, ok := call.Args[len(call.Args)-1].(*ast.CallExpr)
-			sel, isSel := (*ast.SelectorExpr)(nil), false
-			if ok {
-				sel, isSel = last.Fun.(*ast.SelectorExpr)
-			}
-			if !isSel || sel.Sel.Name != "stampsLiveness" {
-				t.Errorf("%s: writePositionTx without the applier's stampsLiveness(): its position writes would not stamp liveness",
-					fset.Position(call.Pos()))
-			}
-			return true
-		})
+			})
+		}
 	}
-	// The schema-event, per-change, batch, position-only and multirow paths.
-	if sites < 5 {
-		t.Fatalf("found %d writePositionTx call sites; want >= 5 — the walk has gone blind", sites)
+	// The schema-event, per-change, batch, position-only and multirow paths
+	// call writePositionTx; writePositionTx calls writePositionUpsertSQL.
+	if sites < 6 {
+		t.Fatalf("found %d position-write call sites; want >= 6 — the walk has gone blind", sites)
 	}
 }
 

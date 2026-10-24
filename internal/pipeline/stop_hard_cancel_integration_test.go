@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestStreamer_HardCancelledStopIsNotGraceful_Binlog drives STOP-DRAIN-HARD-
@@ -23,14 +25,28 @@ import (
 // stop_requested_at set and record no stop. A drained add-table refuses on
 // the flag, naming the hard-cancel remedy; the remedy (start once, then `sync
 // stop --wait`) is then driven and the add passes.
+//
+// The second cell is the review of c421369a's sibling: --apply-exec-timeout
+// (2s) shorter than the watchdog (60s here) ends the wedged drain with a
+// retriable DeadlineExceeded first. That used to go back to the retry loop,
+// whose start cleared the stop request and streamed on; it must end the run
+// the same way. Both cells require the exit status ExitStopNotDrained.
 func TestStreamer_HardCancelledStopIsNotGraceful_Binlog(t *testing.T) {
+	t.Run("drain watchdog", func(t *testing.T) { hardCancelCell(t, 3*time.Second, 0) })
+	t.Run("apply exec timeout before the watchdog", func(t *testing.T) { hardCancelCell(t, time.Minute, 2*time.Second) })
+}
+
+func hardCancelCell(t *testing.T, drain, execTimeout time.Duration) {
 	srcDSN, tgtDSN, eng, filter, cleanup := drainHBRig(t)
 	defer cleanup()
-	setDrainTimeoutForTest(t, 3*time.Second)
+	setDrainTimeoutForTest(t, drain)
 	setPollIntervalForTest(t, 250*time.Millisecond)
 	const streamID = "hard-cancel"
 	mk := func() *Streamer {
-		return &Streamer{Source: eng, Target: eng, SourceDSN: srcDSN, TargetDSN: tgtDSN, StreamID: streamID, Filter: filter}
+		return &Streamer{
+			Source: eng, Target: eng, SourceDSN: srcDSN, TargetDSN: tgtDSN, StreamID: streamID, Filter: filter,
+			ApplyExecTimeout: execTimeout,
+		}
 	}
 	stream := startTWFBRun(mk())
 	defer func() { _ = stream.stop(t) }()
@@ -86,6 +102,10 @@ func TestStreamer_HardCancelledStopIsNotGraceful_Binlog(t *testing.T) {
 	}
 	if !errors.Is(stream.err, ErrStopDrainHardCancelled) {
 		t.Fatalf("the hard-cancelled stop's Run = %v; want %s (not a graceful nil)", stream.err, StopDrainHardCancelledMarker)
+	}
+	var ec interface{ ExitCode() int }
+	if !errors.As(stream.err, &ec) || ec.ExitCode() != sluicecode.ExitStopNotDrained {
+		t.Fatalf("the undrained stop's error does not exit %d: %v", sluicecode.ExitStopNotDrained, stream.err)
 	}
 	if pending, err := applier.(stopFlagReader).ReadStopRequested(ctx, streamID); err != nil || !pending {
 		t.Fatalf("stop_requested_at after a hard-cancelled drain: pending=%v err=%v; want it kept set", pending, err)

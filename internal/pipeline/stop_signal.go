@@ -62,6 +62,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // stopFlagReader is the optional applier-side surface the polling
@@ -104,22 +106,50 @@ type stopSignal struct {
 	hardCancelled atomic.Bool
 }
 
-// StopDrainHardCancelledMarker is the grep-stable marker of a stop whose
-// graceful drain timed out and was hard-cancelled.
+// StopDrainHardCancelledMarker is the grep-stable marker of a `sync stop`
+// whose drain did not complete: the watchdog hard-cancelled it, or it ended
+// in an error the retry loop would have retried.
 const StopDrainHardCancelledMarker = "STOP-DRAIN-HARD-CANCELLED"
 
-// ErrStopDrainHardCancelled is the cause a Run returns when its stop's
-// drain was hard-cancelled ([stopSignal]). It wraps no retriable error, so
-// [Streamer.runWithRetry] does not retry it, and the fleet supervisor does
-// not restart the leg: the operator asked it to stop.
+// ErrStopDrainHardCancelled is the cause a Run returns when its stop did not
+// drain ([stopSignal], [Streamer.settleUndrainedStop]). It wraps no retriable
+// error, so [Streamer.runWithRetry] does not retry it, and the fleet
+// supervisor does not restart the leg: the operator asked it to stop. The
+// error that carries it exits [sluicecode.ExitStopNotDrained], so a service
+// manager can be told not to restart it (systemd RestartPreventExitStatus=).
 var ErrStopDrainHardCancelled = errors.New(StopDrainHardCancelledMarker)
 
-// settleUndrainedStop ends an attempt whose stop's drain the watchdog
-// hard-cancelled. It is deliberately NOT the graceful path:
+// stopUndrainedHow says how a stop failed to drain, for the message.
+type stopUndrainedHow int
+
+const (
+	// stopCutOffByWatchdog: the drain exceeded the drain timeout and the
+	// watchdog cancelled the apply.
+	stopCutOffByWatchdog stopUndrainedHow = iota
+	// stopEndedRetriable: the drain ended in an error the retry loop would
+	// have retried (an --apply-exec-timeout shorter than the watchdog, a
+	// transient fault, a source pump error).
+	stopEndedRetriable
+)
+
+// stopNotDrainedError is the error a Run returns for a stop that did not
+// drain: it unwraps to [ErrStopDrainHardCancelled] and sets the process
+// exit status.
+type stopNotDrainedError struct{ msg string }
+
+func (e *stopNotDrainedError) Error() string { return e.msg }
+func (e *stopNotDrainedError) Unwrap() error { return ErrStopDrainHardCancelled }
+
+// ExitCode implements kong's ExitCoder.
+func (e *stopNotDrainedError) ExitCode() int { return sluicecode.ExitStopNotDrained }
+
+// settleUndrainedStop ends an attempt whose `sync stop` did not drain (see
+// [stopUndrainedHow]). It is deliberately NOT the graceful path:
 //
 //   - stop_requested_at stays set, so `sync stop --wait` (which returns on
-//     its clear) does not report a drain that did not happen. The next
-//     `sync start` clears it, as every start does.
+//     its clear, and since then also requires the recorded stop) does not
+//     report a drain that did not happen. The next `sync start` clears it,
+//     as every start does.
 //   - No stop is recorded on the liveness column, here or by Run on its way
 //     out ([Streamer.forgoStreamStopRecord]). The apply that was cut off
 //     may have had a commit in flight whose outcome sluice cannot know, and
@@ -133,21 +163,24 @@ var ErrStopDrainHardCancelled = errors.New(StopDrainHardCancelledMarker)
 //     an argument about in-doubt commits, not a proof, and the remedy below
 //     costs one restart.
 //
-// dispatchErr is carried as text only: a retriable cause wrapped with %w
-// would send the attempt back through the retry loop.
-func (s *Streamer) settleUndrainedStop(ctx context.Context, streamID string, dispatchErr error) error {
+// cause is carried as text only: a retriable cause wrapped with %w would
+// send the attempt back through the retry loop.
+func (s *Streamer) settleUndrainedStop(ctx context.Context, streamID string, cause error, how stopUndrainedHow) error {
 	s.forgoStreamStopRecord()
-	cause := ""
-	if dispatchErr != nil && !errors.Is(dispatchErr, context.Canceled) {
-		cause = fmt.Sprintf(" (the apply ended with: %v)", dispatchErr)
+	what := "its apply did not drain within the drain timeout and was cancelled"
+	if how == stopEndedRetriable {
+		what = "its drain ended in an error sluice would otherwise retry, so it did not drain"
 	}
-	err := fmt.Errorf("pipeline: %w: stream %q was asked to stop, but its apply did not drain within the drain timeout "+
-		"and was cancelled%s. The stop was not graceful: stop_requested_at is left set and no stop is recorded, so "+
-		"`sluice sync stop --wait` does not report success and `sluice schema add-table` refuses against the stream. "+
-		"Start the stream again with the same --stream-id (it resumes from its last committed position and clears the "+
-		"stop request), then stop it with `sluice sync stop --wait`",
-		ErrStopDrainHardCancelled, streamID, cause)
-	slog.WarnContext(ctx, StopDrainHardCancelledMarker+": the stop's drain was hard-cancelled; not reporting a graceful stop",
+	ended := ""
+	if cause != nil && !errors.Is(cause, context.Canceled) {
+		ended = fmt.Sprintf(" (it ended with: %v)", cause)
+	}
+	err := &stopNotDrainedError{msg: fmt.Sprintf("pipeline: %s: stream %q was asked to stop, but %s%s. The stop was not "+
+		"graceful: stop_requested_at is left set and no stop is recorded, so `sluice sync stop --wait` does not report "+
+		"success and `sluice schema add-table` refuses against the stream. Start the stream again with the same "+
+		"--stream-id (it resumes from its last committed position and clears the stop request), then stop it with "+
+		"`sluice sync stop --wait`", StopDrainHardCancelledMarker, streamID, what, ended)}
+	slog.WarnContext(ctx, StopDrainHardCancelledMarker+": the stop did not drain; not reporting a graceful stop",
 		slog.String("stream_id", streamID), slog.String("error", err.Error()))
 	return err
 }

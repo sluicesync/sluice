@@ -93,6 +93,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -493,6 +494,13 @@ func (s *Streamer) settleAddedColumnBackfills(ctx context.Context, applier ir.Ch
 		return runErr
 	}
 	slog.ErrorContext(ctx, gap.Error(), slog.String("stream_id", streamID))
+	// A stop that did not drain keeps its identity beside the gap: the
+	// supervisor must still not restart the leg and the process must still
+	// exit STOP-DRAIN-HARD-CANCELLED's status (the fix-aimed review of
+	// c421369a, LOW). gap unwraps to the unforwarded-change sentinel only.
+	if errors.Is(runErr, ErrStopDrainHardCancelled) {
+		return errors.Join(gap, runErr)
+	}
 	return gap
 }
 
