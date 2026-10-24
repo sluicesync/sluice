@@ -141,8 +141,10 @@ func TestSettle_HardCancelledDrainIsNotAGracefulStop(t *testing.T) {
 			if _, retriable := classifyRetriable(err); retriable || isRetriableConnectFailure(err) {
 				t.Fatalf("the hard-cancel failure is retriable, so the retry loop would restart the stream: %v", err)
 			}
+			// order logs the applier's stop record and flag clear, from settle
+			// and from Run's exit record alike (both go through app).
 			if len(order) != 0 {
-				t.Fatalf("settle wrote %v; want nothing (no stop recorded, stop_requested_at kept)", order)
+				t.Fatalf("settle or Run's exit wrote %v; want nothing (no stop recorded, stop_requested_at kept)", order)
 			}
 			if calls := store.snapshot(); len(calls) != 0 {
 				t.Fatalf("liveness writes %v; want none, at settle or at Run's exit", calls)
