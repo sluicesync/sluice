@@ -1793,6 +1793,15 @@ type Streamer struct {
 	// so a new Run — an operator restart — re-baselines.
 	unforwardedBaselineFrom ir.CDCReader
 
+	// livenessOpen overrides how a stopping Run opens the store it records
+	// the stop through (tests: one that always fails); nil is
+	// [Streamer.openLivenessStore].
+	livenessOpen func(context.Context) (ir.StreamLivenessStore, func(), error)
+	// liveness is this Run's liveness record-keeping, armed by the first
+	// attempt that reaches the target ([Streamer.armStreamLiveness]) and
+	// discharged when Run returns. nil outside Run.
+	liveness *runLiveness
+
 	// resolvedApplyConcurrency is the per-attempt resolution of the operator's
 	// [ApplyConcurrency] field (ADR-0106, item 31): `0 → auto:N`, `1 → 1`
 	// (explicit serial), `N > 1 → N`. Computed once per [runOnce] attempt by
@@ -1902,6 +1911,12 @@ func (s *Streamer) Run(ctx context.Context) error {
 	if err := validateAcceptedUniqueKeys(s.AcceptTargetOnlyUniqueKeys); err != nil {
 		return err
 	}
+
+	// DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED: a Run that reaches the
+	// target records the stream's stop on its way out, however it ends
+	// (stream_liveness.go).
+	s.liveness = &runLiveness{ctx: ctx}
+	defer s.stopStreamLiveness()
 
 	attempts := s.ApplyRetryAttempts
 	if attempts < 1 {
@@ -2052,6 +2067,9 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	// From here on this Run records the stream's stop when it ends
+	// (stream_liveness.go).
+	s.armStreamLiveness(streamID)
 
 	// ---- 0.5. Resolve the adaptive apply-concurrency default (ADR-0106) ----
 	// `--apply-concurrency 0` (unset) → auto:N (connection-budget-bounded);
@@ -2438,19 +2456,19 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	// that drops events whose qualified name doesn't pass the
 	// filter. No-op pass-through when the filter is empty.
 	//
-	// stopObserved is set by pollStopSignal the moment it first sees
-	// the control-table stop flag. After dispatchApply returns we
-	// inspect it to decide whether to clear the flag (graceful drain
-	// initiated by `sync stop`) or leave it (Ctrl-C / outer ctx cancel
-	// — the operator's stop request, if any, didn't drive this exit).
-	// The cleared flag is the signal `sync stop --wait` polls for.
-	var stopObserved atomic.Bool
-	liveFilter := s.phaseStartApplySidecars(applyCtx, applier, streamID, cancelStream, cancelApply, &stopObserved)
+	// stopSig records what pollStopSignal saw ([stopSignal]). After
+	// dispatchApply returns we inspect it to decide whether to clear the
+	// flag (a graceful drain initiated by `sync stop`) or leave it (Ctrl-C
+	// / outer ctx cancel — the operator's stop request, if any, didn't
+	// drive this exit — or a drain the watchdog hard-cancelled). The
+	// cleared flag is the signal `sync stop --wait` polls for.
+	var stopSig stopSignal
+	liveFilter := s.phaseStartApplySidecars(applyCtx, applier, streamID, cancelStream, cancelApply, &stopSig)
 
 	// Apply, following any source reshard onto the new shard layout
 	// (ADR-0094). The OUTER ctx is used for settle (applyCtx may already
 	// be cancelled by the time a graceful drain completes).
-	return s.applyWithReshardFollow(ctx, applyCtx, applier, streamID, changes, liveFilter, &stopObserved)
+	return s.applyWithReshardFollow(ctx, applyCtx, applier, streamID, changes, liveFilter, &stopSig)
 }
 
 // applyWithReshardFollow drains the change channel through the applier and,
@@ -2472,7 +2490,7 @@ func (s *Streamer) applyWithReshardFollow(
 	streamID string,
 	changes <-chan ir.Change,
 	liveFilter *liveAddedFilter,
-	stopObserved *atomic.Bool,
+	stop *stopSignal,
 ) error {
 	// RENAME-SWAP-FORWARD: the column-order records every intercept wiring of
 	// this run shares — after a cold start, recorded before any boundary.
@@ -2518,7 +2536,7 @@ func (s *Streamer) applyWithReshardFollow(
 		// the dispatch error (Bug 57: retriable before ctx-termination),
 		// surface a source CDC pump error (GitHub #19), and clear the stop
 		// flag after a graceful drain.
-		return s.phaseSettleDispatch(ctx, applier, streamID, dispatchErr, stopObserved)
+		return s.phaseSettleDispatch(ctx, applier, streamID, dispatchErr, stop)
 	}
 }
 

@@ -27,7 +27,7 @@ import (
 type SchemaCmd struct {
 	Preview  SchemaPreviewCmd  `cmd:"" help:"Render the target DDL sluice would emit, with cross-engine translation notes and advisory hints."`
 	Diff     SchemaDiffCmd     `cmd:"" help:"Compare the expected target DDL (source -> translation) against the actual on-target schema; report drift with copy-paste DDL suggestions."`
-	AddTable SchemaAddTableCmd `cmd:"add-table" help:"Bring a new source table into an active stream's scope without a destructive --reset-target-data cycle. Drain the stream first via 'sluice sync stop --wait'."`
+	AddTable SchemaAddTableCmd `cmd:"add-table" help:"Bring a new source table into an active stream's scope without a destructive --reset-target-data cycle. Drain the stream first via 'sluice sync stop --wait --stream-id <id>': without --no-drain the add refuses (DRAINED-ADD-TABLE-STREAM-NOT-STOPPED) unless the stream's control row records that it stopped, as 'sync stop --wait' and every orderly exit do, because a drained add must not run while the stream applies changes. A stream that crashed or was killed, or last ran under an older release, records no stop: start it once and stop it with 'sync stop --wait' (a start that a later check refuses records the stop too). The add also refuses, before handing the table over, if the stream's position moved while it copied."`
 }
 
 // SchemaPreviewCmd implements `sluice schema preview` (ADR-0024).

@@ -10,6 +10,7 @@ import (
 
 	gomysql "github.com/go-sql-driver/mysql"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
@@ -91,6 +92,10 @@ func (e Engine) ControlTableDDLGuidance() []string {
 		"On a PlanetScale branch with safe migrations enabled, direct DDL is refused",
 		"(Error 1105), so ship each statement via a deploy request:",
 		"  sluice deploy-ddl --org <org> --database <db> --ddl '<statement>'",
+		"These are CREATE statements, which change nothing on a table that exists. A",
+		"sluice_cdc_state an earlier release created lacks the liveness column; add it with",
+		"  ALTER TABLE sluice_cdc_state ADD COLUMN " + appliershared.StreamLivenessColumn + " " + streamLivenessColumnDef,
+		"(without it the stream runs, and `sluice schema add-table` without --no-drain refuses).",
 	}
 }
 

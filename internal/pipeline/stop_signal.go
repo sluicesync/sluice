@@ -57,6 +57,8 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -76,6 +78,78 @@ import (
 // other packages — even when the interface is itself unexported.
 type stopFlagReader interface {
 	ReadStopRequested(ctx context.Context, streamID string) (bool, error)
+}
+
+// stopSignal is what one attempt's stop-signal poll learned, read by the
+// settle path once the apply loop has returned
+// ([Streamer.phaseSettleDispatch]).
+//
+//   - observed: the poll saw the control-table stop flag and started a
+//     graceful drain (cancelStream). Set before cancelStream fires.
+//   - hardCancelled: the drain did not finish within the drain timeout and
+//     the watchdog cancelled the apply context itself. Set before
+//     cancelApply fires, so a settle that runs because of that cancel
+//     always sees it. Such a stop is NOT graceful: an apply wedged long
+//     enough to trip the watchdog (a dead connection, a lock wait) was cut
+//     off, and whether its last commit landed is unknown to sluice. Settle
+//     therefore leaves the stop flag set, records no stop, and fails the
+//     run with [ErrStopDrainHardCancelled] (STOP-DRAIN-HARD-CANCELLED).
+//
+// The watchdog can also fire in the instant between a drain that DID finish
+// and the apply context's cancel at the end of the attempt; settle then may
+// see hardCancelled for a drain that completed. That errs toward the loud
+// side (a stop reported as not graceful), never toward the silent one.
+type stopSignal struct {
+	observed      atomic.Bool
+	hardCancelled atomic.Bool
+}
+
+// StopDrainHardCancelledMarker is the grep-stable marker of a stop whose
+// graceful drain timed out and was hard-cancelled.
+const StopDrainHardCancelledMarker = "STOP-DRAIN-HARD-CANCELLED"
+
+// ErrStopDrainHardCancelled is the cause a Run returns when its stop's
+// drain was hard-cancelled ([stopSignal]). It wraps no retriable error, so
+// [Streamer.runWithRetry] does not retry it, and the fleet supervisor does
+// not restart the leg: the operator asked it to stop.
+var ErrStopDrainHardCancelled = errors.New(StopDrainHardCancelledMarker)
+
+// settleHardCancelledStop ends an attempt whose stop's drain the watchdog
+// hard-cancelled. It is deliberately NOT the graceful path:
+//
+//   - stop_requested_at stays set, so `sync stop --wait` (which returns on
+//     its clear) does not report a drain that did not happen. The next
+//     `sync start` clears it, as every start does.
+//   - No stop is recorded on the liveness column, here or by Run on its way
+//     out ([Streamer.forgoStreamStopRecord]). The apply that was cut off
+//     may have had a commit in flight whose outcome sluice cannot know, and
+//     a drained `schema add-table` must not read such a stream as cleanly
+//     stopped. The add refuses it twice over: on the stop flag still set
+//     ([AddTable.preflightStopFlag]) and, should that be cleared by other
+//     means, on the running stamp the last attempt left
+//     ([judgeStreamStopped]). Recording the stop would very likely be safe
+//     (a commit landing late writes its position, which stamps the stream
+//     running again and moves the position the add compares), but that is
+//     an argument about in-doubt commits, not a proof, and the remedy below
+//     costs one restart.
+//
+// dispatchErr is carried as text only: a retriable cause wrapped with %w
+// would send the attempt back through the retry loop.
+func (s *Streamer) settleHardCancelledStop(ctx context.Context, streamID string, dispatchErr error) error {
+	s.forgoStreamStopRecord()
+	cause := ""
+	if dispatchErr != nil && !errors.Is(dispatchErr, context.Canceled) {
+		cause = fmt.Sprintf(" (the apply ended with: %v)", dispatchErr)
+	}
+	err := fmt.Errorf("pipeline: %w: stream %q was asked to stop, but its apply did not drain within the drain timeout "+
+		"and was cancelled%s. The stop was not graceful: stop_requested_at is left set and no stop is recorded, so "+
+		"`sluice sync stop --wait` does not report success and `sluice schema add-table` refuses against the stream. "+
+		"Start the stream again with the same --stream-id (it resumes from its last committed position and clears the "+
+		"stop request), then stop it with `sluice sync stop --wait`",
+		ErrStopDrainHardCancelled, streamID, cause)
+	slog.WarnContext(ctx, StopDrainHardCancelledMarker+": the stop's drain was hard-cancelled; not reporting a graceful stop",
+		slog.String("stream_id", streamID), slog.String("error", err.Error()))
+	return err
 }
 
 // stopSignalPollInterval is how often the polling goroutine checks
@@ -169,13 +243,14 @@ type testCleaner interface {
 // engine appliers satisfy. Callers that pass a non-conforming
 // applier should skip calling pollStopSignal entirely.
 //
-// observed is set to true the moment the poll first sees the stop
-// flag, before cancelStream fires. The Streamer reads it after
-// dispatchApply returns to decide whether the exit was triggered by
-// a stop-signal request (vs Ctrl-C / context cancel from outside);
-// when true, the streamer clears stop_requested_at so a CLI
-// `sync stop --wait` can detect graceful-drain completion.
-func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID string, cancelStream, cancelApply context.CancelFunc, observed *atomic.Bool) {
+// state (nil-safe) records what the poll saw ([stopSignal]): observed is
+// set the moment the poll first sees the stop flag, before cancelStream
+// fires, and hardCancelled before the watchdog's cancelApply. The Streamer
+// reads both after dispatchApply returns: a stop-signal-driven drain (not
+// Ctrl-C / an outer cancel) that finished gracefully clears
+// stop_requested_at so a CLI `sync stop --wait` can detect its completion;
+// a hard-cancelled one does not.
+func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID string, cancelStream, cancelApply context.CancelFunc, state *stopSignal) {
 	t := time.NewTicker(loadPollIntervalForTest())
 	defer t.Stop()
 
@@ -206,8 +281,8 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 			continue
 		}
 		if stopRequested {
-			if observed != nil {
-				observed.Store(true)
+			if state != nil {
+				state.observed.Store(true)
 			}
 			slog.InfoContext(
 				pollCtx, "stop requested via control table; draining stream and exiting",
@@ -233,6 +308,9 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 						slog.String("stream_id", streamID),
 						slog.Duration("timeout", drainTimeout),
 					)
+					if state != nil {
+						state.hardCancelled.Store(true)
+					}
 					cancelApply()
 				}
 			}()

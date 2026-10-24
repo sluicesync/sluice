@@ -297,11 +297,48 @@ func vcrStopMidCopyPersistingNothing(t *testing.T, r vcrRig, s *Streamer, big st
 	if err := run.stop(t); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("RIG: phase 1's stop returned %v", err)
 	}
+	vcrWaitTargetQuiet(t, r)
 	if tok := cell.persistedPosition(t); tok != "" {
 		t.Fatalf("the stopped copy left a persisted position: %s", tok)
 	}
 	t.Logf("phase 1 stopped mid-copy with no persisted position; %s target holds %d of %d rows",
 		big, len(vcrIDs(t, r.tgt(), big)), sourceRows)
+}
+
+// vcrWaitTargetQuiet waits until no other session on the target database is
+// doing anything (VSTREAM-COPY-RESUME-SAA-TEST-STRAGGLER): a stopped copy's
+// last write batch could still be committing after its Run returned, and a
+// cell that counts the target's rows right after the stop and again after a
+// refused re-run then saw that batch land between the two counts (5000
+// before, 5500 after) and blamed the refused run. "Quiet" is no other client
+// session on the database that is not idle (Postgres pg_stat_activity, MySQL
+// the processlist); an idle pooled connection holds no write. When the wait
+// was needed it is logged, as evidence that Run returned before its copy's
+// writers finished, which is filed separately and not settled here.
+func vcrWaitTargetQuiet(t *testing.T, r vcrRig) {
+	t.Helper()
+	query := "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() " +
+		"AND backend_type = 'client backend' AND state <> 'idle'"
+	if r.targetEngine() == "mysql" {
+		query = "SELECT count(*) FROM information_schema.processlist WHERE db = DATABASE() AND id <> CONNECTION_ID() " +
+			"AND command <> 'Sleep'"
+	}
+	start := time.Now()
+	deadline := start.Add(2 * time.Minute)
+	for polls := 0; ; polls++ {
+		busy := r.tgt().scalar(t, query)
+		if busy == "0" {
+			if polls > 0 {
+				t.Logf("STRAGGLER: the target had other active sessions for %s after phase 1's Run returned",
+					time.Since(start).Round(time.Millisecond))
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("RIG: the target still has %s active session(s) 2 minutes after phase 1's Run returned", busy)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // vcrRequireRefusal runs phase 2, a plain re-run, which must exit with an

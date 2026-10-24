@@ -525,6 +525,18 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 		// sync ran healthy for long enough before dying.
 		consecutive := s.recordFailure(sy.ID, err, ran >= s.policy.HealthyRunThreshold)
 
+		// A `sync stop` whose drain was hard-cancelled (STOP-DRAIN-HARD-
+		// CANCELLED) is not restarted: the operator asked the leg to stop,
+		// and a restart would clear the stop request at its start and keep
+		// streaming. It ends failed rather than stopped because it did not
+		// drain: the fleet's exit says so, and the error names the remedy.
+		if errors.Is(err, ErrStopDrainHardCancelled) {
+			slog.ErrorContext(ctx, "supervisor: sync's stop was hard-cancelled after its drain timed out; not restarting",
+				slog.String("stream_id", sy.ID), slog.String("err", err.Error()))
+			s.setState(sy.ID, SyncFailed, err)
+			return
+		}
+
 		// An UNFORWARDED-SCHEMA-CHANGE refusal (GC-2) is not restarted. It is
 		// recorded on the target and replayed at every start, so a restart
 		// could only refuse again — and if that recording ever failed, the

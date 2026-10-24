@@ -369,7 +369,8 @@ func controlTableDDL(controlKeyspace string) string {
 	target_schema          VARCHAR(255) NULL,
 	rows_applied           BIGINT       NOT NULL DEFAULT 0,
 	unforwarded_refusal    TEXT         NULL,
-	live_added_tables      ` + liveAddedTablesColumnDef + `,
+	stream_alive_ms        BIGINT       NULL,
+	live_added_tables     ` + liveAddedTablesColumnDef + `,
 	pending_added_tables   ` + tableSetColumnDef + `,
 	established_tables     ` + tableSetColumnDef + `,
 	dropped_tables         ` + tableSetColumnDef + `,
@@ -1068,7 +1069,11 @@ func listStreamsLegacy(ctx context.Context, db *sql.DB, controlKeyspace, engineN
 // phase 2). 0 for a no-data position write (broker cold-start,
 // schema-delta-only incrementals, a Truncate/SchemaSnapshot serial
 // apply).
-func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64, upsert upsertSpelling) error {
+//
+// stampAlive also stamps the stream's liveness column in the same statement
+// ([writePositionUpsertSQL]); every caller passes the applier's
+// [ChangeApplier.stampsLiveness] (TestPositionWritesStampLiveness).
+func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64, upsert upsertSpelling, stampAlive bool) error {
 	// Sidecar-keyspace feature: when controlKeyspace is set, this UPSERT
 	// still rides the SAME per-change *sql.Tx as the data write (ADR-0007 /
 	// ADR-0049 #4a atomicity) — it is deliberately NOT decoupled onto a
@@ -1111,7 +1116,7 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 	// the measured behaviour of vtcombo 25; the tear test is its check.
 	// Empty controlKeyspace is unchanged single-keyspace, genuinely atomic
 	// behaviour.
-	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace, upsert), streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied); err != nil {
+	if _, err := tx.ExecContext(ctx, writePositionUpsertSQL(controlKeyspace, upsert, stampAlive), streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema, rowsApplied); err != nil {
 		return fmt.Errorf("mysql: write position: %w", err)
 	}
 	return nil
@@ -1127,11 +1132,25 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 // fully-qualified reference as the table, so a qualified name yields a valid
 // three-part `ks`.`table`.column reference and the bare name yields the
 // historical `table`.column form.
-func writePositionUpsertSQL(controlKeyspace string, upsert upsertSpelling) string {
+//
+// stampAlive adds the stream's liveness stamp (the server's clock in Unix ms,
+// [appliershared.StreamLivenessColumn]) to the same upsert, overwriting a
+// stopped marker: a stream that advances its position is running, so a
+// drained add-table cannot pass while it applies, whatever happens to the
+// Run's own stamping goroutine. updated_at keeps its position-write
+// semantics (its ON UPDATE fires for this statement as it always has). False
+// (byte-identical to the historical statement) only when the control table
+// has no such column.
+func writePositionUpsertSQL(controlKeyspace string, upsert upsertSpelling, stampAlive bool) string {
 	ref := controlTableRef(controlKeyspace, controlTableName)
+	aliveCol, aliveVal, aliveSet := "", "", ""
+	if stampAlive {
+		col := appliershared.StreamLivenessColumn
+		aliveCol, aliveVal, aliveSet = ", "+col, ", "+mysqlNowMillisExpr, ", "+col+" = "+upsert.newRowRef(col)
+	}
 	return "INSERT INTO " + ref + " " +
-		"(stream_id, source_position, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied) " +
-		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?)" +
+		"(stream_id, source_position, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied" + aliveCol + ") " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?" + aliveVal + ")" +
 		upsert.clauseOpen() +
 		"source_position = " + upsert.newRowRef("source_position") + ", " +
 		"slot_name = COALESCE(" + upsert.newRowRef("slot_name") + ", " + ref + ".slot_name), " +
@@ -1142,7 +1161,7 @@ func writePositionUpsertSQL(controlKeyspace string, upsert upsertSpelling) strin
 		// rows_applied ACCUMULATES: add this write's delta to the existing
 		// count (COALESCE guards a legacy NULL row, though NOT NULL DEFAULT 0
 		// means the column is never NULL post-migration).
-		"rows_applied = COALESCE(" + ref + ".rows_applied, 0) + " + upsert.newRowRef("rows_applied")
+		"rows_applied = COALESCE(" + ref + ".rows_applied, 0) + " + upsert.newRowRef("rows_applied") + aliveSet
 }
 
 // readStopRequested returns true when the named stream's row has a

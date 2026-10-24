@@ -610,7 +610,7 @@ func (b *mysqlBatchTx) writePosition(ctx context.Context, streamID, token string
 	}
 	posCtx, posCancel := b.a.execTimeoutCtx(ctx)
 	defer posCancel()
-	return writePositionTx(posCtx, b.tx, b.a.controlKeyspace, streamID, token, b.a.slotName, b.a.publicationName, b.a.rowFilterHash, b.a.sourceFingerprint, b.a.targetSchema, rowsApplied, b.a.upsert)
+	return writePositionTx(posCtx, b.tx, b.a.controlKeyspace, streamID, token, b.a.slotName, b.a.publicationName, b.a.rowFilterHash, b.a.sourceFingerprint, b.a.targetSchema, rowsApplied, b.a.upsert, b.a.stampsLiveness())
 }
 
 // commit flushes any remaining pending run (the CheckpointOnlyAtTxBoundary

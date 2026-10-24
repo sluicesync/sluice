@@ -334,6 +334,8 @@ type atkResult struct {
 	bigOnTarget   bool            // the out-of-scope table reached the target
 	markersLanded map[string]bool // the post-add marker reached the target
 	note          string
+	revivedExited bool  // atkReviveMidAdd: the stream restarted mid-add returned on its own
+	revivedErr    error // and with this
 }
 
 func (r atkResult) String() string {
@@ -465,9 +467,69 @@ func atkEstablish(t *testing.T, r vcrRig, p, est string, warm bool) (*twfbRun, f
 	return stream, mk
 }
 
+// atkMode is how a drained cell stops the stream around the add.
+type atkMode int
+
+const (
+	// atkCancel stops the stream by cancelling its Run (a Ctrl-C): the
+	// cell the header's measurement describes.
+	atkCancel atkMode = iota
+	// atkRefuseRunning first runs the drained add against the RUNNING
+	// stream, which must refuse (DRAINED-ADD-TABLE-STREAM-NOT-STOPPED) with the
+	// target untouched, then stops the stream with `sync stop --wait`'s
+	// protocol and runs the add for real.
+	atkRefuseRunning
+	// atkReviveMidAdd stops the stream with `sync stop --wait`'s protocol,
+	// then restarts it while the add is copying (a supervisor restart, a
+	// fleet reload): the start must defer (INCLUDE-TABLE-ADD-IN-PROGRESS)
+	// rather than stream with the added table out of its scope.
+	atkReviveMidAdd
+)
+
+// atkStopWait is `sluice sync stop --wait` against the rig's stream
+// ([syncStopWait]).
+func atkStopWait(t *testing.T, r vcrRig, streamID string, stream *twfbRun) {
+	t.Helper()
+	tgtEng, _ := engines.Get(r.targetEngine())
+	syncStopWait(t, tgtEng, r.tgtDSN, streamID, stream)
+}
+
+// atkRefuseAgainstRunning runs the drained add of add against the running
+// stream p and requires the refusal, with nothing written to the target.
+func atkRefuseAgainstRunning(t *testing.T, r vcrRig, p, add string) {
+	t.Helper()
+	drainHBWaitStamped(t, r.tgtDSN, p) // the running-stream refusal, not the never-stamped one
+	liveBefore := atkControlColumn(t, r, p, "live_added_tables")
+	pendingBefore := atkControlColumn(t, r, p, "pending_added_tables")
+	srcEng, _ := engines.Get("planetscale")
+	tgtEng, _ := engines.Get(r.targetEngine())
+	err := (&AddTable{
+		Source: srcEng, Target: tgtEng,
+		SourceDSN: r.streamDSN, TargetDSN: r.tgtDSN,
+		StreamID: p, TableName: add,
+	}).Run(context.Background())
+	if err == nil {
+		t.Fatalf("a drained add-table against a running stream succeeded; want the %s refusal", DrainedAddTableStreamNotStoppedMarker)
+	}
+	for _, want := range []string{DrainedAddTableStreamNotStoppedMarker, "has not recorded that it stopped", "sluice sync stop --wait --stream-id " + p, "must not run while the stream applies changes"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal = %v; want it to contain %q", err, want)
+		}
+	}
+	if rows := atkRows(t, r.tgt(), add); rows != nil {
+		t.Errorf("the refused add left %s on the target (%d rows); want it absent", add, len(rows))
+	}
+	if got := atkControlColumn(t, r, p, "live_added_tables"); got != liveBefore {
+		t.Errorf("live_added_tables = %q after the refusal; want it unchanged (%q)", got, liveBefore)
+	}
+	if got := atkControlColumn(t, r, p, "pending_added_tables"); got != pendingBefore {
+		t.Errorf("pending_added_tables = %q after the refusal; want it unchanged (%q)", got, pendingBefore)
+	}
+}
+
 // atkRunCell runs one drained add of _2add into a stream established on
 // _1est, with two rounds of source changes during the add's copy.
-func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix string, run int) atkResult {
+func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix string, run int, mode atkMode) atkResult {
 	t.Helper()
 	p := fmt.Sprintf("%s%d", prefix, run)
 	est, add, big := p+"_1est", p+"_2add", p+"_3big"
@@ -490,8 +552,16 @@ func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix
 		}
 	}()
 	stream, mk := atkEstablish(t, r, p, est, false)
-	if err := stream.stop(t); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("RIG: drained stop: %v", err)
+	switch mode {
+	case atkCancel:
+		if err := stream.stop(t); err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("RIG: drained stop: %v", err)
+		}
+	case atkRefuseRunning:
+		atkRefuseAgainstRunning(t, r, p, add)
+		atkStopWait(t, r, p, stream)
+	case atkReviveMidAdd:
+		atkStopWait(t, r, p, stream)
 	}
 
 	pe, ok := engines.Get("planetscale")
@@ -549,6 +619,19 @@ func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix
 	}
 	atkApply(t, r.mysqlDSN, round1)
 
+	// The stream comes back mid-copy. Its start must defer while the add
+	// runs; were it to stream, _2add would be outside its scope until the
+	// add records it, and round 1's changes to it would be gone.
+	var revived *twfbRun
+	if mode == atkReviveMidAdd {
+		revived = startTWFBRun(mk())
+		deferUntil := time.Now().Add(120 * time.Second)
+		for !revived.exited() && time.Now().Before(deferUntil) && !pollAdd() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		res.revivedExited, res.revivedErr = revived.exited(), revived.err
+	}
+
 	// Round 2: _2add fully on the target, vtgate still copying _3big.
 	want := atkAddRows - 60
 	for {
@@ -587,6 +670,12 @@ func atkRunCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix
 		}
 	}
 	res.addErr = addErr
+	if revived != nil && !revived.exited() {
+		// It streamed through the add (no deferral): stop it so the
+		// verdict below sees what it left, from the restart's position.
+		res.note = "the stream restarted mid-add kept running"
+		_ = revived.stop(t)
+	}
 	res.wireBytes = proxy.down.Load()
 	res.received, res.drainErr = counter.counts()
 	if addErr != nil {
@@ -678,12 +767,16 @@ func atkRuns() int {
 	return 1
 }
 
-func atkCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix string) {
+func atkCell(t *testing.T, r vcrRig, proxyDSN string, proxy *atkProxy, prefix string, mode atkMode) {
 	t.Helper()
 	runs := atkRuns()
 	for i := 1; i <= runs; i++ {
-		res := atkRunCell(t, r, proxyDSN, proxy, prefix, i)
+		res := atkRunCell(t, r, proxyDSN, proxy, prefix, i, mode)
 		t.Logf("RUN %d/%d: %s", i, runs, res)
+		if mode == atkReviveMidAdd && (!res.revivedExited || !errors.Is(res.revivedErr, ir.ErrIncludeTableAddInProgress)) {
+			t.Errorf("RUN %d: the stream restarted mid-add did not defer with INCLUDE-TABLE-ADD-IN-PROGRESS (returned=%v err=%v)",
+				i, res.revivedExited, res.revivedErr)
+		}
 		if res.addErr != nil {
 			t.Errorf("RUN %d: the add failed: %v", i, res.addErr)
 			continue
@@ -846,7 +939,24 @@ func TestStreamer_VStreamAddTableKeyspaceWideCopy(t *testing.T) {
 		tgtDSN, cleanupTgt := startPGTarget(t)
 		defer cleanupTgt()
 		r := vcrRig{mysqlDSN: mysqlDSN, streamDSN: streamDSN, tgtDSN: tgtDSN, logs: &logs}
-		atkCell(t, r, proxyDSN, proxy, "dr")
+		atkCell(t, r, proxyDSN, proxy, "dr", atkCancel)
+	})
+	// DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED. Before the fix, a drained
+	// add against a stream left running (LiveMode false in the old
+	// --no-drain cells) left the same 80 deletes and 10 updates stale as
+	// --no-drain did. Now it refuses with the target untouched, and after
+	// `sync stop --wait` the same add is exact; and a stream restarted while
+	// the add copies defers instead of streaming with the table out of scope.
+	t.Run("DrainedRunning/MySQLTarget", func(t *testing.T) {
+		tgtDSN, cleanupTgt := startMySQLTarget(t)
+		defer cleanupTgt()
+		r := vcrRig{mysqlDSN: mysqlDSN, streamDSN: streamDSN, tgtDSN: tgtDSN, logs: &logs, tgtEngine: "mysql"}
+		t.Run("RefusedThenStopWait", func(t *testing.T) {
+			atkCell(t, r, proxyDSN, proxy, "rr", atkRefuseRunning)
+		})
+		t.Run("RestartedMidAdd", func(t *testing.T) {
+			atkCell(t, r, proxyDSN, proxy, "rv", atkReviveMidAdd)
+		})
 	})
 	t.Run("MySQLTarget", func(t *testing.T) {
 		tgtDSN, cleanupTgt := startMySQLTarget(t)
@@ -855,7 +965,7 @@ func TestStreamer_VStreamAddTableKeyspaceWideCopy(t *testing.T) {
 		// The drained flow into the target the --no-drain cells use: exact,
 		// the same pin as the Postgres cell.
 		t.Run("Drained", func(t *testing.T) {
-			atkCell(t, r, proxyDSN, proxy, "dm")
+			atkCell(t, r, proxyDSN, proxy, "dm", atkCancel)
 		})
 		// --no-drain refuses (NO-DRAIN-VSTREAM-SOURCE). Before the refusal
 		// both cells left 80 deletes and 10 updates of the added table stale

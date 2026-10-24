@@ -105,7 +105,7 @@ func TestPollStopSignal_CancelsStreamOnFlag(t *testing.T) {
 }
 
 // TestPollStopSignal_SetsObservedOnFlag verifies the v0.9.0 hook for
-// `sync stop --wait`: the optional observed *atomic.Bool is set the
+// `sync stop --wait`: the optional stopSignal.observed is set the
 // moment pollStopSignal first sees the flag, before cancelStream
 // fires. Streamer.Run reads it after dispatchApply returns to decide
 // whether to clear stop_requested_at — only stop-signal-driven
@@ -118,18 +118,18 @@ func TestPollStopSignal_SetsObservedOnFlag(t *testing.T) {
 	pollCtx, cancelPoll := context.WithCancel(context.Background())
 	defer cancelPoll()
 
-	var observed atomic.Bool
+	var state stopSignal
 	var streamCancelled atomic.Bool
 	cancelStream := func() { streamCancelled.Store(true) }
 	cancelApply := func() {}
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, &observed)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, &state)
 		close(done)
 	}()
 
-	if observed.Load() {
+	if state.observed.Load() {
 		t.Fatal("observed set before flag was raised")
 	}
 	reader.setStopRequested(true)
@@ -139,7 +139,7 @@ func TestPollStopSignal_SetsObservedOnFlag(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("poll loop did not return after stop flag was observed")
 	}
-	if !observed.Load() {
+	if !state.observed.Load() {
 		t.Error("observed was not set when stop flag was observed")
 	}
 	if !streamCancelled.Load() {

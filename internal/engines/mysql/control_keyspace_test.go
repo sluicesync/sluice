@@ -187,7 +187,7 @@ func TestWritePositionUpsertSQL(t *testing.T) {
 		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `sluice_cdc_state`.source_dsn_fingerprint), " +
 		"target_schema = COALESCE(new.target_schema, `sluice_cdc_state`.target_schema), " +
 		"rows_applied = COALESCE(`sluice_cdc_state`.rows_applied, 0) + new.rows_applied"
-	if got := writePositionUpsertSQL("", upsertRowAlias); got != wantBare {
+	if got := writePositionUpsertSQL("", upsertRowAlias, false); got != wantBare {
 		t.Fatalf("writePositionUpsertSQL(\"\") not byte-identical to expected statement:\n got: %s\nwant: %s", got, wantBare)
 	}
 
@@ -202,7 +202,7 @@ func TestWritePositionUpsertSQL(t *testing.T) {
 		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `ctl`.`sluice_cdc_state`.source_dsn_fingerprint), " +
 		"target_schema = COALESCE(new.target_schema, `ctl`.`sluice_cdc_state`.target_schema), " +
 		"rows_applied = COALESCE(`ctl`.`sluice_cdc_state`.rows_applied, 0) + new.rows_applied"
-	if got := writePositionUpsertSQL("ctl", upsertRowAlias); got != wantQualified {
+	if got := writePositionUpsertSQL("ctl", upsertRowAlias, false); got != wantQualified {
 		t.Fatalf("writePositionUpsertSQL(\"ctl\"):\n got: %s\nwant: %s", got, wantQualified)
 	}
 }

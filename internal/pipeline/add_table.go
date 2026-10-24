@@ -257,6 +257,15 @@ type AddTable struct {
 	// pendingToken identifies this run's pending entry; every later write to
 	// it compares-and-sets on it ([ir.PendingAddedTablesStore]).
 	pendingToken string
+	// pendingPredecessor: an entry for the table was pending before this
+	// run recorded its own over it (or that could not be read), so a refusal
+	// ages this run's entry rather than removing the evidence
+	// ([AddTable.recheckStreamStoppedAfterPending]).
+	pendingPredecessor bool
+	// positionAtStart is the stream's persisted position as the drained
+	// checks before the copy passed it, the baseline
+	// [AddTable.refuseStreamRanDuringAdd] compares against.
+	positionAtStart streamPositionMark
 	// copyTimeID is the table's engine id when its copy started.
 	copyTimeID string
 }
@@ -501,6 +510,11 @@ func (a *AddTable) Run(ctx context.Context) error {
 	if err := a.recordPendingAdd(ctx, applier); err != nil {
 		return err
 	}
+	// Unconditional: --no-drain refused in preflightStream, so every add
+	// that gets here is drained (DRAINED-ADD-TABLE-STREAM-NOT-STOPPED).
+	if err := a.recheckStreamStoppedAfterPending(ctx, applier); err != nil {
+		return err
+	}
 	if err := a.bringInTableUnderHeartbeat(ctx, applier, preflight, scoped, sw, rw); err != nil {
 		if errors.Is(err, ir.ErrPendingAddSuperseded) {
 			return a.supersededError(err)
@@ -608,6 +622,13 @@ func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, p
 		)
 	}
 
+	// ---- 6a. A drained add whose stream applied during the copy refuses
+	// here, before the table is recorded (DRAINED-ADD-TABLE-STREAM-NOT-STOPPED;
+	// every add that reaches this is drained).
+	if err := a.refuseStreamRanDuringAdd(ctx, applier); err != nil {
+		return err
+	}
+
 	// ---- 7. MySQL-side filter-flip (ADR-0034): record the new table on
 	// cdc-state.live_added_tables so the running streamer's poll merges
 	// it into the dispatch filter. No-op on the drained and PG paths.
@@ -624,6 +645,15 @@ func (a *AddTable) recordPendingAdd(ctx context.Context, applier ir.ChangeApplie
 	if !ok {
 		slog.DebugContext(ctx, "add-table: target applier keeps no pending-add record; skipping it", slog.String("target", a.Target.Name()))
 		return nil
+	}
+	a.pendingPredecessor = true // unless the read below shows none
+	if pending, _, err := store.ReadPendingAddedTables(ctx, a.StreamID); err == nil {
+		a.pendingPredecessor = false
+		for _, p := range pending {
+			if p.Table == a.TableName {
+				a.pendingPredecessor = true
+			}
+		}
 	}
 	a.pendingToken = newPendingToken()
 	if err := store.RecordPendingAddedTable(ctx, a.StreamID, a.TableName, a.pendingToken); err != nil {
@@ -1108,12 +1138,150 @@ func resolveAddTableTargetSchema(streamID, operatorFlag, recorded string) (strin
 	}
 }
 
-// preflightDrained applies the Phase 1 conservative refusal: the
-// stream must not have an in-flight `sync stop`. The operator is
-// expected to have run `sluice sync stop --wait` before invoking
-// add-table, which leaves the row present and the stop flag
-// cleared.
+// preflightDrained applies the drained flow's refusals: the stream must
+// not have an in-flight `sync stop`, and it must have recorded that it
+// stopped. The operator is expected to have run `sluice sync stop --wait`
+// before invoking add-table, which leaves the row present, the stop flag
+// cleared and the stop recorded on the liveness column.
+//
+// The stopped check (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED) is the one
+// that matters: until it existed a stream that was never stopped passed, and
+// the add then behaved as the live filter-flip path on every source without
+// a publication — 80 deletes and 10 updates of the added table stale on the
+// measured VStream rig (TestStreamer_VStreamAddTableKeyspaceWideCopy). It is
+// judged again after the pending entry is written
+// ([AddTable.recheckStreamStoppedAfterPending]), which closes the window
+// where the stream starts between this read and that write, and once more
+// after the copy ([AddTable.refuseStreamRanDuringAdd]).
 func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplier) error {
+	if err := a.preflightStopFlag(ctx, applier); err != nil {
+		return err
+	}
+	return a.refuseRunningStream(ctx, applier)
+}
+
+// refuseRunningStream is [judgeStreamStopped] on the stream's liveness
+// record. An applier without the surface cannot show the stream stopped, so
+// it refuses too; both shipping appliers have it. When it passes it notes the
+// stream's position, the baseline [AddTable.refuseStreamRanDuringAdd]
+// compares against.
+func (a *AddTable) refuseRunningStream(ctx context.Context, applier ir.ChangeApplier) error {
+	store, ok := applier.(ir.StreamLivenessStore)
+	if !ok {
+		return fmt.Errorf("pipeline: add-table: %w: the %s target keeps no liveness record, so nothing shows that "+
+			"stream %q stopped; use a target engine that does", errStreamNotStopped, engineNameOrEmpty(a.Target), a.StreamID)
+	}
+	l, err := store.ReadStreamLiveness(ctx, a.StreamID)
+	if err := judgeStreamStopped(a.StreamID, l, err); err != nil {
+		return err
+	}
+	pos, found, err := applier.ReadPosition(ctx, a.StreamID)
+	if err != nil {
+		return fmt.Errorf("pipeline: add-table: %w: could not read stream %q's position, which the add compares after "+
+			"its copy to prove the stream did not run during it (%w); run the add again once the target answers",
+			errStreamNotStopped, a.StreamID, err)
+	}
+	a.positionAtStart = streamPositionMark{token: pos.Token, found: found}
+	return nil
+}
+
+// streamPositionMark is a stream's persisted position as the add read it.
+type streamPositionMark struct {
+	token string
+	found bool
+}
+
+// recheckStreamStoppedAfterPending judges the stream's liveness again once
+// the add's pending entry is written. A stream that started after
+// [AddTable.preflightDrained] read the record either stamped before this
+// read — and is refused here — or read the pending entries after the entry
+// landed, and its start door refuses it ([Streamer.judgePendingAdds]).
+//
+// On a refusal nothing but the entry was changed, and what happens to it
+// depends on what it replaced. With no earlier entry for the table it is
+// removed. Over an earlier one — a dead add's entry, which is the evidence
+// that the target table may hold a partial copy — it is aged out instead
+// (heartbeat to the epoch, under this run's token, as a failed add does), so
+// the evidence survives as an incomplete add rather than vanishing.
+func (a *AddTable) recheckStreamStoppedAfterPending(ctx context.Context, applier ir.ChangeApplier) error {
+	err := a.refuseRunningStream(ctx, applier)
+	if err == nil {
+		return nil
+	}
+	store, ok := applier.(ir.PendingAddedTablesStore)
+	if !ok {
+		return err
+	}
+	undoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if a.pendingPredecessor {
+		if terr := store.TouchPendingAddedTable(undoCtx, a.StreamID, a.TableName, a.pendingToken, false); terr != nil {
+			return fmt.Errorf("%w (the pending add-table record of %q, which replaced an earlier one, could not be aged "+
+				"out (%v); it goes stale in %s)", err, a.TableName, terr, ir.PendingAddStaleAfter)
+		}
+		return err
+	}
+	if cerr := store.ClearPendingAddedTables(undoCtx, a.StreamID, []string{a.TableName}); cerr != nil {
+		return fmt.Errorf("%w (the pending add-table record of %q could not be removed (%v); `sluice schema "+
+			"add-table --abandon %s` retires it once it is stale)", err, a.TableName, cerr, a.TableName)
+	}
+	return err
+}
+
+// refuseStreamRanDuringAdd is the drained add's last check, made after the
+// copy and before the table is handed over on a source without a
+// publication: the stream must still have recorded a stop, and its position
+// must be the one the add started from. Only a position write changes the
+// position, so a stream that applied anything during the add — and then
+// stopped cleanly, which leaves the stopped marker — is caught by the second
+// half. The add then fails like any failed add (its pending entry is aged
+// out, and on a Postgres source the publication add this run made is taken
+// back).
+func (a *AddTable) refuseStreamRanDuringAdd(ctx context.Context, applier ir.ChangeApplier) error {
+	store, ok := applier.(ir.StreamLivenessStore)
+	if !ok {
+		return nil // refused at the preflight already
+	}
+	l, err := store.ReadStreamLiveness(ctx, a.StreamID)
+	var pos ir.Position
+	var found bool
+	if err == nil {
+		pos, found, err = applier.ReadPosition(ctx, a.StreamID)
+	}
+	if err != nil {
+		return fmt.Errorf("pipeline: add-table: %w: could not read whether stream %q ran during the add (%w); %s",
+			errStreamNotStopped, a.StreamID, err, a.notHandedOver())
+	}
+	moved := found != a.positionAtStart.found || pos.Token != a.positionAtStart.token
+	if (!l.Found || l.Stopped) && !moved {
+		return nil
+	}
+	what := "its position moved during the add"
+	if !moved {
+		what = "it recorded that it was running during the add"
+	}
+	return fmt.Errorf("pipeline: add-table: %w: stream %q ran while the table was being copied (%s), so it may have "+
+		"applied and dropped changes to %q that the copy did not hold; %s",
+		errStreamNotStopped, a.StreamID, what, a.TableName, a.notHandedOver())
+}
+
+// notHandedOver is the last check's remedy, which depends on whether the
+// table had already joined the stream's scope: on a source with a
+// publication the add records it before its copy.
+func (a *AddTable) notHandedOver() string {
+	stopIt := fmt.Sprintf("`sluice sync stop --wait --stream-id %s`", a.StreamID)
+	if _, publicationSource := a.Source.(publicationAdder); publicationSource {
+		return fmt.Sprintf("the table had already joined the stream's scope (its live-added set, recorded before the "+
+			"copy), and the publication add this run made is taken back. Stop the stream with %s, take the table "+
+			"back out with `sluice schema add-table --abandon %s`, empty the target table, and run the add again",
+			stopIt, a.TableName)
+	}
+	return fmt.Sprintf("the table was copied but NOT handed to the stream. Stop the stream with %s, empty the target "+
+		"table, and run the add again", stopIt)
+}
+
+// preflightStopFlag refuses a stream with an in-flight `sync stop`.
+func (a *AddTable) preflightStopFlag(ctx context.Context, applier ir.ChangeApplier) error {
 	reader, ok := applier.(stopFlagReader)
 	if !ok {
 		// Engine doesn't expose the stop-flag surface. We can't
@@ -1132,7 +1300,13 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 	if stopRequested {
 		// No --no-drain alternative is offered: it is withdrawn on every
 		// source (Bug 332).
-		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table", a.StreamID)
+		// A stop whose drain was hard-cancelled leaves the flag set on
+		// purpose (STOP-DRAIN-HARD-CANCELLED), so the flag alone does not
+		// mean a drain is still coming; the message names that case's
+		// remedy too.
+		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table. "+
+			"If that stop already ended without draining (its `sync stop --wait` timed out, or the stream exited with %s), start the stream once with the same --stream-id and stop it with `sluice sync stop --wait`",
+			a.StreamID, StopDrainHardCancelledMarker)
 	}
 	return nil
 }
@@ -1208,15 +1382,15 @@ func noDrainRefusal(source string, sourceCDC ir.CDCMethod, cdcFrom string) error
 }
 
 // drainedAddTableFlow is the remedy every --no-drain refusal names. The
-// stop must hold for the whole add: add-table does not detect a stream
-// that is still running (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED), and a
-// fleet supervisor's Reconcile restarts a stopped leg that is still in its
-// config on the next reload.
+// stop must hold for the whole add: a drained add refuses a stream that has
+// not recorded a stop (DrainedAddTableStreamNotStoppedMarker) and one whose
+// position moved during the add, and a fleet supervisor's Reconcile
+// restarts a stopped leg that is still in its config on the next reload.
 const drainedAddTableFlow = "Use the drained add-table flow: `sluice sync stop --wait`, then `sluice schema add-table` without --no-drain, then start the stream again: " +
 	"`sluice sync start` with the same --stream-id (it warm-resumes from the stream's position and replays what changed during the add), " +
 	"or, for a `sluice sync run` fleet leg, the fleet (a leg restarts from its fleet config, not from `sync start --stream-id`). " +
 	"Keep the stream stopped until add-table returns: no fleet reload, no supervisor or systemd restart in between. " +
-	"add-table does not detect a stream that is still running, and an add without --no-drain against one loses the same changes"
+	"An add without --no-drain refuses (" + DrainedAddTableStreamNotStoppedMarker + ") until the stream has recorded its stop, and again if the stream ran while the table was copied"
 
 // positionCDCClassifier reports which CDC method wrote a persisted stream
 // position. The MySQL engine implements it for every flavor, because its
