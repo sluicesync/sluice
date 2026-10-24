@@ -84,6 +84,11 @@ type copyStream struct {
 	// different stream's group). Set by the driver at partition time.
 	resumeSeed      []shardGtid
 	resumeSeedTable string
+
+	// boundary records where each shard's copy of the table in flight
+	// ended (cdc_vstream_shard_copy_boundary.go). Reset per table.
+	// Stream-owned.
+	boundary shardCopyBoundary
 }
 
 // copyPumpAutoShardConcurrent is the K > 1 concurrent driver (ADR-0099). It
@@ -281,6 +286,7 @@ func (cs *copyStream) run(ctx context.Context, cancel context.CancelFunc) error 
 		// single-table COPY is independent and captures its own P).
 		cs.cur = nil
 		clear(cs.fields)
+		cs.boundary = shardCopyBoundary{}
 	}
 	return nil
 }
@@ -383,8 +389,13 @@ func (cs *copyStream) pumpTable(ctx context.Context, cancel context.CancelFunc, 
 				return nil, derr
 			}
 			if done {
-				snap := make([]shardGtid, len(cs.cur))
-				copy(snap, cs.cur)
+				// A shard that finished before the stream did is kept at
+				// the GTID it finished at ([shardCopyBoundary]).
+				snap, _, serr := cs.boundary.snapshotPosition(cs.cur)
+				cs.boundary.logHeld(s.keyspace, []string{table})
+				if serr != nil {
+					return nil, serr
+				}
 				if len(snap) == 0 {
 					snap = fromBeginningVStreamPos(s.keyspace, s.shards)
 				}
@@ -442,6 +453,8 @@ func (cs *copyStream) dispatchCopyEvent(table string, ev *binlogdata.VEvent) (bo
 		}
 		s.copyCompletedShards[shardScopeKey(ev.GetKeyspace(), ev.GetShard())] = true
 		s.mu.Unlock()
+		cs.boundary.markFinished(ev.GetShard(), cs.cur)
+		logShardCopyFinished(ev, []string{table})
 		return false, nil
 
 	case binlogdata.VEventType_JOURNAL:
@@ -517,18 +530,28 @@ func (cs *copyStream) bufferRow(table string, ev *binlogdata.VEvent) error {
 	if isVitessInternalTable(stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())) {
 		return nil
 	}
+	// A finished shard's later changes are held for the CDC tail, and a
+	// shard still copying sends copy rows only: the mirror of
+	// bufferCopyRow (cdc_vstream_shard_copy_boundary.go).
+	if cs.boundary.finished(rev.GetShard()) {
+		cs.boundary.hold(rev.GetShard(), len(rev.GetRowChanges()))
+		return nil
+	}
 	fields, ok := cs.fields[fieldCacheKey(rev.GetShard(), rev.GetTableName())]
 	if !ok {
 		return fmt.Errorf("mysql/vstream: snapshot: concurrent COPY: row event for %q without preceding FIELD event", table)
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
+		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields, true); err != nil {
+			s.mu.Lock()
+			s.refuseTableLocked(tableName, err)
+			s.mu.Unlock()
+			continue // the event's other row changes are still judged
+		}
+		row, _, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
 		if err != nil {
 			return err
-		}
-		if !ok {
-			continue
 		}
 		if err := s.enqueueConcurrentRowLocked(cs.idx, tableName, row); err != nil {
 			return err

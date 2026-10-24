@@ -793,6 +793,27 @@ type IdempotentCopyReader interface {
 	CopyNeedsIdempotentWriter() bool
 }
 
+// CopyReplayDeferrer is the OPTIONAL surface a snapshot [RowReader]
+// implements when its copy can receive changes the source replays INSIDE
+// the copy that the copy cannot apply in order (a VStream copy: vttablet's
+// catch-up before the next table of a multi-table stream, or after vtgate
+// restarted a shard's stream; a replayed DELETE or key change). By default
+// such a change refuses the table it belongs to
+// (VSTREAM-COPY-ROW-CHANGE-REFUSED).
+//
+// A caller that GUARANTEES a later change stream replays every change from
+// a position at or before the copy's start calls DeferCopyReplaysToStream,
+// before or while it reads rows, and the copy then leaves those changes
+// unapplied for that stream to replay instead of refusing. The one caller
+// is the drained `schema add-table`: the stream it requires stopped resumes
+// from its pre-add persisted position (measured exact,
+// TestStreamer_VStreamAddTableKeyspaceWideCopy's Drained cells). A cold
+// start must never call it: its change stream starts at the copy's own
+// position, after the replayed changes.
+type CopyReplayDeferrer interface {
+	DeferCopyReplaysToStream()
+}
+
 // LossyFloatCopyReader is the OPTIONAL surface a snapshot [RowReader]
 // implements to declare that its cold-start COPY DISPLAY-ROUNDS
 // single-precision FLOAT columns — the value lands at mysqld's

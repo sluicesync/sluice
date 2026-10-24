@@ -930,6 +930,36 @@ type vstreamSnapshotStream struct {
 	// the per-scope-vs-global routing is wired correctly.
 	copyCompletedShards map[string]bool
 
+	// copyBoundary records where each shard's copy ended on the CURRENT copy
+	// stream (reset for every per-table stream), so the snapshot position
+	// keeps a shard that finished early at its own copy GTID
+	// (cdc_vstream_shard_copy_boundary.go). Guarded by mu.
+	copyBoundary shardCopyBoundary
+
+	// cdcResumeRewound is set by [finishCopy] when the single-stream copy's
+	// snapshot position is behind the stream's in-place position (a shard
+	// finished early and its later changes were held): the CDC tail must
+	// then open a fresh stream at the position instead of continuing the
+	// copy stream, which is past those changes. Guarded by mu.
+	cdcResumeRewound bool
+
+	// copyRefusals holds, per table, the first copy-row refusal
+	// ([copyRowChangeRefusal]); readTables records every table a ReadRows
+	// was opened for. Err reports a refusal once its table is read, so a
+	// keyspace-wide stream that buffers tables nobody reads is refused only
+	// for the tables it delivers. Guarded by mu.
+	copyRefusals map[string]error
+	readTables   map[string]bool
+
+	// deferReplays is set by [vstreamSnapshotRows.DeferCopyReplaysToStream]:
+	// the caller guarantees a later change stream replays from before the
+	// copy, so an unappliable replayed change is left unapplied instead of
+	// refusing. deferredReplays counts, per table, every unappliable change
+	// the copy received, deferred or not (a refusal withdrawn by a late
+	// deferral keeps an exact count). Guarded by mu.
+	deferReplays    bool
+	deferredReplays map[string]int
+
 	conn       *grpc.ClientConn
 	grpcStream vtgateservice.Vitess_VStreamClient
 	grpcCancel context.CancelFunc // cancels the gRPC stream context
@@ -1362,6 +1392,7 @@ func (s *vstreamSnapshotStream) copyPumpAutoShard(ctx context.Context, cancel co
 		// next table starts from the beginning and captures its own P.
 		s.currentVgtid = nil
 		clear(s.fields)
+		s.copyBoundary = shardCopyBoundary{}
 		s.posBreadcrumbs = nil
 		s.broadcast()
 		s.mu.Unlock()
@@ -1424,10 +1455,16 @@ func (s *vstreamSnapshotStream) pumpOneTableCopy(ctx context.Context, cancel con
 				// This table's COPY is complete. Snapshot its captured
 				// VGTID under mu (the pump is the sole writer, but reading
 				// it under the same lock keeps the contract uniform).
+				// A shard that finished before the stream did is kept at
+				// the GTID it finished at, so the tail replays the
+				// changes it sent afterwards ([shardCopyBoundary]).
 				s.mu.Lock()
-				snap := make([]shardGtid, len(s.currentVgtid))
-				copy(snap, s.currentVgtid)
+				snap, _, serr := s.copyBoundary.snapshotPosition(s.currentVgtid)
+				s.copyBoundary.logHeld(s.keyspace, s.copyTables)
 				s.mu.Unlock()
+				if serr != nil {
+					return nil, serr
+				}
 				if len(snap) == 0 {
 					// A COPY_COMPLETED with no observed VGTID means vtgate
 					// emitted no GTID for this (possibly empty) table. Fall
@@ -1517,6 +1554,7 @@ func (s *vstreamSnapshotStream) reopenForTableSeeded(ctx context.Context, table 
 func (s *vstreamSnapshotStream) finishCopyAutoShard(stream *ir.SnapshotStream) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.logDeferredReplaysLocked()
 
 	if s.err == nil {
 		startShards, err := stitchSnapshotMin(s.perTableSnapshots)
@@ -1844,11 +1882,23 @@ func (s *vstreamSnapshotStream) finishCopy(stream *ir.SnapshotStream) {
 	defer s.mu.Unlock()
 
 	if s.err == nil {
-		pos, err := encodeVStreamPos(s.currentVgtid)
-		if err != nil {
+		// A shard that finished before the stream did is kept at the GTID
+		// it finished at ([shardCopyBoundary]). When that moves any shard
+		// back, the copy stream is past the held changes, so the CDC tail
+		// opens a fresh stream at the position ([startPump]).
+		snap, moved, serr := s.copyBoundary.snapshotPosition(s.currentVgtid)
+		s.copyBoundary.logHeld(s.keyspace, s.copyTables)
+		s.logDeferredReplaysLocked()
+		if serr != nil {
+			s.err = serr
+		} else if pos, err := encodeVStreamPos(snap); err != nil {
 			s.err = fmt.Errorf("mysql/vstream: snapshot: encode position: %w", err)
 		} else {
 			stream.Position = pos
+			if moved {
+				s.currentVgtid = snap
+				s.cdcResumeRewound = true
+			}
 		}
 	}
 	s.copyComplete = true
@@ -1978,6 +2028,8 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 		}
 		key := shardScopeKey(ev.GetKeyspace(), ev.GetShard())
 		s.copyCompletedShards[key] = true
+		s.copyBoundary.markFinished(ev.GetShard(), s.currentVgtid)
+		logShardCopyFinished(ev, s.copyTables)
 		return false, nil
 
 	case binlogdata.VEventType_JOURNAL:
@@ -2008,10 +2060,11 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 }
 
 // bufferCopyRow decodes a COPY-phase ROW event and appends each row
-// to rowBuffer under the unqualified table name. During COPY mode
-// every RowChange has only an After image (the rows are being
-// copied, not modified); we treat anything that decodes as a row as
-// a snapshot row.
+// to rowBuffer under the unqualified table name. A shard still copying
+// sends copy rows, an After image only; anything else from it is judged
+// by [copyRowChangeRefusal]. A shard that has finished its copy sends
+// binlog changes, which are held for the CDC tail
+// ([shardCopyBoundary]).
 //
 // Caller holds s.mu. Each kept row is enqueued via [enqueueRowLocked],
 // which enforces the byte cap (ADR-0071): backpressure for the table a
@@ -2038,6 +2091,15 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	if isVitessInternalTable(stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())) {
 		return nil
 	}
+	// A shard that has finished its copy streams its binlog from its copy
+	// snapshot: these are changes, not copy rows. The snapshot position
+	// keeps that shard at the GTID it finished at, so the CDC tail replays
+	// every one of them with both images (cdc_vstream_shard_copy_boundary.go,
+	// VSTREAM-SHARD-SKEW-COPY-CHANGES-DROPPED).
+	if s.copyBoundary.finished(rev.GetShard()) {
+		s.copyBoundary.hold(rev.GetShard(), len(rev.GetRowChanges()))
+		return nil
+	}
 	key := fieldCacheKey(rev.GetShard(), rev.GetTableName())
 	fields, ok := s.fields[key]
 	if !ok {
@@ -2045,15 +2107,19 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
+		// A shard still copying sends copy rows (an after image only). A
+		// replayed change it cannot apply refuses this table, or is left to
+		// a later change stream the caller vouched for; it is never skipped
+		// unaccounted (the skip this replaced dropped every DELETE). Either
+		// way the event's other row changes are still judged, so every
+		// unappliable one is counted.
+		if err := copyRowChangeRefusal(rev.GetKeyspace(), rev.GetShard(), tableName, rc, fields, len(s.copyTables) == 1); err != nil {
+			s.refuseTableLocked(tableName, err)
+			continue
+		}
+		row, _, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.zeroDate)
 		if err != nil {
 			return err
-		}
-		if !ok {
-			// COPY-phase rows always have After populated. A missing
-			// After is malformed; skip it so the rest of the table
-			// still buffers cleanly.
-			continue
 		}
 		// Bug 125: every decoded COPY row is buffered — we do NOT drop
 		// behind-the-scan emissions. The pre-v0.100 dedup (GitHub #14)
@@ -2215,7 +2281,15 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 	// P_start. The single-stream path skips this — its one stream is
 	// already keyspace-wide / single-table and at the right position, so
 	// it just resumes in place.
-	if len(s.copyTablesSeq) > 0 {
+	//
+	// The single-stream path reopens too when its snapshot position was
+	// moved back behind the stream (a shard finished its copy early and its
+	// later changes were held, [finishCopy]): continuing in place would
+	// skip them.
+	s.mu.Lock()
+	rewound := s.cdcResumeRewound
+	s.mu.Unlock()
+	if len(s.copyTablesSeq) > 0 || rewound {
 		if err := s.reopenForCDC(ctx); err != nil {
 			return nil, err
 		}
@@ -2258,8 +2332,16 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 	// re-apply each table's server-side WHERE, matching the COPY phase. Only
 	// in-scope tables are streamed, and each carries its filter; unfiltered
 	// syncs keep the keyspace-wide catch-all byte-for-byte.
+	//
+	// The single-stream path (no copyTablesSeq) reaches here only when its
+	// position was moved back ([finishCopy]); its tail keeps exactly the
+	// filter its copy stream carried, which is what continuing in place
+	// would have used.
 	rules := vstreamCopyFilterRules(nil, nil)
-	if len(s.rowFilters) > 0 {
+	switch {
+	case len(s.copyTablesSeq) == 0:
+		rules = vstreamCopyFilterRules(s.copyTables, s.rowFilters)
+	case len(s.rowFilters) > 0:
 		rules = vstreamCopyFilterRules(s.copyTablesSeq, s.rowFilters)
 	}
 	req := &vtgate.VStreamRequest{
@@ -2295,8 +2377,9 @@ func (s *vstreamSnapshotStream) reopenForCDC(ctx context.Context) error {
 	s.grpcCancel = streamCancel
 	clear(s.fields) // the keyspace-wide stream re-emits FIELD per table
 	s.mu.Unlock()
-	slog.InfoContext(ctx, "mysql/vstream: snapshot: auto-shard CDC handoff (keyspace-wide tail from stitched position)",
-		slog.String("keyspace", s.keyspace))
+	slog.InfoContext(ctx, "mysql/vstream: snapshot: CDC handoff (tail opened at the snapshot position)",
+		slog.String("keyspace", s.keyspace),
+		slog.Bool("per_table_copy", len(s.copyTablesSeq) > 0))
 	return nil
 }
 
@@ -2787,7 +2870,83 @@ func (s *vstreamSnapshotStream) setErr(err error) {
 func (s *vstreamSnapshotStream) Err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.err
+	if s.err != nil {
+		return s.err
+	}
+	return s.readTableRefusalLocked()
+}
+
+// refuseTableLocked handles one change [copyRowChangeRefusal] judged
+// unappliable. Every such change is counted in deferredReplays and never
+// applied. Unless the caller deferred replays to a later change stream
+// ([vstreamSnapshotRows.DeferCopyReplaysToStream]), it also records the
+// table's first refusal and wakes any reader: the copy of that table has
+// failed. The caller holds mu and goes on with the event's other row
+// changes either way, so the count covers every unappliable change.
+func (s *vstreamSnapshotStream) refuseTableLocked(table string, err error) {
+	if s.deferredReplays == nil {
+		s.deferredReplays = map[string]int{}
+	}
+	s.deferredReplays[table]++
+	if s.deferReplays {
+		return
+	}
+	if s.copyRefusals == nil {
+		s.copyRefusals = map[string]error{}
+	}
+	if _, ok := s.copyRefusals[table]; !ok {
+		s.copyRefusals[table] = err
+	}
+	s.broadcast()
+}
+
+// deferCopyReplaysLocked switches the copy to leaving unappliable replayed
+// changes for a later change stream. A refusal already recorded is
+// withdrawn: its changes were counted and never applied, exactly as a
+// deferral leaves them, so the switch is race-free against a replay that
+// arrived before it and the count stays exact. The caller holds mu.
+func (s *vstreamSnapshotStream) deferCopyReplaysLocked() {
+	s.deferReplays = true
+	clear(s.copyRefusals)
+	s.broadcast()
+}
+
+// logDeferredReplaysLocked records, once at the end of the copy, the
+// changes left to the later change stream. The caller holds mu.
+func (s *vstreamSnapshotStream) logDeferredReplaysLocked() {
+	if !s.deferReplays {
+		return // without a deferral these changes refused their tables
+	}
+	tables := make([]string, 0, len(s.deferredReplays))
+	for t := range s.deferredReplays {
+		tables = append(tables, t)
+	}
+	sort.Strings(tables)
+	for _, t := range tables {
+		slog.Info("mysql/vstream: snapshot: the copy received changes Vitess replayed inside it and left them to the change stream, "+
+			"which resumes from before the copy and replays them in order",
+			slog.String("keyspace", s.keyspace),
+			slog.String("table", t),
+			slog.Int("changes", s.deferredReplays[t]))
+	}
+}
+
+// readTableRefusalLocked returns the refusal of the first (by name) table
+// that has one and whose rows a ReadRows was opened for. A refusal can only
+// arrive while its table is still copying, so before that table's ReadRows
+// closes, and the reader's Err check after the drain sees it. The caller
+// holds mu.
+func (s *vstreamSnapshotStream) readTableRefusalLocked() error {
+	var first string
+	for table := range s.copyRefusals {
+		if s.readTables[table] && (first == "" || table < first) {
+			first = table
+		}
+	}
+	if first == "" {
+		return nil
+	}
+	return s.copyRefusals[first]
 }
 
 // cancelGRPCStream cancels the CURRENT gRPC stream context so a parked Recv
@@ -3131,6 +3290,19 @@ func (r *vstreamSnapshotRows) Err() error {
 // the writer absorbs the overlap idempotently.
 func (r *vstreamSnapshotRows) CopyNeedsIdempotentWriter() bool { return true }
 
+// DeferCopyReplaysToStream implements [ir.CopyReplayDeferrer]: from now on
+// (and for any refusal already recorded) a replayed change the copy cannot
+// apply in order is left unapplied for the caller's later change stream,
+// which replays from before the copy. The drained `schema add-table` is the
+// only caller (cdc_vstream_shard_copy_boundary.go).
+func (r *vstreamSnapshotRows) DeferCopyReplaysToStream() {
+	r.snap.mu.Lock()
+	defer r.snap.mu.Unlock()
+	r.snap.deferCopyReplaysLocked()
+}
+
+var _ ir.CopyReplayDeferrer = (*vstreamSnapshotRows)(nil)
+
 // CopyDisplayRoundsFloats implements [ir.LossyFloatCopyReader]. The
 // VStream COPY phase streams rows over vttablet's rowstreamer, whose
 // bare-column SELECT (built inside vttablet, out of sluice's reach)
@@ -3199,12 +3371,18 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 	// active table on the sequential path) and avoids W goroutines fighting
 	// over one field for no purpose.
 	concurrent := s.concurrentCopy
+	s.mu.Lock()
+	// The table is delivered: a copy-row refusal recorded for it is now
+	// the reader's error (readTableRefusalLocked).
+	if s.readTables == nil {
+		s.readTables = map[string]bool{}
+	}
+	s.readTables[tableName] = true
 	if !concurrent {
-		s.mu.Lock()
 		s.activeTable = tableName
 		s.cond.Broadcast()
-		s.mu.Unlock()
 	}
+	s.mu.Unlock()
 
 	// Buffered like every other bulk-copy hop (see [rowChanBuffer]) so the
 	// drain's dequeue overlaps the downstream write instead of rendezvous-
@@ -3250,8 +3428,15 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 			// this table must close on the per-table signal — the global
 			// copyComplete only flips after EVERY table, far too late.
 			for len(s.rowBuffer[tableName]) == 0 && !s.copyComplete &&
-				!s.tableCopyComplete[tableName] && s.err == nil && ctx.Err() == nil {
+				!s.tableCopyComplete[tableName] && s.err == nil && ctx.Err() == nil &&
+				s.copyRefusals[tableName] == nil {
 				s.cond.Wait()
+			}
+			// A refused table delivers nothing more: the reader's Err
+			// check after the drain reports the refusal.
+			if s.copyRefusals[tableName] != nil {
+				s.mu.Unlock()
+				return
 			}
 			queue := s.rowBuffer[tableName]
 			if len(queue) == 0 {

@@ -1622,6 +1622,19 @@ func (a *AddTable) openSnapshotForAdd(ctx context.Context) (string, *ir.Snapshot
 	if err != nil {
 		return "", nil, migcore.WrapWithHint(migcore.PhaseSnapshot, fmt.Errorf("pipeline: add-table: open snapshot stream: %w", err))
 	}
+	// Drained (the only mode a VStream source allows since
+	// NO-DRAIN-VSTREAM-SOURCE): the stream was stopped before this add and
+	// resumes from its pre-add persisted position, so it replays every change
+	// the source makes during the copy, in order. A change Vitess replays
+	// INSIDE this keyspace-wide copy (the catch-up before each later table)
+	// that the copy cannot apply in order is therefore left to that stream
+	// instead of failing the add (ir.CopyReplayDeferrer; measured by
+	// TestStreamer_VStreamAddTableKeyspaceWideCopy's Drained cells). Never in
+	// live mode, whose running stream is past the copy. Kept beside the open
+	// so TestCopyReplayDeferralRoster can see it.
+	if d, ok := stream.Rows.(ir.CopyReplayDeferrer); ok && !a.LiveMode {
+		d.DeferCopyReplaysToStream()
+	}
 	return "", stream, nil
 }
 

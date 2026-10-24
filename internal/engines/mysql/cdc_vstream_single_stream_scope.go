@@ -25,15 +25,17 @@ import (
 // finished table while a later one was being copied stays on the target, at
 // exit 0. Measured on a local vttestserver (mysql80) with no fault: 60 of 60 such deletes stale,
 // every one received in the copy phase; updates exact. The default per-table
-// copy opens each table as its own stream, has no catch-up, and was exact in
-// the same cell.
+// copy opens each table as its own stream, has no catch-up between tables,
+// and was exact in
+// the same cell. (A vtgate shard-stream retry still replays inside any copy;
+// that is refused and retried, VSTREAM-VTGATE-SHARD-RETRY-CATCHUP-DELETES.)
 //
 // A one-table scope is unaffected (there is no later table to catch up
 // before) and keeps the parameter; so does the keyspace-wide open with no
 // table list, which ignores it (autoShard needs more than one listed table).
 // Refused rather than repaired: applying the catch-up's deletes would need
 // them ordered against the upsert queue they overtake, and the default copy
-// already gives the same result with no catch-up at all (operator decision
+// already gives the same result with no catch-up between tables (operator decision
 // 2026-10-22).
 func refuseSingleStreamMultiTable(cfg *gomysql.Config, tables []string) error {
 	if len(tables) <= 1 || !vstreamCopySingleStreamFromDSN(cfg) {
@@ -52,7 +54,7 @@ func refuseSingleStreamMultiTable(cfg *gomysql.Config, tables []string) error {
 		"copied before it copies the next, and the copy keeps only inserted and updated rows from that replay, so a row "+
 		"deleted from a copied table during the copy would stay on the target. Remove vstream_copy_single_stream from "+
 		"the source DSN and re-run the same command: the default copies each table in its own stream, which replays "+
-		"nothing. A copy of one table may keep the parameter. This run copied nothing",
+		"nothing between tables. A copy of one table may keep the parameter. This run copied nothing",
 		ir.ErrVStreamSingleStreamMultiTable, len(tables), list)
 }
 
