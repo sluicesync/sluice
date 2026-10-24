@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // TestPollStopSignal_HardCancelIsRecordedBeforeCancelApply: the watchdog
@@ -67,6 +69,85 @@ func TestSupervisor_HardCancelledStopNotRestarted(t *testing.T) {
 	}
 	if snap, _ := snapshotFor(sup, "leg"); snap.State != SyncFailed {
 		t.Fatalf("leg state = %q; want %q (it did not drain)", snap.State, SyncFailed)
+	}
+}
+
+// TestSettle_StopEndingRetriableIsNotGraceful is the watchdog case's sibling
+// (the fix-aimed review of c421369a, MEDIUM): a `sync stop` drain that ends
+// in an error the retry loop would retry — an --apply-exec-timeout shorter
+// than the watchdog, a transient fault at the last batch, a source pump
+// error — used to be returned for the retry, whose start cleared the stop
+// flag and kept streaming. With the stop observed it now settles like a
+// hard cancel; without a stop it is still returned for the retry (control).
+func TestSettle_StopEndingRetriableIsNotGraceful(t *testing.T) {
+	retriable := fakeRetriableErr{msg: "context deadline exceeded (--apply-exec-timeout)"}
+	cases := []struct {
+		name        string
+		observed    bool
+		dispatchErr error
+		sourceErr   error
+		undrained   bool
+	}{
+		{name: "stop observed, apply ends retriable", observed: true, dispatchErr: retriable, undrained: true},
+		{name: "stop observed, source pump error", observed: true, sourceErr: errors.New("read: connection reset"), undrained: true},
+		{name: "no stop, apply ends retriable (retried as before)", dispatchErr: retriable},
+		{name: "no stop, source pump error (retried as before)", sourceErr: errors.New("read: connection reset")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var order []string
+			store := &fakeLivenessStore{}
+			app := settleOrderApplier{livenessOnlyApplier: livenessOnlyApplier{store}, order: &order}
+			s := &Streamer{Applier: app}
+			if tc.sourceErr != nil {
+				s.sourceErrFn = func() error { return tc.sourceErr }
+			}
+			s.liveness = &runLiveness{ctx: context.Background()}
+			s.armStreamLiveness("st")
+			var stop stopSignal
+			stop.observed.Store(tc.observed)
+			err := s.phaseSettleDispatch(context.Background(), app, "st", tc.dispatchErr, &stop)
+			s.stopStreamLiveness()
+			if !tc.undrained {
+				if errors.Is(err, ErrStopDrainHardCancelled) || err == nil {
+					t.Fatalf("without a stop the error must go back to the retry loop unchanged, got %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrStopDrainHardCancelled) || !strings.Contains(err.Error(), "did not drain") {
+				t.Fatalf("settle = %v; want the %s failure", err, StopDrainHardCancelledMarker)
+			}
+			if _, r := classifyRetriable(err); r || isRetriableConnectFailure(err) {
+				t.Fatalf("the undrained-stop failure is retriable: %v", err)
+			}
+			if len(order) != 0 {
+				t.Fatalf("settle or Run's exit wrote %v; want nothing", order)
+			}
+		})
+	}
+}
+
+// TestStopNotDrainedExitStatus: a stop that did not drain exits
+// sluicecode.ExitStopNotDrained (4), so a service manager can be told not to
+// restart it (RestartPreventExitStatus=4), including when an owed
+// added-column backfill joins it at the attempt's end (the review's LOW: the
+// backfill settle used to replace the error and lose its identity).
+func TestStopNotDrainedExitStatus(t *testing.T) {
+	s := &Streamer{}
+	err := s.settleUndrainedStop(context.Background(), "st", nil, stopCutOffByWatchdog)
+	type exitCoder interface{ ExitCode() int }
+	for name, e := range map[string]error{
+		"alone":             err,
+		"wrapped":           fmt.Errorf("pipeline: run: %w", err),
+		"joined with a gap": errors.Join(&addedColumnBackfillIncompleteError{runErr: err}, err),
+	} {
+		var ec exitCoder
+		if !errors.As(e, &ec) || ec.ExitCode() != sluicecode.ExitStopNotDrained {
+			t.Errorf("%s: exit status not %d: %v", name, sluicecode.ExitStopNotDrained, e)
+		}
+		if !errors.Is(e, ErrStopDrainHardCancelled) {
+			t.Errorf("%s: lost ErrStopDrainHardCancelled: %v", name, e)
+		}
 	}
 }
 

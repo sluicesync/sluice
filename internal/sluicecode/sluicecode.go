@@ -1143,6 +1143,15 @@ const (
 	// prose.
 	ExitRefusal = 3
 
+	// ExitStopNotDrained: a `sync start` / `sync run` process asked to stop
+	// by `sluice sync stop` exited without draining (STOP-DRAIN-HARD-
+	// CANCELLED: its drain was hard-cancelled, or ended in an error that
+	// would otherwise retry). Distinct from 1 because the right reaction
+	// differs: the operator asked for the stop, so a service manager should
+	// not restart the process (systemd: RestartPreventExitStatus=4), and
+	// stop_requested_at is still set until the next start.
+	ExitStopNotDrained = 4
+
 	// ExitUsage documents (does not implement) kong's built-in exit
 	// code for flag/command parse errors: kong exits 80 on usage
 	// errors (a square/exit semantic code) before any Run method is

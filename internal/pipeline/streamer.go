@@ -2511,6 +2511,12 @@ func (s *Streamer) applyWithReshardFollow(
 		if dispatchErr == nil && s.sourceReshard != nil && !s.InjectShardColumn.Engaged() && !s.interceptErrorPending() {
 			newChanges, wasReshard, rerr := s.sourceReshard.ReopenAfterReshard(applyCtx)
 			if wasReshard {
+				// A stop whose drain the watchdog cut off while the reshard
+				// reopened settles like any undrained stop, not as a reopen
+				// failure (the fix-aimed review of c421369a, LOW).
+				if stop != nil && stop.hardCancelled.Load() {
+					return s.settleUndrainedStop(ctx, streamID, rerr, stopCutOffByWatchdog)
+				}
 				if rerr != nil {
 					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: reshard reopen: %w", rerr))
 				}

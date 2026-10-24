@@ -227,12 +227,17 @@ func applierAfterConnect() func(context.Context, *pgx.Conn) error {
 // transaction isolation to READ COMMITTED, Postgres's own default, whatever
 // `ALTER DATABASE/ROLE … SET default_transaction_isolation` says. The apply
 // transactions are written for it: the position upsert updates the stream's
-// control row, which the stream's liveness stamp also updates in a separate
-// short transaction, and under REPEATABLE READ or SERIALIZABLE an apply
-// transaction that began before such a stamp fails its upsert with 40001
-// (a serialization failure the applier retries by restarting the attempt).
-// The same holds for `sync stop`'s request on that row. Pinned per session,
-// as synchronous_commit is pinned per transaction.
+// control row, which other short transactions also update while an apply
+// transaction is open — `sync stop`'s request, a `schema add-table`'s
+// pending-entry and table-set writes, and the liveness stamps an attempt
+// start, a stop record or a start that undoes its own stamp make (there is
+// no periodic stamp: a running stream's own position writes keep its
+// record) — and under REPEATABLE READ or SERIALIZABLE an apply transaction
+// that began before such a write fails its upsert with 40001 (a
+// serialization failure the applier retries by restarting the attempt).
+// Pinned per session, as synchronous_commit is pinned per transaction. The
+// cost is one `SHOW default_transaction_isolation` per new applier
+// connection (and a SET only when it differs).
 //
 // The pin overrides an operator's `ALTER ROLE/DATABASE … SET
 // default_transaction_isolation` for the applier's sessions — deliberately,

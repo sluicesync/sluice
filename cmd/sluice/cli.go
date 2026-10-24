@@ -35,6 +35,7 @@ import (
 	pstelemetry "sluicesync.dev/sluice/internal/planetscale/telemetry"
 	"sluicesync.dev/sluice/internal/progress"
 	"sluicesync.dev/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
 // Globals are flags shared across every subcommand. Embedding into the
@@ -2820,8 +2821,7 @@ func waitForStopComplete(ctx context.Context, applier ir.ChangeApplier, streamID
 			return fmt.Errorf("poll stop signal: %w", err)
 		}
 		if !stopRequested {
-			fmt.Fprintf(os.Stdout, "stream %q drained and exited cleanly\n", streamID)
-			return nil
+			return confirmStopRecorded(ctx, applier, streamID)
 		}
 		if time.Now().After(deadline) {
 			return stopWaitTimeoutError(streamID, timeout)
@@ -2832,6 +2832,40 @@ func waitForStopComplete(ctx context.Context, applier ir.ChangeApplier, streamID
 		case <-t.C:
 		}
 	}
+}
+
+// confirmStopRecorded decides `sync stop --wait`'s success once the stop
+// request has cleared. A cleared flag alone is not proof the stream stopped
+// (the fix-aimed review of c421369a): every `sync start` clears it at its
+// start, so a stream that exited without draining and was restarted — by
+// systemd Restart=on-failure, a fleet reload, a supervisor — clears it too,
+// and is running. A graceful drain records the stop on the liveness column
+// BEFORE it clears the flag, so success requires that marker. A target whose
+// control table keeps no liveness record (an older release's table a role
+// cannot alter) cannot prove either way; that is reported, not failed, as
+// `sync stop --wait` always behaved there.
+func confirmStopRecorded(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+	store, ok := applier.(ir.StreamLivenessStore)
+	if !ok {
+		fmt.Fprintf(os.Stdout, "stream %q drained and exited cleanly\n", streamID)
+		return nil
+	}
+	l, err := store.ReadStreamLiveness(ctx, streamID)
+	switch {
+	case err != nil:
+		return fmt.Errorf("stream %q cleared its stop request, but whether it recorded its stop could not be read: %w", streamID, err)
+	case l.Stopped:
+		fmt.Fprintf(os.Stdout, "stream %q drained and exited cleanly\n", streamID)
+		return nil
+	case l.Found && !l.Recorded:
+		fmt.Fprintf(os.Stdout, "stream %q cleared its stop request; this target keeps no liveness record, so sluice cannot confirm that it recorded its stop\n", streamID)
+		return nil
+	}
+	return fmt.Errorf("stream %q's stop request was cleared, but the stream did not record a stop: something started it "+
+		"again — systemd Restart=on-failure, a `sluice sync run` fleet reload or supervisor, or a manual start — and it is "+
+		"running now. If its previous run exited with %s (exit status %d: the stop did not drain), a service manager "+
+		"restarted it; set RestartPreventExitStatus=%d. Stop it again with `sluice sync stop --wait` once whatever "+
+		"blocked the drain is gone", streamID, pipeline.StopDrainHardCancelledMarker, sluicecode.ExitStopNotDrained, sluicecode.ExitStopNotDrained)
 }
 
 // stopWaitTimeoutError is `sync stop --wait`'s timeout. It cannot claim the

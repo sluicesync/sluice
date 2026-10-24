@@ -21,13 +21,20 @@
 // stream dropped the new table's changes.
 //
 // So this gate walks every package under internal/engines, finds each
-// function whose string literals write `source_position` (the same test the
-// per-package rosters use: a literal naming it, and a literal that starts
-// INSERT INTO / UPDATE or assigns `source_position =`), and requires each
-// such package to carry both per-package rosters. WHAT IT REACHES: SQL a
-// package spells in its own string literals. A position written through a
-// shared helper in another package is seen where the helper lives, which is
-// why the floor below pins the two packages known to write today.
+// function or package-level const/var block whose string literals write
+// `source_position` (a literal naming it, and a literal that — whitespace
+// collapsed, case folded — opens INSERT [INTO|IGNORE] / REPLACE / UPDATE /
+// MERGE / UPSERT, or assigns `source_position =`), and requires each such
+// package to carry both per-package rosters.
+//
+// WHAT IT REACHES, and what it does not: SQL a package spells in its own
+// string literals, inside one declaration. It does NOT see a statement whose
+// verb and column name are assembled from different declarations (a verb in
+// one package-level const, the column in another), SQL built in another
+// package (seen where it lives — every source_position mention outside
+// internal/engines is a comment or a reader today), or a write through an
+// ORM/driver API with no SQL text. The floor below pins the two packages
+// known to write today, so a walk gone blind fails rather than passes.
 package docsync
 
 import (
@@ -54,13 +61,17 @@ func TestPositionWriterEngines_EveryOneCarriesTheLivenessRosters(t *testing.T) {
 		if perr != nil {
 			return perr
 		}
+		pkg := filepath.Dir(path)
 		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || !writesSourcePosition(fn.Body) {
-				continue
+			// A function, or a package-level const/var block (SQL hoisted
+			// into a package-level string is still a write).
+			name := "a package-level declaration"
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				name = fn.Name.Name
 			}
-			pkg := filepath.Dir(path)
-			writers[pkg] = append(writers[pkg], fn.Name.Name)
+			if writesSourcePosition(decl) {
+				writers[pkg] = append(writers[pkg], name)
+			}
 		}
 		return nil
 	})
@@ -96,9 +107,9 @@ func TestPositionWriterEngines_EveryOneCarriesTheLivenessRosters(t *testing.T) {
 
 // writesSourcePosition is the per-package rosters' test, at function scope:
 // a literal names source_position, and a literal writes.
-func writesSourcePosition(body *ast.BlockStmt) bool {
+func writesSourcePosition(decl ast.Node) bool {
 	names, writes := false, false
-	ast.Inspect(body, func(n ast.Node) bool {
+	ast.Inspect(decl, func(n ast.Node) bool {
 		bl, ok := n.(*ast.BasicLit)
 		if !ok || bl.Kind != token.STRING {
 			return true
@@ -108,10 +119,25 @@ func writesSourcePosition(body *ast.BlockStmt) bool {
 			return true
 		}
 		names = names || strings.Contains(v, "source_position")
-		up := strings.ToUpper(strings.TrimSpace(v))
-		writes = writes || strings.HasPrefix(up, "INSERT INTO") || strings.HasPrefix(up, "UPDATE ") ||
-			strings.Contains(v, "source_position =")
+		writes = writes || sqlWrites(v)
 		return true
 	})
 	return names && writes
+}
+
+// sqlWriteVerbs are the statement openings that write a row, after
+// whitespace is collapsed and case folded.
+var sqlWriteVerbs = []string{"INSERT INTO ", "INSERT IGNORE ", "INSERT ", "REPLACE INTO ", "REPLACE ", "UPDATE ", "MERGE INTO ", "MERGE ", "UPSERT "}
+
+// sqlWrites reports whether a literal opens a write statement or assigns
+// source_position, with runs of whitespace (spaces, tabs, newlines) collapsed
+// so a multi-line or oddly spaced statement is seen.
+func sqlWrites(v string) bool {
+	norm := strings.ToUpper(strings.Join(strings.Fields(v), " "))
+	for _, verb := range sqlWriteVerbs {
+		if strings.HasPrefix(norm+" ", verb) {
+			return true
+		}
+	}
+	return strings.Contains(norm, "SOURCE_POSITION =") || strings.Contains(norm, "SOURCE_POSITION=")
 }
