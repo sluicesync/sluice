@@ -43,6 +43,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -283,7 +284,8 @@ func TestReplicaIdentity_PublishableShapesStillStream(t *testing.T) {
 
 // TestReplicaIdentity_AddTableRefusesBeforeExtendingThePublication pins
 // the OTHER door into the publication. `schema add-table` runs
-// `ALTER PUBLICATION … ADD TABLE` against a live stream, after which
+// `ALTER PUBLICATION … ADD TABLE` (drained, against the stopped stream:
+// `--no-drain` is withdrawn, Bug 332), after which
 // Postgres refuses the source application's own UPDATE/DELETE on the
 // added table exactly as cold start would have. Unlike the target-side
 // sibling (Bug 211) there is no per-change floor to catch it later — the
@@ -317,8 +319,18 @@ func TestReplicaIdentity_AddTableRefusesBeforeExtendingThePublication(t *testing
 	if !waitForRowCount(t, targetDSN, "ri_live", 1, 90*time.Second) {
 		t.Fatal("cold start never delivered the seed row")
 	}
+	// Warm the CDC lane so the stream's control row exists, then stop it:
+	// the add runs drained (--no-drain refuses before this door).
+	applyDDL(t, sourceDSN, "INSERT INTO ri_live (id, v) VALUES (2, 'b');")
+	if !waitForRowCount(t, targetDSN, "ri_live", 2, 90*time.Second) {
+		t.Fatal("CDC never delivered the warmup row")
+	}
+	streamCancel()
+	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("stopping the stream: %v", err)
+	}
 
-	// A new source table whose only key is DEFERRABLE, added live.
+	// A new source table whose only key is DEFERRABLE, added drained.
 	applyDDL(t, sourceDSN, `
 		CREATE TABLE ri_late (id int, v text, CONSTRAINT ri_late_pk PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED);
 		INSERT INTO ri_late (id, v) VALUES (1, 'a');
@@ -333,7 +345,6 @@ func TestReplicaIdentity_AddTableRefusesBeforeExtendingThePublication(t *testing
 		TargetDSN: targetDSN,
 		StreamID:  streamID,
 		TableName: "ri_late",
-		LiveMode:  true,
 	}).Run(addCtx)
 	assertReplicaIdentityRefusal(t, err, "ri_late")
 
@@ -348,11 +359,18 @@ func TestReplicaIdentity_AddTableRefusesBeforeExtendingThePublication(t *testing
 	}
 	applyDDL(t, sourceDSN, "UPDATE ri_late SET v = 'still writable';")
 
-	// The running stream is untouched by the refused add.
-	applyDDL(t, sourceDSN, "INSERT INTO ri_live (id, v) VALUES (2, 'b');")
-	if !waitForRowCount(t, targetDSN, "ri_live", 2, 90*time.Second) {
-		t.Fatal("the live stream wedged after a refused add-table")
+	// The stream resumes untouched by the refused add.
+	restartCtx, restartCancel := context.WithCancel(context.Background())
+	defer restartCancel()
+	restartErr := make(chan error, 1)
+	restarted := &Streamer{Source: pgEng, Target: pgEng, SourceDSN: sourceDSN, TargetDSN: targetDSN, StreamID: streamID, SlotName: "replica_identity_add_table"}
+	go func() { restartErr <- restarted.Run(restartCtx) }()
+	applyDDL(t, sourceDSN, "INSERT INTO ri_live (id, v) VALUES (3, 'c');")
+	if !waitForRowCount(t, targetDSN, "ri_live", 3, 90*time.Second) {
+		t.Fatal("the stream did not resume after a refused add-table")
 	}
+	restartCancel()
+	<-restartErr
 }
 
 // TestReplicaIdentity_ExcludeTableClearsTheRefusal pins the escape the

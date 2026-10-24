@@ -40,11 +40,12 @@ import (
 //
 // Phase 1 (default) is intentionally narrow: one table per invocation,
 // the stream must be drained first, and the source/target must be the
-// same engine pair the active stream uses. Phase 2 (`--no-drain`, Postgres
-// sources only, ADR-0030) lifts the drain precondition for high-availability
-// workloads; every other source refuses it (NO-DRAIN-BINLOG-SOURCE,
-// NO-DRAIN-VSTREAM-SOURCE). See `docs/dev/design/mid-stream-add-table.md` and ADR-0030
-// for the design space and correctness story.
+// same engine pair the active stream uses. Phase 2 (`--no-drain`, ADR-0030)
+// lifted the drain precondition and is WITHDRAWN on every source: each live
+// path lost the changes made to the table during the add, the Postgres one
+// last (Bug 332). The flag stays and refuses (NO-DRAIN-POSTGRES-SOURCE,
+// NO-DRAIN-BINLOG-SOURCE, NO-DRAIN-VSTREAM-SOURCE). See
+// `docs/dev/design/mid-stream-add-table.md` and ADR-0030.
 type SchemaAddTableCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
@@ -60,7 +61,7 @@ type SchemaAddTableCmd struct {
 
 	SlotName string `help:"Override the temporary replication-slot name used for the snapshot capture on engines with a slot concept (Postgres). Defaults to 'sluice_addtable_<table>'. Engines without slots ignore this flag." placeholder:"NAME"`
 
-	NoDrain bool `help:"Phase 2 live add: run add-table against an actively-streaming sync without first running 'sync stop --wait'. Available on a Postgres source (publication-add, ADR-0030; strict zero-loss since v0.32.0, ADR-0036). Every other source refuses loudly before anything is written and names the drained workflow: a MySQL or MariaDB binlog source (NO-DRAIN-BINLOG-SOURCE), whose live path lost every change made to the new table between the add's snapshot and the stream admitting it, which spans the whole copy; a PlanetScale or Vitess (VStream) source (NO-DRAIN-VSTREAM-SOURCE), whose add-table copy also drops the changes made to the table while it runs; and the trigger-CDC sources. The source is judged from --source-driver and from the stream's recorded position. The drained workflow: sync stop --wait, then add-table, then restart the stream (sync start with the same --stream-id, or the fleet for a sync run leg, which restarts from its config). Keep the stream stopped, with no fleet reload and no supervisor or systemd restart, until add-table returns: add-table does not detect a running stream." name:"no-drain"`
+	NoDrain bool `help:"WITHDRAWN on every source (Bug 332). It was the Phase 2 live add: add-table against a stream that is still running. It stays so a script that passes it gets a loud refusal, before anything is read or written, naming the drained workflow. Every live path it took lost the changes made to the new table during the add: a Postgres source (NO-DRAIN-POSTGRES-SOURCE; the running stream dropped them until it admitted the table, or applied them while the copy ran so the copy undid deletes and updates; the strict zero-loss claimed since v0.32.0 held for inserts alone), a MySQL or MariaDB binlog source (NO-DRAIN-BINLOG-SOURCE) and a PlanetScale or Vitess (VStream) source (NO-DRAIN-VSTREAM-SOURCE); the trigger-CDC sources never had one. The drained workflow: sync stop --wait, then add-table, then restart the stream (sync start with the same --stream-id, or the fleet for a sync run leg, which restarts from its config). Keep the stream stopped, with no fleet reload and no supervisor or systemd restart, until add-table returns: add-table does not detect a running stream." name:"no-drain"`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Must match the active stream's --target-schema, or be omitted to inherit the recorded value (Bug 46 / ADR-0031). When the active stream was started with --target-schema=NAME, the new table lands in NAME (rather than 'public') so CDC events the active stream's applier routes to NAME.<table> arrive at a real table. Mismatch (operator-supplied flag differs from recorded) refuses loudly. MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 

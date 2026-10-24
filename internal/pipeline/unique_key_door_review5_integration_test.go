@@ -122,10 +122,12 @@ func TestStreamer_UniqueKeyDoor_Review5AddTableAcceptedKey(t *testing.T) {
 	defer acancel()
 	// The shape under test is a table added while the stream runs. --no-drain
 	// on a binlog source refuses now (NO-DRAIN-BINLOG-SOURCE), so the state is
-	// reached the one way a MySQL stream still can: a drained add the operator
+	// reached the one way any stream still can: a drained add the operator
 	// ran without stopping the stream, which add-table does not detect
 	// (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED in docs/dev/audit-backlog.md).
-	// When that door is closed, this pin needs a Postgres live-add twin.
+	// --no-drain is withdrawn on Postgres too (Bug 332), so there is no live
+	// add left to twin this with; when that door closes, this state is only
+	// reachable from a pre-v0.163.9 binary's record.
 	if err := (&AddTable{
 		Source: mysqlEng, Target: mysqlEng, SourceDSN: srcDSN, TargetDSN: tgtDSN,
 		StreamID: streamID, TableName: "kd", AcceptTargetOnlyUniqueKeys: accept,

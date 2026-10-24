@@ -239,6 +239,12 @@ func TestStreamer_UniqueKeyDoor_Review7AddTableArrayCollation(t *testing.T) {
 	if !waitForRowCount(t, targetDSN, "customers", 2, 60*time.Second) {
 		t.Fatal("the stream never delivered the warmup row")
 	}
+	// The add runs drained, against the stopped stream: --no-drain is
+	// withdrawn on every source (Bug 332), and the door is the same.
+	cancel()
+	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("stopping the stream: %v", err)
+	}
 
 	// The source keys tags under its deterministic default collation; the
 	// operator's pre-created target compares them case-insensitively.
@@ -250,7 +256,7 @@ func TestStreamer_UniqueKeyDoor_Review7AddTableArrayCollation(t *testing.T) {
 	defer acancel()
 	err := (&AddTable{
 		Source: pgEng, Target: pgEng, SourceDSN: sourceDSN, TargetDSN: targetDSN,
-		StreamID: streamID, TableName: "orders", LiveMode: true,
+		StreamID: streamID, TableName: "orders",
 	}).Run(actx)
 	var refusal *ir.SourceUniqueKeyAbsentError
 	if !errors.As(err, &refusal) || refusal.When != ir.UniqueKeyDoorAddTable || !strings.Contains(err.Error(), "orders.o_tags") {
@@ -264,6 +270,4 @@ func TestStreamer_UniqueKeyDoor_Review7AddTableArrayCollation(t *testing.T) {
 	if n := tgt.scalar(t, "SELECT count(*) FROM orders"); n != "0" {
 		t.Fatalf("the refusing add-table copied %s rows", n)
 	}
-	cancel()
-	<-runErr
 }

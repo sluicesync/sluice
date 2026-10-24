@@ -33,20 +33,26 @@ sluice sync start \
     --stream-id appdb
 ```
 
-Later, bring `users` into the same stream. On Postgres this can be done **without draining** the stream:
+Later, bring `users` into the same stream. Stop the stream for the add, then start it again:
 
 ```bash
+sluice sync stop --stream-id appdb --target-driver postgres --target "$DST" --wait
 sluice schema add-table users \
     --source-driver postgres --source "$SRC" \
     --target-driver postgres --target "$DST" \
-    --stream-id appdb --no-drain
+    --stream-id appdb
+sluice sync start \
+    --source-driver postgres --source "$SRC" \
+    --target-driver postgres --target "$DST" \
+    --include-table 'orders,order_items' \
+    --stream-id appdb
 ```
 
-`add-table` creates the table on the target, bulk-copies its rows from a consistent snapshot, extends the source publication, and hands the table to the running CDC stream — the same gapless snapshot→CDC boundary a cold start gets. On a terminal it prompts for typed confirmation (the table name) unless you pass `--yes`; on a non-terminal stdin (a script, CI, an agent) it refuses with `SLUICE-E-CONFIRMATION-REQUIRED` instead of prompting.
+`add-table` creates the table on the target, bulk-copies its rows from a consistent snapshot and, on Postgres, extends the source publication. The restart warm-resumes from the stream's position and replays what changed during the add after the copy, in order; it does not re-snapshot. On a terminal the add prompts for typed confirmation (the table name) unless you pass `--yes`; on a non-terminal stdin (a script, CI, an agent) it refuses with `SLUICE-E-CONFIRMATION-REQUIRED` instead of prompting.
 
-`--no-drain` works only on a **Postgres source** (any target — the new table joins the source publication, ADR-0030; strict zero-loss since v0.32.0, ADR-0036). Every other source refuses loudly before it changes anything and names the **drained workflow**: a MySQL or MariaDB binlog source (`NO-DRAIN-BINLOG-SOURCE`: its live path lost every change made to the new table between the add's snapshot and the running stream admitting it, which spans the whole copy), a PlanetScale/Vitess (VStream) source (`NO-DRAIN-VSTREAM-SOURCE`: its add-table copy also drops the changes made to the table while it runs), and a trigger-CDC source. The drained workflow is `sluice sync stop --wait`, then `schema add-table`, then `sluice sync start` again (a re-run with the same `--stream-id` warm-resumes and replays what changed during the add; it does not re-snapshot), or for a `sluice sync run` fleet leg, the fleet's own restart, which starts the leg from its config. Keep the stream stopped until `schema add-table` returns, with no fleet reload and no supervisor or systemd restart in between: add-table does not detect a stream that is still running, and an add against one loses the same changes.
+**`--no-drain` is withdrawn on every source.** It refuses loudly before it reads or writes anything and names this drained workflow: a Postgres source (`NO-DRAIN-POSTGRES-SOURCE`, since v0.163.9: Bug 332 measured the running stream dropping the new table's changes until it admitted the table, or, on a stream without `--include-table`, applying them while the copy ran so the copy undid deletes and updates; the "strict zero-loss since v0.32.0" this page used to promise held for inserts alone), a MySQL or MariaDB binlog source (`NO-DRAIN-BINLOG-SOURCE`: its live path lost every change made to the new table between the add's snapshot and the running stream admitting it, which spans the whole copy), a PlanetScale/Vitess (VStream) source (`NO-DRAIN-VSTREAM-SOURCE`: its add-table copy also drops the changes made to the table while it runs), and a trigger-CDC source. For a `sluice sync run` fleet leg, restart it through the fleet, which starts the leg from its config. Keep the stream stopped until `schema add-table` returns, with no fleet reload and no supervisor or systemd restart in between: add-table does not detect a stream that is still running, and an add against one loses the same changes.
 
-After the add, `users` is part of the stream's scope: sluice records it in the stream's live-added set on the target (`sluice_cdc_state.live_added_tables`), so restarting the stream with the same `--include-table 'orders,order_items'` keeps streaming it, drained add or `--no-drain`, on every source. Only `sluice schema add-table --abandon users --yes` takes it back out (an `--exclude-table` that names it is refused, `LIVE-ADDED-TABLE-EXCLUDED`, rather than silently winning), and the next start then stops applying it and records it as dropped, so bringing it back later needs a fresh copy. Through v0.162.0 only the MySQL `--no-drain` path recorded the table, and a Postgres stream restarted with its original `--include-table` silently stopped applying `users`.
+After the add, `users` is part of the stream's scope: sluice records it in the stream's live-added set on the target (`sluice_cdc_state.live_added_tables`), so restarting the stream with the same `--include-table 'orders,order_items'` keeps streaming it, on every source. Only `sluice schema add-table --abandon users --yes` takes it back out (an `--exclude-table` that names it is refused, `LIVE-ADDED-TABLE-EXCLUDED`, rather than silently winning), and the next start then stops applying it and records it as dropped, so bringing it back later needs a fresh copy. Through v0.162.0 only the MySQL `--no-drain` path recorded the table, and a Postgres stream restarted with its original `--include-table` silently stopped applying `users`.
 
 One table per invocation. Repeat it per table, or script the loop.
 

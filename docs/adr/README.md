@@ -52,13 +52,13 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 
 | ADR | Decision |
 |---|---|
-| [0030](adr-0030-mid-stream-live-add-table.md) | Mid-stream live add-table — `--no-drain` (PG path; Phase 2) |
+| [0030](adr-0030-mid-stream-live-add-table.md) | Mid-stream live add-table — `--no-drain` (PG path; Phase 2). **Withdrawn** in v0.163.9 (Bug 332, `NO-DRAIN-POSTGRES-SOURCE`): the running stream undid or dropped the new table's deletes and updates (and, filtered, its inserts) during the add; `--no-drain` now refuses on every source |
 | [0031](adr-0031-multi-source-aggregation-target-schema.md) | Multi-source aggregation via `--target-schema NAME` (PG-only) |
 | [0032](adr-0032-pg-extension-passthrough.md) | PG extension passthrough catalog — 7-extension enumerated allowlist |
-| [0033](adr-0033-mid-stream-live-add-strict-zero-loss.md) | Strict zero-loss correctness for live add-table (Bug 36 closure) |
+| [0033](adr-0033-mid-stream-live-add-strict-zero-loss.md) | Strict zero-loss correctness for live add-table (Bug 36 closure). **Correction** (Bug 332): the strict zero-loss held for inserts alone; the path is withdrawn |
 | [0034](adr-0034-mysql-phase-2-live-add-table.md) | MySQL Phase 2 live add-table via streamer-side filter-flip. Its additive-override rule (a live-added table wins over `--exclude-table`) is **superseded** in v0.163.0 (Bug 321): the contradiction refuses as `LIVE-ADDED-TABLE-EXCLUDED`. The live path itself is **withdrawn** (2026-10-23): it lost every change made to the new table during the copy, so `--no-drain` on a binlog source refuses `NO-DRAIN-BINLOG-SOURCE` |
 | [0035](adr-0035-postgis-geometry-spatial-support.md) | PostGIS-aware geometry translation with SRID preserved cross-engine |
-| [0036](adr-0036-mid-stream-loss-surface-characterization.md) | Mid-stream loss-surface characterization (post-Bug-36 audit) |
+| [0036](adr-0036-mid-stream-loss-surface-characterization.md) | Mid-stream loss-surface characterization (post-Bug-36 audit). **Correction** (Bug 332): INSERT-only load could not see the delete/update loss; the path is withdrawn |
 
 ## Redaction + perf + bulk-copy (0037–0043)
 

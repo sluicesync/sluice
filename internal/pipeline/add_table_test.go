@@ -304,113 +304,6 @@ func TestAddTable_LiveMode_FieldRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_SkipsActiveStreamRefusal confirms the live-
-// mode path does NOT trip the Phase 1 stop_requested_at refusal.
-// The stream's row exists, the stop flag is set (would refuse in
-// Phase 1), and the live-mode engine's slot-position read succeeds —
-// the orchestrator proceeds to publication-add and snapshot.
-func TestAddTable_LiveMode_SkipsActiveStreamRefusal(t *testing.T) {
-	src := newAddTableSourceEngineLive("source")
-	src.schema = &ir.Schema{Tables: []*ir.Table{
-		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
-	}}
-	src.slotLSN = "0/1000"
-	src.snapshotLSN = "0/2000"
-
-	tgt := newAddTableTargetEngine("target")
-	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
-	// Phase 1 would refuse on this; live mode must skip the check.
-	tgt.applier.stopRequested = true
-
-	a := &AddTable{
-		Source: src, Target: tgt,
-		SourceDSN: "src", TargetDSN: "tgt",
-		StreamID: "live", TableName: "new_table",
-		LiveMode: true,
-	}
-	if err := a.Run(context.Background()); err != nil {
-		t.Fatalf("Run with LiveMode=true unexpectedly errored: %v", err)
-	}
-	if src.snapshotCalls != 1 {
-		t.Errorf("live-mode snapshot opens = %d; want 1", src.snapshotCalls)
-	}
-	if got := src.addedTables; len(got) != 1 || got[0] != "new_table" {
-		t.Errorf("live-mode publication-add tables = %v; want [new_table]", got)
-	}
-}
-
-// TestAddTable_LiveMode_UsesRecordedSlotName pins the slot-name
-// plumbing through cdc-state (ADR-0030 follow-up): when the active
-// stream's StreamStatus carries a non-empty SlotName, preflightLive
-// queries that slot's position rather than the engine default. This
-// is the load-bearing surface for operators running multiple
-// concurrent streams against the same source via custom --slot-name.
-func TestAddTable_LiveMode_UsesRecordedSlotName(t *testing.T) {
-	src := newAddTableSourceEngineLive("source")
-	src.schema = &ir.Schema{Tables: []*ir.Table{
-		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
-	}}
-	src.slotLSN = "0/1000"
-	src.snapshotLSN = "0/2000"
-
-	tgt := newAddTableTargetEngine("target")
-	// StreamStatus carries the operator's custom slot name (recorded
-	// by the streamer's SetSlotName plumbing on every position-write).
-	tgt.applier.streams = []ir.StreamStatus{
-		{StreamID: "live", SlotName: "sluice_shard_a"},
-	}
-
-	a := &AddTable{
-		Source: src, Target: tgt,
-		SourceDSN: "src", TargetDSN: "tgt",
-		StreamID: "live", TableName: "new_table",
-		LiveMode: true,
-	}
-	if err := a.Run(context.Background()); err != nil {
-		t.Fatalf("Run errored: %v", err)
-	}
-	if !src.slotReadCalled {
-		t.Fatal("ReadSlotPosition was never called")
-	}
-	if src.slotNameAsked != "sluice_shard_a" {
-		t.Errorf("ReadSlotPosition queried slot %q; want %q (from recorded StreamStatus.SlotName)",
-			src.slotNameAsked, "sluice_shard_a")
-	}
-}
-
-// TestAddTable_LiveMode_FallsBackToDefaultSlotName pins the legacy-
-// row / default-named-stream fallback: when StreamStatus.SlotName is
-// empty (NULL slot_name in cdc-state, e.g. a row that pre-dates the
-// column or a stream that ran with the default slot), preflightLive
-// queries `sluice_slot`. Without this fallback the live-add would
-// refuse when the recorded value happens to be empty.
-func TestAddTable_LiveMode_FallsBackToDefaultSlotName(t *testing.T) {
-	src := newAddTableSourceEngineLive("source")
-	src.schema = &ir.Schema{Tables: []*ir.Table{
-		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
-	}}
-	src.slotLSN = "0/1000"
-	src.snapshotLSN = "0/2000"
-
-	tgt := newAddTableTargetEngine("target")
-	// SlotName left empty — covers both legacy rows + default streams.
-	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
-
-	a := &AddTable{
-		Source: src, Target: tgt,
-		SourceDSN: "src", TargetDSN: "tgt",
-		StreamID: "live", TableName: "new_table",
-		LiveMode: true,
-	}
-	if err := a.Run(context.Background()); err != nil {
-		t.Fatalf("Run errored: %v", err)
-	}
-	if src.slotNameAsked != "sluice_slot" {
-		t.Errorf("ReadSlotPosition queried slot %q; want %q (default fallback)",
-			src.slotNameAsked, "sluice_slot")
-	}
-}
-
 // TestAddTable_UsesRecordedPublication pins the ADR-0176-prerequisite
 // inheritance: when the active stream's StreamStatus carries a
 // recorded publication_name, preflightStream scopes the source engine
@@ -423,8 +316,6 @@ func TestAddTable_UsesRecordedPublication(t *testing.T) {
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	src.slotLSN = "0/1000"
-	src.snapshotLSN = "0/2000"
 
 	tgt := newAddTableTargetEngine("target")
 	tgt.applier.streams = []ir.StreamStatus{
@@ -435,7 +326,6 @@ func TestAddTable_UsesRecordedPublication(t *testing.T) {
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
 		StreamID: "live", TableName: "new_table",
-		LiveMode: true,
 	}
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("Run errored: %v", err)
@@ -460,8 +350,6 @@ func TestAddTable_LegacyEmptyPublicationDoesNotScope(t *testing.T) {
 	src.schema = &ir.Schema{Tables: []*ir.Table{
 		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}}
-	src.slotLSN = "0/1000"
-	src.snapshotLSN = "0/2000"
 
 	tgt := newAddTableTargetEngine("target")
 	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
@@ -470,7 +358,6 @@ func TestAddTable_LegacyEmptyPublicationDoesNotScope(t *testing.T) {
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
 		StreamID: "live", TableName: "new_table",
-		LiveMode: true,
 	}
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("Run errored: %v", err)
@@ -480,7 +367,7 @@ func TestAddTable_LegacyEmptyPublicationDoesNotScope(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_RefusesSourceWithoutPublication confirms live mode
+// TestAddTable_LiveMode_RefusesSourceWithoutPublication confirms --no-drain
 // refuses, with the generic message and the drained flow, on a source that
 // neither extends a publication nor is a binlog or VStream source (the stub
 // declares logical replication without the publication surface).
@@ -502,7 +389,7 @@ func TestAddTable_LiveMode_RefusesSourceWithoutPublication(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error on live mode with a source without a publication; got nil")
 	}
-	for _, want := range []string{"publication-bearing source engine", "drained add-table flow", "sluice sync stop --wait"} {
+	for _, want := range []string{"withdrawn on every source", "drained add-table flow", "sluice sync stop --wait"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err = %v; want it to contain %q", err, want)
 		}
@@ -541,66 +428,47 @@ func TestAddTable_LiveMode_BinlogSourceRefusesBeforeAnyWrite(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_InvariantFires confirms the snapshot-LSN ≥
-// slot-LSN invariant trips loudly when a stub engine reports a
-// regressed snapshot LSN. The standard ordering can't actually
-// produce this in practice, but the check pins the invariant
-// against a future regression in the flow's ordering.
-func TestAddTable_LiveMode_InvariantFires(t *testing.T) {
-	src := newAddTableSourceEngineLive("source")
-	src.schema = &ir.Schema{Tables: []*ir.Table{
-		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
-	}}
-	src.slotLSN = "0/2000"     // active stream at 0/2000
-	src.snapshotLSN = "0/1000" // snapshot somehow regressed to 0/1000
-
-	tgt := newAddTableTargetEngine("target")
-	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
-
-	a := &AddTable{
-		Source: src, Target: tgt,
-		SourceDSN: "src", TargetDSN: "tgt",
-		StreamID: "live", TableName: "new_table",
-		LiveMode: true,
-	}
-	err := a.Run(context.Background())
-	if err == nil {
-		t.Fatalf("expected invariant-fired error; got nil")
-	}
-	if !strings.Contains(err.Error(), "snapshot LSN") || !strings.Contains(err.Error(), "behind") {
-		t.Errorf("err = %v; want snapshot-LSN-behind-slot-LSN refusal", err)
-	}
-}
-
-// TestAddTable_LiveMode_EmptySlotLSNSkipsInvariant confirms that
-// when the active slot's confirmed_flush_lsn is empty (fresh slot,
-// no consumer progress yet), the invariant check is skipped and
-// the orchestrator proceeds. This mirrors PG's behaviour right
-// after a slot is created but before any commits have flowed.
-func TestAddTable_LiveMode_EmptySlotLSNSkipsInvariant(t *testing.T) {
-	src := newAddTableSourceEngineLive("source")
-	src.schema = &ir.Schema{Tables: []*ir.Table{
-		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
-	}}
-	src.slotLSN = ""           // empty floor → skip
-	src.snapshotLSN = "0/1000" // any value is fine
-
-	tgt := newAddTableTargetEngine("target")
-	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
-
-	a := &AddTable{
-		Source: src, Target: tgt,
-		SourceDSN: "src", TargetDSN: "tgt",
-		StreamID: "live", TableName: "new_table",
-		LiveMode: true,
-	}
-	if err := a.Run(context.Background()); err != nil {
-		t.Fatalf("Run with empty slot LSN unexpectedly errored: %v", err)
+// TestAddTable_LiveMode_PublicationSourceRefusesBeforeAnyWrite pins
+// NO-DRAIN-POSTGRES-SOURCE (Bug 332) at the stub level: a publication
+// source — the one source that still had a live path — refuses --no-drain
+// with the marker and the drained flow, whether or not a stop is in flight
+// and on a dry run too, before any publication add, snapshot, live-added
+// record or target writer.
+func TestAddTable_LiveMode_PublicationSourceRefusesBeforeAnyWrite(t *testing.T) {
+	for _, stopRequested := range []bool{false, true} {
+		for _, dryRun := range []bool{false, true} {
+			src := newAddTableSourceEngineLive("pg-source")
+			src.schema = &ir.Schema{Tables: []*ir.Table{
+				{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+			}}
+			tgt := newAddTableTargetEngineWithLiveAdd("postgres")
+			tgt.applier.streams = []ir.StreamStatus{{StreamID: "live", SlotName: "sluice_slot", PublicationName: "sluice_pub"}}
+			tgt.applier.stopRequested = stopRequested
+			err := (&AddTable{
+				Source: src, Target: tgt,
+				SourceDSN: "src", TargetDSN: "tgt",
+				StreamID: "live", TableName: "new_table",
+				LiveMode: true, DryRun: dryRun,
+			}).Run(context.Background())
+			if err == nil {
+				t.Fatalf("stop=%v dry-run=%v: --no-drain on a publication source succeeded; want the %s refusal", stopRequested, dryRun, noDrainPostgresSourceMarker)
+			}
+			for _, want := range []string{noDrainPostgresSourceMarker, "sluice sync stop --wait", "without --no-drain", "Keep the stream stopped"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("stop=%v dry-run=%v: err = %v; want it to contain %q", stopRequested, dryRun, err, want)
+				}
+			}
+			if len(src.addedTables) != 0 || src.snapshotCalls != 0 || len(tgt.applier.recordedLiveAdds) != 0 ||
+				tgt.openSchemaWriterCalls != 0 || tgt.openRowWriterCalls != 0 {
+				t.Errorf("stop=%v dry-run=%v: wrote before refusing: publication adds %v, snapshots %d, live adds %v, schema writers %d, row writers %d",
+					stopRequested, dryRun, src.addedTables, src.snapshotCalls, tgt.applier.recordedLiveAdds, tgt.openSchemaWriterCalls, tgt.openRowWriterCalls)
+			}
+		}
 	}
 }
 
-// TestActiveSlotName pins the slot-name lookup behavior for live
-// mode (ADR-0030). The cdc-state row's slot_name column is the
+// TestActiveSlotName pins the slot-name lookup behavior (ADR-0030; now
+// the recorded publication's own-slot exclusion, ADR-0176). The cdc-state row's slot_name column is the
 // authoritative source; an empty value falls back to the engine
 // default `sluice_slot` to cover both legacy rows that pre-date
 // the column and streamers that ran with the default slot name.
@@ -640,19 +508,6 @@ func TestActiveSlotName(t *testing.T) {
 				t.Errorf("activeSlotName(%+v) = %q; want %q", c.in, got, c.want)
 			}
 		})
-	}
-}
-
-// TestSlotNameSource pins the diagnostic tag so log inspection has
-// a stable contract. Operators tracing a live-add that picked the
-// wrong slot read this tag to confirm whether it came from the
-// recorded row or the default fallback.
-func TestSlotNameSource(t *testing.T) {
-	if got := slotNameSource(ir.StreamStatus{SlotName: "sluice_shard_a"}); got != "recorded" {
-		t.Errorf("slotNameSource(recorded) = %q; want %q", got, "recorded")
-	}
-	if got := slotNameSource(ir.StreamStatus{}); got != "default-fallback" {
-		t.Errorf("slotNameSource(empty) = %q; want %q", got, "default-fallback")
 	}
 }
 
@@ -750,24 +605,13 @@ func (e *addTableSourceEnginePubScoped) WithPublicationScope(publication, ownSlo
 	return e
 }
 
-// addTableSourceEngineLive is the live-mode (Phase 2) test stand-in.
-// Implements every optional surface the live-mode preflight + LSN
-// invariant check needs:
-//   - publicationAdder (gates the live-mode refusal)
-//   - slotPositionReader (returns the configured slotLSN)
-//   - snapshotLSNExtractor + lsnComparer (drive the invariant check;
-//     the comparer here is a string compare which works for the
-//     monotonically-increasing test fixtures)
-//
-// The snapshot it returns advertises snapshotLSN as its position
-// token via a JSON envelope ExtractSnapshotLSN can decode.
+// addTableSourceEngineLive is the publication-source (Postgres-shaped)
+// test stand-in: it implements publicationAdder and records the tables the
+// add extends the publication with. (Named for the --no-drain live path it
+// once stood in for; Bug 332 withdrew that path.)
 type addTableSourceEngineLive struct {
 	*addTableSourceEngine
-	addedTables    []string
-	slotLSN        string
-	snapshotLSN    string
-	slotNameAsked  string // captured by ReadSlotPosition for assertion
-	slotReadCalled bool
+	addedTables []string
 }
 
 func newAddTableSourceEngineLive(name string) *addTableSourceEngineLive {
@@ -777,50 +621,6 @@ func newAddTableSourceEngineLive(name string) *addTableSourceEngineLive {
 func (e *addTableSourceEngineLive) AddPublicationTables(_ context.Context, _ string, tables []string) error {
 	e.addedTables = append(e.addedTables, tables...)
 	return nil
-}
-
-func (e *addTableSourceEngineLive) ReadSlotPosition(_ context.Context, _, slotName string) (string, error) {
-	e.slotReadCalled = true
-	e.slotNameAsked = slotName
-	return e.slotLSN, nil
-}
-
-// OpenSnapshotStream overrides the embedded base to advertise the
-// configured snapshotLSN in the position token. The token is the
-// LSN itself (no JSON envelope) — the test extractor / comparer
-// below handle this format directly.
-func (e *addTableSourceEngineLive) OpenSnapshotStream(_ context.Context, _ string) (*ir.SnapshotStream, error) {
-	e.snapshotCalls++
-	return &ir.SnapshotStream{
-		Position: ir.Position{Engine: e.name, Token: e.snapshotLSN},
-		Rows:     &recordingRowReader{},
-		Changes:  &noopCDCReader{},
-		CloseFn:  func() error { return nil },
-	}, nil
-}
-
-// ExtractSnapshotLSN treats the position token as the LSN string
-// directly (test-only shape; the real PG engine decodes a JSON
-// envelope).
-func (e *addTableSourceEngineLive) ExtractSnapshotLSN(pos ir.Position) (lsn string, ok bool, err error) {
-	if pos.Engine == "" && pos.Token == "" {
-		return "", false, nil
-	}
-	return pos.Token, true, nil
-}
-
-// CompareLSN does a lexicographic compare on the LSN strings —
-// adequate for the monotonically-increasing fixtures the live-
-// mode unit tests use ("0/1000", "0/2000", ...). Real engines do
-// numeric comparison after parsing.
-func (e *addTableSourceEngineLive) CompareLSN(a, b string) (int, error) {
-	switch {
-	case a < b:
-		return -1, nil
-	case a > b:
-		return 1, nil
-	}
-	return 0, nil
 }
 
 // addTableTargetEngine bundles a recordingEngine with a configurable

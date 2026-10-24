@@ -26,6 +26,8 @@ B/C/D for this surface. (Status reconciled 2026-05-18 during an
 ADR-status audit; the prior "no strict-zero-loss implementation has
 shipped / paths remain on the table" wording predated v0.32.0.)
 
+**Correction (2026-10-23, Bug 332): "strict-zero-loss SHIPPED v0.32.0" was false, and the live add-table path is withdrawn (v0.163.9, NO-DRAIN-POSTGRES-SOURCE).** The v0.32.0 fix closed the `errUnknownTable` drop ADR-0036 found, and its pin (`TestStreamer_AddTable_LiveMode_PG_UnderLoad`, now deleted) wrote INSERTs only. Inserts are the one change kind that commutes with an idempotent copy. Deletes and updates made during the add were lost or undone by the copy, and on a filtered stream every change was dropped until the live-added poll admitted the table (measured at v0.163.8, see ADR-0030's withdrawal note). The Path A slot-pause finding below is unaffected.
+
 ## Context
 
 ADR-0030 shipped Phase 2 mid-stream live add-table (`--no-drain`, PG-only) in v0.24.0 with a documented best-effort gap (ADR-0030 § "What could go wrong" item 3): events on the new table inserted DURING the brief publication-add window may not be delivered. The under-load CI test (`TestAddTable_LiveMode_PG_UnderLoad`) explicitly relaxes its assertions — snapshot rows + post-add CDC are pinned (load-bearing); in-flight events during the add window are best-effort logged but not asserted. The v0.24.0 cycle's Scenario 4 exploration confirmed real loss: 0% at slow rate, ~36% at high-burst (1000 rows / sub-second).

@@ -36,6 +36,14 @@
 //   - pg->mysql filtered:   A 20/10/10, B 30/10/10 (50 kept, 20 stale, 20 missing)
 //   - pg->mysql unfiltered: A 20/10/0,  B 30/0/0 (50 kept, 10 stale)
 //   - drained add against a stopped stream, pg->pg and pg->mysql: exact.
+//
+// The live arms are now pins: --no-drain on a Postgres source refuses
+// NO-DRAIN-POSTGRES-SOURCE before it reads the source, opens a snapshot,
+// extends the publication or records anything, and the running stream is
+// unaffected. The drained controls (filtered pg->pg and pg->mysql,
+// unfiltered pg->pg) stay exact pins across every phase. The RecopyRemedy
+// cells measure the CHANGELOG's re-copy on a Postgres source, including its
+// foreign-key caveat (runRecopyRemedy, shared with the binlog rig).
 
 package pipeline
 
@@ -192,9 +200,17 @@ func runPGNoDrainArm(t *testing.T, arm pgndwArm) pgndwOutcome {
 		Source: src, Target: tgtEng, SourceDSN: arm.src.dsn, TargetDSN: arm.tgt.dsn,
 		StreamID: streamID, TableName: "orders", LiveMode: arm.noDrain,
 	}).Run(context.Background())
-	if out.addErr != nil {
-		out.warnLines = len(ndwWarnLines(logs.String(), logOffset))
+	if arm.noDrain {
+		// The pin: the add that lost the window's changes now refuses before
+		// it reads the source or writes anything, and the running stream is
+		// unaffected.
+		requirePGNoDrainRefusal(t, arm, out, tgtEng, streamID)
+		arm.src.exec(t, "INSERT INTO users VALUES (3, 'u3')")
+		waitUser(3, run)
 		return out
+	}
+	if out.addErr != nil {
+		t.Fatalf("[%s] drained AddTable: %v", arm.name, out.addErr)
 	}
 	if phaseA.at.IsZero() || phaseB.at.IsZero() {
 		t.Fatalf("RIG [%s]: the hooks did not run (A=%v B=%v)", arm.name, phaseA.at, phaseB.at)
@@ -238,24 +254,35 @@ func runPGNoDrainArm(t *testing.T, arm pgndwArm) pgndwOutcome {
 	return out
 }
 
-// requirePGLiveMeasured is the Phase A measurement: the live add exits nil
-// and the target diverges. It records the counts; a run that comes out exact
-// says the rig stopped reproducing, not that the bug is gone.
-func requirePGLiveMeasured(t *testing.T, arm pgndwArm) {
-	out := runPGNoDrainArm(t, arm)
-	if out.addErr != nil {
-		t.Fatalf("[%s] the --no-drain add failed: %v", arm.name, out.addErr)
+// requirePGNoDrainRefusal is the pin that replaced the measurement: the
+// --no-drain add refuses NO-DRAIN-POSTGRES-SOURCE, names the drained flow,
+// and left nothing behind — no snapshot, no target table, no live-added or
+// pending record, and no publication membership for the table.
+func requirePGNoDrainRefusal(t *testing.T, arm pgndwArm, out pgndwOutcome, tgtEng ir.Engine, streamID string) {
+	t.Helper()
+	if out.addErr == nil {
+		t.Fatalf("[%s] --no-drain on a Postgres source succeeded; want the %s refusal", arm.name, noDrainPostgresSourceMarker)
 	}
-	if out.stale+out.changed+out.missing == 0 {
-		t.Errorf("[%s] the --no-drain add came out exact; the rig no longer reproduces Bug 332", arm.name)
+	for _, want := range []string{noDrainPostgresSourceMarker, "sluice sync stop --wait", "without --no-drain", "Keep the stream stopped"} {
+		if !strings.Contains(out.addErr.Error(), want) {
+			t.Errorf("[%s] refusal = %v; want it to contain %q", arm.name, out.addErr, want)
+		}
+	}
+	if out.snapshotOpened {
+		t.Errorf("[%s] the refused add opened a snapshot", arm.name)
+	}
+	if rows := arm.tgt.rows(t); rows != nil {
+		t.Errorf("[%s] the refused add left orders on the target (%d rows)", arm.name, len(rows))
+	}
+	ndwAssertNoAddRecorded(t, tgtEng, arm.tgt.dsn, streamID)
+	src := twfbDB{engine: "postgres", dsn: arm.src.dsn}
+	if n := src.scalar(t, `SELECT count(*) FROM pg_publication_rel pr JOIN pg_class c ON c.oid = pr.prrelid WHERE c.relname = 'orders'`); n != "0" {
+		t.Errorf("[%s] the refused add put orders in a publication (%s memberships)", arm.name, n)
 	}
 }
 
 func requirePGDrainedExact(t *testing.T, arm pgndwArm) {
 	out := runPGNoDrainArm(t, arm)
-	if out.addErr != nil {
-		t.Fatalf("[%s] drained AddTable: %v", arm.name, out.addErr)
-	}
 	if out.stale+out.changed+out.missing > 0 {
 		t.Errorf("CONTROL [%s]: drained add against a stopped stream is not exact: %d stale, %d changed, %d missing", arm.name, out.stale, out.changed, out.missing)
 	}
@@ -277,31 +304,54 @@ func pgndwPGMySQL(t *testing.T) (src, tgt ndwDB, cleanup func()) {
 func TestAddTableNoDrainWindow_PG_PGToPG_FilteredLive(t *testing.T) {
 	src, tgt, cleanup := pgndwPGPG(t)
 	defer cleanup()
-	requirePGLiveMeasured(t, pgndwArm{name: "pg-pg-filtered-live", tgtEngine: "postgres", src: src, tgt: tgt, filtered: true, noDrain: true})
+	runPGNoDrainArm(t, pgndwArm{name: "pg-pg-filtered-live", tgtEngine: "postgres", src: src, tgt: tgt, filtered: true, noDrain: true})
 }
 
 func TestAddTableNoDrainWindow_PG_PGToPG_UnfilteredLive(t *testing.T) {
 	src, tgt, cleanup := pgndwPGPG(t)
 	defer cleanup()
-	requirePGLiveMeasured(t, pgndwArm{name: "pg-pg-unfiltered-live", tgtEngine: "postgres", src: src, tgt: tgt, noDrain: true})
+	runPGNoDrainArm(t, pgndwArm{name: "pg-pg-unfiltered-live", tgtEngine: "postgres", src: src, tgt: tgt, noDrain: true})
 }
 
 func TestAddTableNoDrainWindow_PG_PGToMySQL_FilteredLive(t *testing.T) {
 	src, tgt, cleanup := pgndwPGMySQL(t)
 	defer cleanup()
-	requirePGLiveMeasured(t, pgndwArm{name: "pg-mysql-filtered-live", tgtEngine: "mysql", src: src, tgt: tgt, filtered: true, noDrain: true})
+	runPGNoDrainArm(t, pgndwArm{name: "pg-mysql-filtered-live", tgtEngine: "mysql", src: src, tgt: tgt, filtered: true, noDrain: true})
 }
 
 func TestAddTableNoDrainWindow_PG_PGToMySQL_UnfilteredLive(t *testing.T) {
 	src, tgt, cleanup := pgndwPGMySQL(t)
 	defer cleanup()
-	requirePGLiveMeasured(t, pgndwArm{name: "pg-mysql-unfiltered-live", tgtEngine: "mysql", src: src, tgt: tgt, noDrain: true})
+	runPGNoDrainArm(t, pgndwArm{name: "pg-mysql-unfiltered-live", tgtEngine: "mysql", src: src, tgt: tgt, noDrain: true})
 }
 
 func TestAddTableNoDrainWindow_PG_PGToPG_DrainedStoppedControl(t *testing.T) {
 	src, tgt, cleanup := pgndwPGPG(t)
 	defer cleanup()
 	requirePGDrainedExact(t, pgndwArm{name: "pg-pg-drained-stopped", tgtEngine: "postgres", src: src, tgt: tgt, filtered: true})
+}
+
+func TestAddTableNoDrainWindow_PG_PGToPG_UnfilteredDrainedStoppedControl(t *testing.T) {
+	src, tgt, cleanup := pgndwPGPG(t)
+	defer cleanup()
+	requirePGDrainedExact(t, pgndwArm{name: "pg-pg-unfiltered-drained-stopped", tgtEngine: "postgres", src: src, tgt: tgt})
+}
+
+// TestAddTableNoDrainWindow_PG_RecopyRemedy* measure the remedy the
+// CHANGELOG gives an operator whose table an earlier --no-drain add on a
+// Postgres source left diverged (runRecopyRemedy: stop the stream, empty the
+// target table with its foreign keys off for that session, add it again
+// drained, restart), including the foreign-key caveat.
+func TestAddTableNoDrainWindow_PG_RecopyRemedy(t *testing.T) {
+	src, tgt, cleanup := pgndwPGPG(t)
+	defer cleanup()
+	runRecopyRemedy(t, "postgres", "postgres", src, tgt, "SET LOCAL session_replication_role = replica")
+}
+
+func TestAddTableNoDrainWindow_PG_RecopyRemedyMySQLTarget(t *testing.T) {
+	src, tgt, cleanup := pgndwPGMySQL(t)
+	defer cleanup()
+	runRecopyRemedy(t, "postgres", "mysql", src, tgt, "SET FOREIGN_KEY_CHECKS = 0")
 }
 
 func TestAddTableNoDrainWindow_PG_PGToMySQL_DrainedStoppedControl(t *testing.T) {

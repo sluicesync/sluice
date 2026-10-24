@@ -40,8 +40,9 @@ func TestEngine_Capabilities(t *testing.T) {
 	}
 }
 
-// TestEngine_CompareLSN exercises the live-mode invariant helper
-// (ADR-0030) on canonical PG LSN strings. The compare must be
+// TestEngine_CompareLSN exercises the LSN compare (once the --no-drain
+// invariant helper of ADR-0030, withdrawn by Bug 332; still used by the
+// position comparison in engine.go) on canonical PG LSN strings. The compare must be
 // numeric over the parsed pglogrepl.LSN value, not lexicographic
 // over the string form — `0/A` sorts above `0/9` lexicographically
 // but pglogrepl.ParseLSN gives 10 vs 9 numerically.

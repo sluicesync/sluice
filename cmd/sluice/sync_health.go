@@ -122,7 +122,7 @@ type HealthResult struct {
 	// PendingAddedTablesTripped: at least one entry is stale (its add-table
 	// stopped refreshing it [ir.PendingAddStaleAfter] ago). A fresh entry is
 	// an add-table still copying — reported, not tripped, so a cron probe
-	// does not page through every normal --no-drain add.
+	// does not page through every add that is still copying.
 	PendingAddedTablesTripped bool `json:"pending_added_tables_tripped,omitempty"`
 	// PendingAddedTablesAbandoned: at least one entry was retired by `schema
 	// add-table --abandon` (R4-1). It trips too, and its remedy is to restart

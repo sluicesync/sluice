@@ -1955,8 +1955,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// streamer-snapshot-handoff race): if a missing row's body
 		// appears here, the applier received the event and dropped it
 		// (or failed downstream); if not, it never reached the
-		// applier and the loss is upstream. See the diagnose test's
-		// renderVerdictM5Attribution for the cross-reference.
+		// applier and the loss is upstream. The diagnose test that
+		// read it was deleted with --no-drain (Bug 332); see
+		// diagApplierInsertReceived.
 		schema := a.routedSchema(v.Schema)
 		diagApplierInsertReceived(ctx, schema, v)
 		// Bug 125: the Insert ON CONFLICT target is the table's PK when
@@ -2151,8 +2152,13 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 
 // diagApplierInsertReceived emits an ADR-0036 Phase A.3 DEBUG-level
 // trace line every time an Insert event reaches the dispatch site.
-// The diagnose test (`add_table_live_pg_diagnose_integration_test.go`)
-// parses these to build an `applierByBody` map keyed off the events
+//
+// ORPHANED since Bug 332: its only consumer, the --no-drain diagnose test
+// (`add_table_live_pg_diagnose_integration_test.go`), was deleted with the
+// path it diagnosed. It is left in place only because removing it touches
+// the applier hot path, and a guard-withdrawal release carries no other
+// runtime change; remove it (and its token parse, which runs even with
+// DEBUG off) in a follow-up. The test parsed these to build an `applierByBody` map keyed off the events
 // table's `body` column, then cross-references each missing row to
 // classify the loss as M5c (applier received and dropped) vs
 // M5a/M5b (pgoutput filtered or streamer-snapshot-handoff race —
