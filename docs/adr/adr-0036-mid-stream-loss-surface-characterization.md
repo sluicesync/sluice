@@ -4,6 +4,8 @@
 
 **Phase A.1 run complete (2026-05-10, Vultr vhf-3c-8gb / Postgres 16.13 / Linux).** 6 runs of the diagnostic test produced stable verdicts:
 
+**Correction (2026-10-23, Bug 332): the Phase B "strict zero-loss" result was false, and the live add-table path is withdrawn (v0.163.9, NO-DRAIN-POSTGRES-SOURCE).** Every phase of this characterization drove INSERT-only load, so it could only ever find loss in the one change kind that commutes with the add's idempotent copy; the Phase B fix (target CREATE before the publication add, idempotent copy) is real for inserts and for nothing else. Deletes and updates that reach a row before the copy writes it are undone by the copy, and on a filtered stream every change is dropped until the live-added poll admits the table: measured at v0.163.8 by `internal/pipeline/add_table_no_drain_window_pg_integration_test.go` (PG→PG 40–50 deletes kept and 15–20 updates stale; ADR-0030's withdrawal note has the full numbers). The diagnose test (`add_table_live_pg_diagnose_integration_test.go`) and the under-load pin were deleted with the path; the debug instrumentation it read is left in place (pipeline `addtable.diag` lines, still emitted by drained adds; the applier probe is marked orphaned for a follow-up removal).
+
 | Mechanism | Outcome | Key signature |
 |---|---|---|
 | M1 — Long txns straddling pub-add | FAILS in 5/6, HOLDS in 1/6 (1 affected row) | Loader uses implicit single-statement txns; rare straddler when loader cadence and ALTER coincide |

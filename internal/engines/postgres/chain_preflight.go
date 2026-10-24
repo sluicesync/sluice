@@ -33,9 +33,9 @@ import (
 //     START_REPLICATION to confirmed_flush_lsn, so without this check
 //     the incremental SUCCEEDS while the chain silently misses every
 //     write in (parent, confirmed_flush]. Same hazard class the
-//     live add-table preflight guards via [Engine.ReadSlotPosition]
-//     ("events in [snapshot-LSN, confirmed_flush_lsn] would be
-//     silently dropped"); this is the backup-chain counterpart.
+//     withdrawn `schema add-table --no-drain` preflight guarded with its
+//     slot-position floor (ADR-0030, withdrawn by Bug 332); this is the
+//     backup-chain counterpart.
 //
 // A confirmed_flush_lsn at or behind the parent position is healthy:
 // equal is the steady-state chain shape (the slot sits exactly at the

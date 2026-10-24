@@ -16,7 +16,9 @@ package pipeline
 // then runs `sluice schema add-table SOURCE.NAME`, then resumes
 // (re-run `sluice sync start` with the same --stream-id; there is no
 // resume flag). AddTable refuses if the stream is
-// still active. Live add-table without the drain is Phase 2.
+// still active. Live add-table without the drain (Phase 2, `--no-drain`)
+// is withdrawn on every source (Bug 332): it refuses before anything is
+// read or written.
 //
 // The flow:
 //
@@ -99,27 +101,13 @@ type slotDropper interface {
 	OpenSlotManager(ctx context.Context, dsn string) (ir.SlotManager, error)
 }
 
-// slotPositionReader is the optional engine-side surface for reading
-// the active stream's slot position before a live mid-stream add-
-// table. Used by [AddTable.LiveMode] to capture the slot's
-// confirmed_flush_lsn at the moment publication-add is about to
-// run, so the orchestrator can verify the subsequent snapshot LSN
-// has not regressed past it (which would silently drop events on
-// the new table). PG implements via SELECT confirmed_flush_lsn FROM
-// pg_replication_slots WHERE slot_name = ...; engines without slots
-// leave it unimplemented and live mode refuses on those engines via
-// the publicationAdder gate. See ADR-0030.
-type slotPositionReader interface {
-	ReadSlotPosition(ctx context.Context, dsn, slotName string) (string, error)
-}
-
 // currentWALPositionReader is an optional engine-side surface for
 // reading the source's current WAL position against a supplied DSN.
 // ADR-0036 (Path D Phase A) instrumentation: the diagnostic flow logs
 // pg_current_wal_lsn() before AND after publication-add so the
 // captured logs name a concrete LSN window for the catalog change.
 // Independent from the SchemaReader.SourceCurrentPosition surface
-// (which requires a held SchemaReader) because the live-add flow
+// (which requires a held SchemaReader) because the add flow
 // closes the SchemaReader before publication-add runs.
 //
 // Implemented on PG; engines without WAL semantics omit it. Returns
@@ -131,31 +119,14 @@ type currentWALPositionReader interface {
 
 // snapshotLSNExtractor is the optional engine-side surface for
 // extracting the consistent-point LSN out of a snapshot stream's
-// opaque [ir.Position] token. Used by [AddTable.LiveMode] to verify
-// the snapshot-LSN ≥ slot-confirmed-flush-LSN invariant (ADR-0030).
-// PG implements via JSON-decoding its position envelope; engines
-// without LSN-shaped positions return ("", false, nil).
-//
-// The orchestrator stays engine-neutral by treating absence of this
-// interface as "no LSN floor available, skip the check". Live mode
-// refuses up-front on engines that don't implement publicationAdder,
-// so in practice the only engine that opts into live mode also
-// implements this surface.
+// opaque [ir.Position] token, for the ADR-0036 debug line that places
+// the snapshot against the publication-add LSN window
+// ([AddTable.diagSnapshotConsistentPoint]). PG implements via
+// JSON-decoding its position envelope; engines without LSN-shaped
+// positions return ("", false, nil), and an engine without the surface
+// skips the line.
 type snapshotLSNExtractor interface {
 	ExtractSnapshotLSN(pos ir.Position) (lsn string, ok bool, err error)
-}
-
-// lsnComparer is the optional engine-side surface for comparing two
-// position-token LSN strings. Used in conjunction with
-// [snapshotLSNExtractor] and [slotPositionReader] to enforce the
-// snapshot-LSN ≥ slot-confirmed-flush-LSN invariant on live add-
-// table without the orchestrator needing to parse engine-specific
-// LSN encodings.
-//
-// Returns -1 if a < b, 0 if equal, +1 if a > b. PG implements via
-// pglogrepl.ParseLSN comparison; engines without slots omit it.
-type lsnComparer interface {
-	CompareLSN(a, b string) (int, error)
 }
 
 // AddTable is the orchestrator for the mid-stream add-table flow.
@@ -211,25 +182,17 @@ type AddTable struct {
 	// target schema, or capturing a snapshot.
 	DryRun bool
 
-	// LiveMode, when true, lifts the Phase 1 conservative refusal
-	// of an active stream and runs add-table against a stream that
-	// is currently consuming WAL. Phase 2 of the mid-stream add-
-	// table feature; see ADR-0030 for the correctness story
-	// (publication-add-then-snapshot ordering on PG; the idempotent
-	// applier absorbs the [snapshot-LSN, slot-LSN] overlap on the
-	// new table).
-	//
-	// Trade-off: LiveMode skips the `stop_requested_at` refusal in
-	// favour of an explicit invariant check (snapshot-LSN ≥ slot
-	// confirmed_flush_lsn captured at publication-add time). Only a
-	// publication-bearing source (PG, publication-add) takes the live
-	// path — see preflightLive. Every other source refuses before
-	// anything is written and names the drained add-table flow: a binlog
-	// source (NO-DRAIN-BINLOG-SOURCE; ADR-0034's filter-flip lost every
-	// change made to the table between the add's snapshot and the stream
-	// admitting it, which spans the whole copy, not a poll interval), a
-	// VStream source (NO-DRAIN-VSTREAM-SOURCE), and the rest. The CLI
-	// flag is `--no-drain` on `sluice schema add-table`.
+	// LiveMode is `--no-drain` on `sluice schema add-table`: an add
+	// against a stream that is still running. It is WITHDRAWN on every
+	// source and always refuses, before the source is read or anything is
+	// written, naming the drained add-table flow
+	// ([noDrainRefusalForStream]). Each live path it once took lost the
+	// changes made to the table during the add: Postgres's publication add
+	// (NO-DRAIN-POSTGRES-SOURCE, Bug 332), the binlog filter-flip
+	// (NO-DRAIN-BINLOG-SOURCE) and the VStream copy
+	// (NO-DRAIN-VSTREAM-SOURCE). The field and the flag stay so a script
+	// that still passes it gets the refusal rather than an unknown-flag
+	// error or, worse, a drained add against a running stream.
 	LiveMode bool
 
 	// TargetSchema is the operator-supplied per-source target schema
@@ -339,8 +302,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	)
 
 	// ---- 1. Verify the stream exists and is not actively running.
-	// In live mode the active-stream refusal is skipped in favour of
-	// the snapshot-LSN ≥ slot-LSN invariant captured below.
+	// --no-drain (LiveMode) refuses here on every source.
 	applier, err := a.Target.OpenChangeApplier(ctx, a.TargetDSN)
 	if err != nil {
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: open target applier: %w", err))
@@ -610,20 +572,6 @@ func (a *AddTable) bringInTable(ctx context.Context, applier ir.ChangeApplier, p
 	// consistent-point LSN against the publication-add LSN window.
 	a.diagSnapshotConsistentPoint(ctx, stream.Position, lsnBeforePubAdd, lsnAfterPubAdd, tempSlot)
 
-	// ---- 5a. Live-mode invariant (PG path only): snapshot-LSN ≥ slot
-	// confirmed_flush_lsn captured before publication-add. ADR-0030.
-	// The standard ordering (publication-add → snapshot) cannot trip
-	// this in practice, but the explicit check pins the invariant so
-	// a future regression in the flow's ordering fails loudly rather
-	// than producing silent drift on the new table.
-	// It is the only live path: preflightLive refuses --no-drain on every
-	// source without a publication.
-	if a.LiveMode {
-		if err := a.verifyLiveModeLSNInvariant(ctx, preflight.slotConfirmedFlushLSN, stream.Position); err != nil {
-			return err
-		}
-	}
-
 	// ---- 6. Bulk-copy the single table. runBulkCopyForAddTable
 	// re-runs CreateTablesWithoutConstraints (idempotent no-op given
 	// the early-create in step 3a above), copies rows via the
@@ -799,7 +747,10 @@ func (a *AddTable) diagSnapshotConsistentPoint(ctx context.Context, pos ir.Posit
 // [AddTable.bringInTable] call site): from that point the publication
 // delivers the table, and a running stream must apply what it delivers, as
 // an unfiltered stream always did. Elsewhere it runs here, after the copy,
-// where ADR-0034's MySQL --no-drain path always ran it.
+// where ADR-0034's MySQL --no-drain path always ran it. With --no-drain
+// withdrawn (Bug 332) the stream is meant to be stopped for the whole add,
+// so the order no longer decides what a running stream applies; it is kept
+// so the drained path's records and undo are unchanged by the withdrawal.
 func (a *AddTable) recordLiveAddedTable(ctx context.Context, applier ir.ChangeApplier, _ addTablePreflight) error {
 	if _, publicationSource := a.Source.(publicationAdder); publicationSource {
 		return nil // recorded before the publication add
@@ -822,27 +773,18 @@ func (a *AddTable) recordAddedTable(ctx context.Context, applier ir.ChangeApplie
 		))
 	}
 	slog.InfoContext(ctx, "add-table: recorded the table in the stream's live-added set: it is in the stream's scope on every "+
-		"start from now on (only `schema add-table --abandon` takes it out); on a publication source a running stream applies it from "+
-		"the publication add, but on any other source a stream that was still running picks it up only at its next poll tick and "+
-		"has dropped the table's changes until then, so the stream must have been stopped for the add; "+
+		"start from now on (only `schema add-table --abandon` takes it out); the stream must be stopped for the whole add on every "+
+		"source: a stream still running drops the table's changes until its next poll tick, or on an unfiltered Postgres stream applies "+
+		"them while the copy runs, which a later copied row undoes (Bug 332); "+
 		"a stream whose --exclude-table names it refuses (LIVE-ADDED-TABLE-EXCLUDED) until one of the two changes",
 		slog.String("table", a.TableName), slog.String("stream_id", a.StreamID))
 	return nil
 }
 
-// logAddComplete emits the terminal success line, tailored to whether
-// the add ran live (only on a publication source: the publication has
-// delivered the table to the running stream since before the snapshot)
-// or drained (operator must restart the stream).
+// logAddComplete emits the terminal success line: the operator restarts
+// the stream (every add is drained; --no-drain refuses before Run gets
+// here).
 func (a *AddTable) logAddComplete(ctx context.Context) {
-	if a.LiveMode {
-		slog.InfoContext(
-			ctx, "add-table: live add complete; the running stream has applied the table's changes since the publication add, before the snapshot",
-			slog.String("table", a.TableName),
-			slog.String("stream_id", a.StreamID),
-		)
-		return
-	}
 	slog.InfoContext(
 		ctx, "add-table: complete; resume the stream by re-running `sluice sync start --source-driver=... --source=... "+
 			"--target-driver=... --target=...` with the same --stream-id (there is no resume flag) "+
@@ -1042,39 +984,21 @@ func (a *AddTable) validate() error {
 }
 
 // addTablePreflight is the orchestrator-side state captured during
-// the stream pre-flight: the active stream exists, the recorded
-// target-schema namespace, and (in live mode) the active stream's
-// slot confirmed_flush_lsn at the moment publication-add is about
-// to run. The captured LSN feeds the snapshot-LSN ≥ slot-LSN
-// invariant check after the snapshot opens.
-//
-// Empty slotConfirmedFlushLSN means "no floor" — either the engine
-// doesn't expose the surface (drained mode), or the slot exists but
-// has not yet acked any consumer progress.
+// the stream pre-flight.
 //
 // resolvedTargetSchema is the post-resolution value to thread into
 // the schema writer / row writer / change applier — either inherited
 // from the recorded value, supplied by the operator, or (when both
 // sides agreed-empty) the empty string for "use the DSN default."
 type addTablePreflight struct {
-	slotConfirmedFlushLSN string
-	resolvedTargetSchema  string
+	resolvedTargetSchema string
 }
 
 // preflightStream verifies the active stream's row exists on the
-// target. In drained (default) mode it also refuses if no `sync
-// stop` is in flight, surfacing the operator-friendly "drain first"
-// message. In live mode (`LiveMode=true`, ADR-0030) the active-
-// stream refusal is skipped in favour of three tighter checks:
-//
-//  1. the source engine must implement publicationAdder — engines
-//     without publications (MySQL) get a clear PG-only error here;
-//  2. the source engine must implement slotPositionReader — needed
-//     to capture the slot's confirmed_flush_lsn for the invariant
-//     check that fires after the snapshot opens;
-//  3. the slot's confirmed_flush_lsn is captured (best-effort: an
-//     empty string means "no floor", which the invariant check
-//     accepts).
+// target and refuses if a `sync stop` is still in flight, surfacing the
+// operator-friendly "drain first" message. `--no-drain` (LiveMode)
+// refuses on every source, before anything is read or written
+// ([noDrainRefusalForStream]; Bug 332 withdrew the last live path).
 //
 // Always resolves the target-schema namespace (Bug 46): inherits
 // the recorded value when the operator omits the flag, refuses on
@@ -1099,6 +1023,12 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 	}
 	if !found {
 		return addTablePreflight{}, fmt.Errorf("pipeline: add-table: no stream %q on target — verify --stream-id matches the active stream's id (run `sluice sync status` to list streams)", a.StreamID)
+	}
+	// --no-drain refuses here, on every source, before the source is read
+	// or anything is written (Bug 332). The stream's row is read first only
+	// because its recorded position picks the marker.
+	if a.LiveMode {
+		return addTablePreflight{}, noDrainRefusalForStream(a.Source, status)
 	}
 
 	// ADR-0176 prerequisite: point the source engine at the stream's
@@ -1133,14 +1063,6 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 		return addTablePreflight{}, err
 	}
 
-	if a.LiveMode {
-		live, err := a.preflightLive(ctx, status)
-		if err != nil {
-			return addTablePreflight{}, err
-		}
-		live.resolvedTargetSchema = resolvedTS
-		return live, nil
-	}
 	if err := a.preflightDrained(ctx, applier); err != nil {
 		return addTablePreflight{}, err
 	}
@@ -1207,54 +1129,47 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 		return migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf("pipeline: add-table: read stop flag: %w", err))
 	}
 	if stopRequested {
-		// The --no-drain alternative exists only on a publication source;
-		// everywhere else it refuses (NO-DRAIN-BINLOG-SOURCE,
-		// NO-DRAIN-VSTREAM-SOURCE), so the hint does not offer it there.
-		alternative := ""
-		if isPublicationAdder(a.Source) {
-			alternative = " (or, on this Postgres source, pass --no-drain to add the table to a running stream)"
-		}
-		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table%s", a.StreamID, alternative)
+		// No --no-drain alternative is offered: it is withdrawn on every
+		// source (Bug 332).
+		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table", a.StreamID)
 	}
 	return nil
 }
 
-// preflightLive applies the live-mode refusals and captures the
-// publication path's floor. Only a publication-bearing source has a live
-// path (`publicationAdder`, Postgres, ADR-0030): it captures the active
-// stream's slot confirmed_flush_lsn so the snapshot-LSN ≥ slot-LSN
-// invariant can be checked after the snapshot opens, and refuses if the
-// source doesn't also implement `slotPositionReader` (a code-side
-// guarantee on PG; the absence indicates a build with the engine surface
-// stripped).
-//
-// Every other source refuses, before anything is written
-// ([noDrainLivePathRefusal]).
-func (a *AddTable) preflightLive(ctx context.Context, status ir.StreamStatus) (addTablePreflight, error) {
-	if err := noDrainLivePathRefusal(a.Source, status); err != nil {
-		return addTablePreflight{}, err
-	}
-	return a.preflightLivePG(ctx, status)
-}
-
-// noDrainLivePathRefusal is the --no-drain source decision: nil for a
-// publication-bearing source (the one live path), otherwise
-// [noDrainRefusal]'s message for the stream's CDC method
-// ([streamSourceCDC]: the declared driver and the stream's recorded
-// position), each naming the drained add-table flow. Pinned across every
-// registered engine by TestNoDrainLivePath_EngineMatrix.
-func noDrainLivePathRefusal(source ir.Engine, status ir.StreamStatus) error {
+// noDrainRefusalForStream is the --no-drain refusal. `--no-drain` is
+// withdrawn on EVERY source: no live add-table path is left. The marker
+// names the source class and the live path it took, picked for the
+// publication path by the source implementing [publicationAdder] and
+// otherwise from the stream's CDC method ([streamSourceCDC]: the declared
+// driver and the stream's recorded position). Each message names the
+// drained add-table flow. Pinned across every registered engine by
+// TestNoDrainRefusal_EngineMatrix.
+func noDrainRefusalForStream(source ir.Engine, status ir.StreamStatus) error {
 	if _, publicationSource := source.(publicationAdder); publicationSource {
-		return nil
+		return fmt.Errorf(
+			"pipeline: add-table: %s: --no-drain is withdrawn on a Postgres source (source=%q): the running stream does not apply the new table's changes in order after the add's copy. "+
+				"A stream started with --include-table drops them until it admits the table, and an unfiltered stream applies them while the copy runs, "+
+				"so a delete or update made during the add is lost or undone by the copy, and on a filtered stream inserts are lost too. %s",
+			noDrainPostgresSourceMarker, source.Name(), drainedAddTableFlow,
+		)
 	}
 	sourceCDC, cdcFrom := streamSourceCDC(source, status)
 	return noDrainRefusal(source.Name(), sourceCDC, cdcFrom)
 }
 
 // noDrainRefusal is the --no-drain refusal for a source without a
-// publication. Two sources get their own marker, because each reached a
-// live path that lost data:
+// publication. Each source class that had a live path gets its own marker,
+// because each lost data its own way:
 //
+//   - a Postgres source (NO-DRAIN-POSTGRES-SOURCE, [noDrainRefusalForStream])
+//     took ADR-0030's publication add. Bug 332:
+//     TestAddTableNoDrainWindow_PG_* measured, on pg->pg and pg->mysql,
+//     every change made between the add's snapshot and the stream admitting
+//     the table lost on a filtered stream (50 deletes kept, 20 updates
+//     stale, 20 inserts missing), and on an unfiltered one the deletes and
+//     updates that reached a row before the copy wrote it undone (40-50
+//     kept, 10-15 stale), at exit 0 with no WARN. ADR-0036's "strict
+//     zero-loss" was pinned with inserts only.
 //   - a BINLOG source (MySQL, MariaDB; NO-DRAIN-BINLOG-SOURCE) took
 //     ADR-0034's filter-flip. The copy reads a snapshot fixed when it
 //     opens, the table joins the running stream's scope only after the
@@ -1272,8 +1187,6 @@ func noDrainLivePathRefusal(source ir.Engine, status ir.StreamStatus) error {
 //
 // Every other source (the trigger-CDC engines, and engines with no CDC,
 // which validate refuses earlier) gets the generic refusal.
-//
-// Pinned across every registered engine by TestNoDrainLivePath_EngineMatrix.
 func noDrainRefusal(source string, sourceCDC ir.CDCMethod, cdcFrom string) error {
 	switch sourceCDC {
 	case ir.CDCBinlog:
@@ -1288,7 +1201,7 @@ func noDrainRefusal(source string, sourceCDC ir.CDCMethod, cdcFrom string) error
 		)
 	}
 	return fmt.Errorf(
-		"pipeline: add-table: --no-drain requires a publication-bearing source engine (Postgres); source=%q (cdc=%s) is not one. %s",
+		"pipeline: add-table: --no-drain is withdrawn on every source; source=%q (cdc=%s) never had a live add-table path. %s",
 		source, sourceCDC, drainedAddTableFlow,
 	)
 }
@@ -1343,40 +1256,9 @@ const noDrainVStreamSourceMarker = "NO-DRAIN-VSTREAM-SOURCE"
 // refusal for a MySQL or MariaDB binlog source carries.
 const noDrainBinlogSourceMarker = "NO-DRAIN-BINLOG-SOURCE"
 
-// preflightLivePG is the original ADR-0030 preflight: capture the
-// active stream's slot confirmed_flush_lsn so the snapshot-LSN ≥
-// slot-LSN invariant has a floor to verify against. PG-only.
-//
-// The slot name is recovered from the StreamStatus row populated by
-// the active stream's last position-write (PG ChangeApplier records
-// it via SetSlotName on every Streamer startup; the sluice_cdc_state
-// row's slot_name column carries it). Empty / legacy values fall
-// back to the engine default `sluice_slot`.
-func (a *AddTable) preflightLivePG(ctx context.Context, status ir.StreamStatus) (addTablePreflight, error) {
-	reader, ok := a.Source.(slotPositionReader)
-	if !ok {
-		return addTablePreflight{}, fmt.Errorf(
-			"pipeline: add-table: --no-drain requires the source engine to expose ReadSlotPosition; %q does not. This is a code-side guarantee on PG; the absence indicates a build with the engine surface stripped — file an issue",
-			a.Source.Name(),
-		)
-	}
-
-	slotName := activeSlotName(status)
-	lsn, err := reader.ReadSlotPosition(ctx, a.SourceDSN, slotName)
-	if err != nil {
-		return addTablePreflight{}, migcore.WrapWithHint(migcore.PhaseConnect, fmt.Errorf(
-			"pipeline: add-table: --no-drain: read slot position for %q: %w",
-			slotName, err,
-		))
-	}
-	slog.InfoContext(
-		ctx, "add-table: live mode: captured active-stream slot position",
-		slog.String("slot", slotName),
-		slog.String("slot_source", slotNameSource(status)),
-		slog.String("confirmed_flush_lsn", lsn),
-	)
-	return addTablePreflight{slotConfirmedFlushLSN: lsn}, nil
-}
+// noDrainPostgresSourceMarker is the grep-stable marker the --no-drain
+// refusal for a Postgres (publication) source carries (Bug 332).
+const noDrainPostgresSourceMarker = "NO-DRAIN-POSTGRES-SOURCE"
 
 // schemaSourceLabel returns a diagnostic tag for the
 // resolveAddTableTargetSchema branch the operator hit — useful when
@@ -1408,19 +1290,6 @@ func activeSlotName(status ir.StreamStatus) string {
 	return defaultActiveSlotName
 }
 
-// slotNameSource is a diagnostic tag for the slot-name resolution
-// path — useful when an operator's live-add succeeds against the
-// fallback slot but the operator was expecting their custom slot to
-// be picked up. Logs surface "recorded" when the cdc-state row
-// carried a non-empty slot_name, "default-fallback" when it was
-// empty (legacy row or default-named stream).
-func slotNameSource(status ir.StreamStatus) string {
-	if status.SlotName != "" {
-		return "recorded"
-	}
-	return "default-fallback"
-}
-
 // defaultActiveSlotName mirrors the engine-side default in
 // internal/engines/postgres/cdc_reader.go's defaultSlot constant.
 // Held in the pipeline package because the orchestrator stays
@@ -1429,73 +1298,11 @@ func slotNameSource(status ir.StreamStatus) string {
 // hand.
 const defaultActiveSlotName = "sluice_slot"
 
-// verifyLiveModeLSNInvariant enforces the live-mode invariant
-// snapshot-LSN ≥ slotConfirmedFlushLSN. ADR-0030's correctness
-// story explains why publication-add → snapshot ordering keeps the
-// invariant in practice; this check is the test-able shape of a
-// regression in that ordering.
-//
-// Skipped (with a debug log) when:
-//   - the active slot's confirmed_flush_lsn was empty at preflight
-//     time (no floor to enforce); or
-//   - the source engine doesn't expose snapshotLSNExtractor /
-//     lsnComparer (fall-through; the engine surface guarantees the
-//     check is meaningful on PG).
-func (a *AddTable) verifyLiveModeLSNInvariant(ctx context.Context, slotLSN string, snapshotPos ir.Position) error {
-	if slotLSN == "" {
-		slog.DebugContext(ctx, "add-table: live mode: slot confirmed_flush_lsn empty; skipping snapshot-LSN ≥ slot-LSN invariant check")
-		return nil
-	}
-
-	extractor, ok := a.Source.(snapshotLSNExtractor)
-	if !ok {
-		slog.DebugContext(
-			ctx, "add-table: live mode: source engine does not expose ExtractSnapshotLSN; skipping invariant check",
-			slog.String("source", a.Source.Name()),
-		)
-		return nil
-	}
-	snapshotLSN, ok, err := extractor.ExtractSnapshotLSN(snapshotPos)
-	if err != nil {
-		return fmt.Errorf("pipeline: add-table: --no-drain: extract snapshot LSN: %w", err)
-	}
-	if !ok || snapshotLSN == "" {
-		slog.DebugContext(ctx, "add-table: live mode: snapshot position has no LSN; skipping invariant check")
-		return nil
-	}
-
-	comparer, ok := a.Source.(lsnComparer)
-	if !ok {
-		slog.DebugContext(
-			ctx, "add-table: live mode: source engine does not expose CompareLSN; skipping invariant check",
-			slog.String("source", a.Source.Name()),
-		)
-		return nil
-	}
-	cmp, err := comparer.CompareLSN(snapshotLSN, slotLSN)
-	if err != nil {
-		return fmt.Errorf("pipeline: add-table: --no-drain: compare LSNs (snapshot=%q, slot=%q): %w", snapshotLSN, slotLSN, err)
-	}
-	if cmp < 0 {
-		return fmt.Errorf(
-			"pipeline: add-table: --no-drain: snapshot LSN %s is behind active stream's slot confirmed_flush_lsn %s; events on table %q in [snapshot, slot] would be silently dropped. This indicates a regression in the publication-add-then-snapshot ordering (ADR-0030); refusing to proceed",
-			snapshotLSN, slotLSN, a.TableName,
-		)
-	}
-	slog.InfoContext(
-		ctx, "add-table: live mode: snapshot-LSN ≥ slot-LSN invariant satisfied",
-		slog.String("snapshot_lsn", snapshotLSN),
-		slog.String("slot_confirmed_flush_lsn", slotLSN),
-	)
-	return nil
-}
-
 // diagReadCurrentWAL is the ADR-0036 (Path D Phase A) instrumentation
 // helper that reads the source engine's current WAL position via the
 // optional currentWALPositionReader surface. Best-effort: a missing
 // surface or query failure produces an empty string rather than
-// aborting the live add. Logs at DEBUG with the supplied phase tag
-// so the diagnostic test can correlate before/after readings.
+// aborting the add. Logs at DEBUG with the supplied phase tag.
 func (a *AddTable) diagReadCurrentWAL(ctx context.Context, phase string) string {
 	reader, ok := a.Source.(currentWALPositionReader)
 	if !ok {
@@ -1630,7 +1437,9 @@ func (a *AddTable) openSnapshotForAdd(ctx context.Context) (string, *ir.Snapshot
 	// that the copy cannot apply in order is therefore left to that stream
 	// instead of failing the add (ir.CopyReplayDeferrer; measured by
 	// TestStreamer_VStreamAddTableKeyspaceWideCopy's Drained cells). Never in
-	// live mode, whose running stream is past the copy. Kept beside the open
+	// live mode, whose running stream is past the copy (unreachable since
+	// --no-drain refuses on every source, Bug 332; the guard stays so a
+	// future live path cannot inherit the deferral). Kept beside the open
 	// so TestCopyReplayDeferralRoster can see it.
 	if d, ok := stream.Rows.(ir.CopyReplayDeferrer); ok && !a.LiveMode {
 		d.DeferCopyReplaysToStream()
@@ -1721,7 +1530,6 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 		slog.Bool("primary_key", t.PrimaryKey != nil),
 		slog.Int("secondary_indexes", len(t.Indexes)),
 		slog.Int("foreign_keys", len(t.ForeignKeys)),
-		slog.Bool("live_mode", a.LiveMode),
 		slog.String("target_schema", resolvedTargetSchema),
 	)
 	if _, ok := a.Source.(publicationAdder); ok {
@@ -1730,21 +1538,8 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 			slog.String("table", t.Name),
 		)
 	}
-	if a.LiveMode {
-		// Only the publication path is live: preflightLive refuses every
-		// other source before the dry run is reached.
-		slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) PG path (ADR-0030): would capture active stream's slot confirmed_flush_lsn, ALTER PUBLICATION ADD TABLE, capture snapshot, verify snapshot-LSN ≥ slot-LSN invariant, bulk-copy rows, drop temp slot")
-	} else {
-		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=...` with the same --stream-id")
-	}
+	slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to re-run `sluice sync start --source-driver=... --source=... --target-driver=... --target=...` with the same --stream-id")
 	return nil
-}
-
-// isPublicationAdder reports whether src implements [publicationAdder]
-// — the PG-path discriminator, used by the drained preflight's hint.
-func isPublicationAdder(src ir.Engine) bool {
-	_, ok := src.(publicationAdder)
-	return ok
 }
 
 // preflightAddTableShape runs the three SOURCE-SHAPE preflights on the one

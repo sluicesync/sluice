@@ -18,7 +18,6 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -583,66 +582,20 @@ func (e Engine) PrecedesOrEqual(a, b ir.Position) (bool, error) {
 	return cmp <= 0, nil
 }
 
-// ReadSlotPosition returns the named replication slot's
-// confirmed_flush_lsn as a canonical "X/XXXXXXXX" string. Used by
-// the mid-stream live add-table flow (ADR-0030) to capture the
-// active stream's slot position before a publication change, so the
-// orchestrator can verify the subsequent snapshot LSN is at or
-// beyond the slot's current confirmed-flush position. If that
-// invariant ever fails, events on the new table in
-// [snapshot-LSN, confirmed_flush_lsn] would be silently dropped;
-// the live-mode preflight catches it loudly instead.
-//
-// Returns a clear error when the slot doesn't exist (typo on the
-// operator side, or a fresh stream that hasn't created its slot
-// yet). Returns the empty string when the slot exists but
-// confirmed_flush_lsn is NULL — fresh slot with no consumer
-// progress yet; the caller treats that as "no floor".
-//
-// Discovered structurally on the pipeline side via slotPositionReader;
-// engines without replication slots simply omit the method.
-func (e Engine) ReadSlotPosition(ctx context.Context, dsn, slotName string) (string, error) {
-	if slotName == "" {
-		return "", errors.New("postgres: read slot position: slot name is empty")
-	}
-	cfg, err := e.parseDSN(dsn)
-	if err != nil {
-		return "", err
-	}
-	db, err := openDB(ctx, cfg)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = db.Close() }()
-
-	const q = `
-		SELECT COALESCE(confirmed_flush_lsn::text, '')
-		FROM   pg_replication_slots
-		WHERE  slot_name = $1`
-	var lsn string
-	switch err := db.QueryRowContext(ctx, q, slotName).Scan(&lsn); {
-	case errors.Is(err, sql.ErrNoRows):
-		return "", fmt.Errorf("postgres: read slot position: slot %q not found in pg_replication_slots — verify the active stream's slot name", slotName)
-	case err != nil:
-		return "", fmt.Errorf("postgres: read slot position: %w", err)
-	}
-	return lsn, nil
-}
-
 // ReadCurrentWALPosition returns pg_current_wal_lsn() against the
 // supplied DSN as a canonical "X/XXXXXXXX" string. ADR-0036 (Path D
-// Phase A) instrumentation surface: lets the live add-table
+// Phase A) instrumentation surface: lets the add-table
 // orchestrator log the WAL position before AND after the publication-
 // add step so the diagnostic test can attribute observed loss to a
 // specific LSN window. Independent from the SchemaReader's
-// SourceCurrentPosition surface because the live-add flow closes its
+// SourceCurrentPosition surface because the add flow closes its
 // SchemaReader before publication-add runs.
 //
 // Discovered structurally on the pipeline side via the
 // currentWALPositionReader interface; engines without WAL semantics
 // simply omit the method. The diagnostic instrumentation is best-
 // effort: a query failure logs at WARN and returns empty, since this
-// is purely diagnostic and must not abort the live add.
+// is purely diagnostic and must not abort the add.
 func (e Engine) ReadCurrentWALPosition(ctx context.Context, dsn string) (string, error) {
 	cfg, err := e.parseDSN(dsn)
 	if err != nil {

@@ -126,7 +126,7 @@ func tableListOrNull(tables []string) any {
 //   - `sluice schema add-table` REGISTRATION (audit 2026-08-27 A7):
 //     pipeline AddTable.Run → [Engine.PreflightAddTableUnlogged], a
 //     one-table census before any target-side DDL or publication change,
-//     on every add-table mode (drained, --no-drain live, dry-run). This
+//     on every add-table mode (drained, dry-run; --no-drain refuses before it). This
 //     door exists because add-table extends a LIVE stream's scope
 //     without re-running the spanning census, and the spanning census
 //     predicate cannot see live-added tables; it also upgrades the

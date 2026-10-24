@@ -1550,10 +1550,13 @@ func TestIncludeTableScopeDrift_ExcludeOfAnAddedTableRefuses(t *testing.T) {
 // within its poll interval, having recorded the table as dropped (R8); a
 // restart that only narrows the exclusion refuses (R7-S1: before R8 it
 // streamed the table onto a copy missing the window's changes, at exit 0);
-// emptying the target table and adding it again converges. addArgs is
-// passed to the add against the running stream: --no-drain on a publication
-// source; nothing on a binlog source (see the binlog test).
-func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig, addArgs ...string) {
+// emptying the target table and adding it again converges. The add against
+// the running stream is a drained add (no --no-drain): the state an older
+// binary's --no-drain add left, and the one a drained add run without
+// stopping the stream leaves (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED).
+// First, through the real binary, --no-drain itself must refuse with the
+// source's marker and leave nothing for the drained add to trip over.
+func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
 	t.Helper()
 	r.exec(r.src, "CREATE TABLE kd (id INT PRIMARY KEY, k VARCHAR(20)); INSERT INTO kd VALUES (1, 'a');"+
 		"CREATE TABLE tmp_keep (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO tmp_keep VALUES (1, 'x'), (2, 'y')")
@@ -1565,11 +1568,18 @@ func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig, addArgs ...string)
 	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
 		t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
 	}
+	marker := noDrainBinlogSourceMarker
+	if r.driver == "postgres" {
+		marker = noDrainPostgresSourceMarker
+	}
+	if code, out := r.addTable("tmp_keep", "--no-drain"); code == 0 || !strings.Contains(out, marker) {
+		t.Fatalf("schema add-table tmp_keep --no-drain: exit %d; want a refusal carrying %s\n%s", code, marker, out)
+	}
 	// The add cannot know the stream's flags. It usually completes before the
 	// poll sees it; if the stream's refusal abandons it first, it stops with
 	// PENDING-ADD-SUPERSEDED (R8). Either is correct.
-	if code, out := r.addTable("tmp_keep", addArgs...); code != 0 && !strings.Contains(out, "PENDING-ADD-SUPERSEDED") {
-		t.Fatalf("schema add-table tmp_keep %v: exit %d\n%s", addArgs, code, out)
+	if code, out := r.addTable("tmp_keep"); code != 0 && !strings.Contains(out, "PENDING-ADD-SUPERSEDED") {
+		t.Fatalf("schema add-table tmp_keep: exit %d\n%s", code, out)
 	}
 	r.exec(r.src, "UPDATE tmp_keep SET e = 'changed' WHERE id = 1")
 	requireLiveAddedExcludedRefusal(t, run, "tmp_keep", "stopped when it saw the add", "recorded the table as dropped")
@@ -1597,11 +1607,14 @@ func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig, addArgs ...string)
 }
 
 // TestIncludeTableScopeDrift_PgoutputLiveAddOfAnExcludedTableStops is R6-S1
-// on pgoutput (the publication-add path).
+// on pgoutput (the publication-add path). Until Bug 332 it ran the
+// --no-drain add itself; now the binary refuses that
+// (NO-DRAIN-POSTGRES-SOURCE) and the helper drives the drained add against
+// the running stream, which leaves the same record.
 func TestIncludeTableScopeDrift_PgoutputLiveAddOfAnExcludedTableStops(t *testing.T) {
 	src, tgt, cleanup := startPostgresLogical(t)
 	defer cleanup()
-	liveAddOfAnExcludedTable(t, newScopeDriftRig(t, "postgres", src, tgt), "--no-drain")
+	liveAddOfAnExcludedTable(t, newScopeDriftRig(t, "postgres", src, tgt))
 }
 
 // TestIncludeTableScopeDrift_BinlogLiveAddOfAnExcludedTableStops is R6-S1 on

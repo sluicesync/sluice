@@ -575,13 +575,19 @@ func runRecopyRemedy(t *testing.T, srcEngine, tgtEngine string, src, tgt ndwDB, 
 	if !ok {
 		t.Fatalf("%s engine not registered", tgtEngine)
 	}
+	// A Postgres source (Bug 332's remedy) takes the same DDL without the
+	// storage-engine clause.
+	engineClause := " ENGINE=InnoDB"
+	if src.driver == "pgx" {
+		engineClause = ""
+	}
 	src.exec(t,
-		"CREATE TABLE users (id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB",
+		"CREATE TABLE users (id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id))"+engineClause,
 		"INSERT INTO users VALUES (1, 'u1')",
-		"CREATE TABLE orders (id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB",
+		"CREATE TABLE orders (id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id))"+engineClause,
 		"INSERT INTO orders VALUES "+ndwValues(1, 2000, "v1"),
 		"CREATE TABLE order_notes (id BIGINT NOT NULL, order_id BIGINT NOT NULL, payload VARCHAR(64) NOT NULL, PRIMARY KEY (id), "+
-			"CONSTRAINT fk_notes_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE) ENGINE=InnoDB")
+			"CONSTRAINT fk_notes_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE)"+engineClause)
 	notes := make([]string, 0, 200)
 	for id := 1; id <= 200; id++ {
 		notes = append(notes, fmt.Sprintf("(%d,%d,'note')", id, id))

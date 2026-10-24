@@ -164,6 +164,12 @@ func TestStreamer_UniqueKeyDoor_Review3AddTableFacts(t *testing.T) {
 	if !waitForRowCount(t, targetDSN, "customers", 2, 60*time.Second) {
 		t.Fatal("the stream never delivered the warmup row")
 	}
+	// The add runs drained, against the stopped stream: --no-drain is
+	// withdrawn on every source (Bug 332), and the door is the same.
+	cancel()
+	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("stopping the stream: %v", err)
+	}
 
 	applyDDL(t, sourceDSN, "CREATE TABLE orders (id bigint PRIMARY KEY, email varchar(255), CONSTRAINT orders_email_key UNIQUE (email)); "+
 		"ALTER TABLE orders REPLICA IDENTITY FULL; INSERT INTO orders VALUES (1, NULL), (2, NULL);")
@@ -174,7 +180,7 @@ func TestStreamer_UniqueKeyDoor_Review3AddTableFacts(t *testing.T) {
 		defer acancel()
 		return (&AddTable{
 			Source: pgEng, Target: pgEng, SourceDSN: sourceDSN, TargetDSN: targetDSN,
-			StreamID: streamID, TableName: "orders", LiveMode: true,
+			StreamID: streamID, TableName: "orders",
 		}).Run(actx)
 	}
 	err := add()
@@ -194,8 +200,6 @@ func TestStreamer_UniqueKeyDoor_Review3AddTableFacts(t *testing.T) {
 	if !waitForRowCount(t, targetDSN, "orders", 2, 60*time.Second) {
 		t.Fatalf("the add copied %s rows; want both NULL-email rows", tgt.scalar(t, "SELECT count(*) FROM orders"))
 	}
-	cancel()
-	<-runErr
 }
 
 // TestStreamer_UniqueKeyDoor_Review3CatalogAheadOfPosition pins what the
