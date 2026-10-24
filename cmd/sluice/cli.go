@@ -2672,7 +2672,7 @@ type SyncStopCmd struct {
 	Target          string        `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
 	StreamID        string        `help:"Stream identifier to stop." required:"" placeholder:"ID"`
 	Wait            bool          `help:"Block until the running streamer drains and clears its stop signal. Use to coordinate ALTER windows or scripted teardowns." short:"w"`
-	Timeout         time.Duration `help:"Maximum wait when --wait is set. On timeout the CLI exits non-zero; the stop request remains in place and the streamer will eventually drain." default:"5m"`
+	Timeout         time.Duration `help:"Maximum wait when --wait is set. On timeout the CLI exits non-zero and the stop request stays set; the timeout does not mean the stream is still draining (a drain that exceeds 30s is hard-cancelled, STOP-DRAIN-HARD-CANCELLED, and the stream exits without recording its stop)." default:"5m"`
 	ControlKeyspace string        `name:"control-keyspace" help:"MySQL/PlanetScale/Vitess target only: the unsharded sidecar keyspace the stream's control tables live in (see 'sync start --control-keyspace'). Omit to auto-detect on a sharded target; must match what the stream was started with. Empty + unsharded/non-Vitess target = the default keyspace." placeholder:"KEYSPACE"`
 }
 
@@ -2792,10 +2792,10 @@ const stopWaitPollInterval = 1 * time.Second
 // returns false (the streamer cleared the flag on graceful exit) or
 // the timeout fires. Returns nil on success, a plain error on timeout
 // (kong's generic exit 1 — deliberate: the taxonomy reserves 2 for
-// config-load errors and 3 for coded refusals, and a drain still in
-// progress is neither; exitcode-wise it's an ordinary "the command
-// didn't achieve what you asked" failure, with the drain continuing
-// in the background as the message says), and the underlying error on
+// config-load errors and 3 for coded refusals, and an undrained stop
+// is neither; exitcode-wise it's an ordinary "the command didn't
+// achieve what you asked" failure — see [stopWaitTimeoutError] for why
+// it does not claim the drain continues), and the underlying error on
 // read failure.
 func waitForStopComplete(ctx context.Context, applier ir.ChangeApplier, streamID string, timeout time.Duration) error {
 	reader, ok := applier.(stopFlagReader)
@@ -2824,7 +2824,7 @@ func waitForStopComplete(ctx context.Context, applier ir.ChangeApplier, streamID
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("stream %q did not complete drain within %s; the stop request remains in place and the streamer will continue draining — check `sluice sync status` to investigate", streamID, timeout)
+			return stopWaitTimeoutError(streamID, timeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -2832,6 +2832,24 @@ func waitForStopComplete(ctx context.Context, applier ir.ChangeApplier, streamID
 		case <-t.C:
 		}
 	}
+}
+
+// stopWaitTimeoutError is `sync stop --wait`'s timeout. It cannot claim the
+// drain is still going: the control row reads the same (stop request set, a
+// running stamp on stream_alive_ms) for three different states, and the
+// commonest at the default --timeout (5m, against the streamer's 30s drain
+// watchdog) is a stream that is no longer draining at all — its drain was
+// hard-cancelled and it exited 1 with STOP-DRAIN-HARD-CANCELLED, or no
+// process was running it to begin with. So the message names all three and
+// the remedy the first two share.
+func stopWaitTimeoutError(streamID string, timeout time.Duration) error {
+	return fmt.Errorf("stream %q did not complete drain within %s, and its stop request is still set. "+
+		"Either the stream's drain timed out and it exited without draining (its log ends with %s and the process exited 1), "+
+		"or no process was running the stream, or its apply is still wedged. sluice cannot tell these apart from the control row. "+
+		"In the first two cases the stop is not recorded and `sluice schema add-table` refuses against the stream: start it once "+
+		"with the same --stream-id (it resumes from its last committed position and clears the stop request), then stop it "+
+		"again with `sluice sync stop --wait`. If the process is still running, find what is blocking its apply on the target",
+		streamID, timeout, pipeline.StopDrainHardCancelledMarker)
 }
 
 // isStreamNotFoundErr returns true when err wraps an engine's stream-

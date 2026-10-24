@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // TestIsStreamNotFoundErr mirrors TestIsSlotNotFoundErr: the helper
@@ -109,6 +110,18 @@ func TestWaitForStopComplete_Timeout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "stream-1") {
 		t.Errorf("err message should name the stream; got %v", err)
+	}
+	// A timeout cannot tell a stream still draining from one whose drain
+	// was hard-cancelled (it exited, stop not recorded), so the message
+	// names the hard-cancel marker and its remedy, and must not promise
+	// the drain continues.
+	for _, want := range []string{pipeline.StopDrainHardCancelledMarker, "start it once", "sluice sync stop --wait"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("timeout message lacks %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "continue draining") {
+		t.Errorf("timeout message still claims the drain continues: %v", err)
 	}
 	// The timeout is a PLAIN error — kong's generic exit 1, per the
 	// helper's doc comment (which once promised an exit-2 error the
