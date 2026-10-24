@@ -213,6 +213,12 @@ func ndwJoin(ids []int64) string {
 // MySQL-family) and stamps its time.
 func (p *ndwPhase) apply(t *testing.T, src ndwDB) {
 	t.Helper()
+	src.exec(t, p.statements()...)
+	p.at = time.Now()
+}
+
+// statements renders the phase's changes (portable SQL: MySQL and Postgres).
+func (p *ndwPhase) statements() []string {
 	var stmts []string
 	if len(p.deletes) > 0 {
 		stmts = append(stmts, "DELETE FROM orders WHERE id IN ("+ndwJoin(p.deletes)+")")
@@ -227,8 +233,7 @@ func (p *ndwPhase) apply(t *testing.T, src ndwDB) {
 		}
 		stmts = append(stmts, "INSERT INTO orders VALUES "+strings.Join(vals, ","))
 	}
-	src.exec(t, stmts...)
-	p.at = time.Now()
+	return stmts
 }
 
 // ndwPhaseResult is what the target holds wrong for one phase's changes.

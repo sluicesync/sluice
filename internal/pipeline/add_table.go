@@ -788,7 +788,8 @@ func (a *AddTable) logAddComplete(ctx context.Context) {
 	slog.InfoContext(
 		ctx, "add-table: complete; resume the stream by re-running `sluice sync start --source-driver=... --source=... "+
 			"--target-driver=... --target=...` with the same --stream-id (there is no resume flag) "+
-			"to pick up CDC for the new table",
+			"to pick up CDC for the new table, or, for a `sluice sync run` fleet leg, restart it through the fleet "+
+			"(a leg restarts from its fleet config, not from `sync start --stream-id`)",
 		slog.String("table", a.TableName),
 		slog.String("stream_id", a.StreamID),
 	)

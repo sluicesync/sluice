@@ -41,7 +41,10 @@
 // NO-DRAIN-POSTGRES-SOURCE before it reads the source, opens a snapshot,
 // extends the publication or records anything, and the running stream is
 // unaffected. The drained controls (filtered pg->pg and pg->mysql,
-// unfiltered pg->pg) stay exact pins across every phase. The RecopyRemedy
+// unfiltered pg->pg) stay exact pins across every phase, each phase judged
+// on its own, plus two before the publication add: P, committed after the
+// stop and before the ALTER, and T, one transaction opened before the ALTER
+// and committed right after it. The RecopyRemedy
 // cells measure the CHANGELOG's re-copy on a Postgres source, including its
 // foreign-key caveat (runRecopyRemedy, shared with the binlog rig).
 
@@ -49,6 +52,7 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -67,10 +71,25 @@ const pgndwHold = 2 * time.Second
 // open the add uses) runs the rig's hooks. It survives the add's
 // re-scoping to the stream's recorded publication (WithPublicationScope),
 // which would otherwise hand the add the bare engine and drop the hooks.
+// aroundPubAdd, when set, runs before the add's ALTER PUBLICATION and
+// returns the function to run right after it.
 type pgndwSource struct {
 	postgres.Engine
-	onSnapshot *func()
-	onMidCopy  *func()
+	onSnapshot   *func()
+	onMidCopy    *func()
+	aroundPubAdd *func() func()
+}
+
+func (e *pgndwSource) AddPublicationTables(ctx context.Context, dsn string, tables []string) error {
+	after := func() {}
+	if f := *e.aroundPubAdd; f != nil {
+		after = f()
+	}
+	if err := e.Engine.AddPublicationTables(ctx, dsn, tables); err != nil {
+		return err
+	}
+	after()
+	return nil
 }
 
 func (e *pgndwSource) WithPublicationScope(publication, ownSlot string) ir.Engine {
@@ -78,7 +97,7 @@ func (e *pgndwSource) WithPublicationScope(publication, ownSlot string) ir.Engin
 	if !ok {
 		panic("RIG: postgres WithPublicationScope no longer returns a postgres.Engine")
 	}
-	return &pgndwSource{Engine: inner, onSnapshot: e.onSnapshot, onMidCopy: e.onMidCopy}
+	return &pgndwSource{Engine: inner, onSnapshot: e.onSnapshot, onMidCopy: e.onMidCopy, aroundPubAdd: e.aroundPubAdd}
 }
 
 func (e *pgndwSource) OpenSnapshotStreamWithSlot(ctx context.Context, dsn, slotName string) (*ir.SnapshotStream, error) {
@@ -179,9 +198,28 @@ func runPGNoDrainArm(t *testing.T, arm pgndwArm) pgndwOutcome {
 	phaseC := &ndwPhase{name: "C", deletes: ndwRange(31, 40), updates: ndwRange(131, 140), inserts: ndwRange(100021, 100030)}
 	phaseD := &ndwPhase{name: "D", deletes: ndwRange(41, 45), updates: ndwRange(141, 145), inserts: ndwRange(100031, 100035)}
 	out := pgndwOutcome{phases: []*ndwPhase{phaseA, phaseB, phaseC, phaseD}}
+	// The window before the publication add, drained arms only (a refused
+	// --no-drain add never reaches it): phase P commits on the source after
+	// the stream stopped and before the add's ALTER PUBLICATION; phase T is
+	// one transaction opened before the ALTER and committed right after it,
+	// so its WAL straddles the catalog change the restarted stream decodes
+	// through. The drained add must come out exact across both.
+	phaseP := &ndwPhase{name: "P", deletes: ndwRange(46, 50), updates: ndwRange(146, 150), inserts: ndwRange(100036, 100040)}
+	phaseT := &ndwPhase{name: "T", deletes: ndwRange(51, 55), updates: ndwRange(151, 155), inserts: ndwRange(100041, 100045)}
+	var aroundPubAdd func() func()
+	pubAddRan := false
 
 	if !arm.noDrain {
 		ndwStopWait(t, tgtEng, arm.tgt.dsn, streamID, run)
+		out.phases = append(out.phases, phaseP, phaseT)
+		aroundPubAdd = func() func() {
+			phaseP.apply(t, arm.src)
+			commit := pgndwOpenTx(t, arm.src, phaseT)
+			return func() {
+				pubAddRan = true
+				commit()
+			}
+		}
 	}
 
 	var onSnapshot, onMidCopy func()
@@ -194,7 +232,7 @@ func runPGNoDrainArm(t *testing.T, arm pgndwArm) pgndwOutcome {
 		phaseB.apply(t, arm.src)
 		time.Sleep(pgndwHold)
 	}
-	src := &pgndwSource{Engine: srcEng.(postgres.Engine), onSnapshot: &onSnapshot, onMidCopy: &onMidCopy}
+	src := &pgndwSource{Engine: srcEng.(postgres.Engine), onSnapshot: &onSnapshot, onMidCopy: &onMidCopy, aroundPubAdd: &aroundPubAdd}
 	logOffset := len(logs.String())
 	out.addErr = (&AddTable{
 		Source: src, Target: tgtEng, SourceDSN: arm.src.dsn, TargetDSN: arm.tgt.dsn,
@@ -212,8 +250,11 @@ func runPGNoDrainArm(t *testing.T, arm pgndwArm) pgndwOutcome {
 	if out.addErr != nil {
 		t.Fatalf("[%s] drained AddTable: %v", arm.name, out.addErr)
 	}
-	if phaseA.at.IsZero() || phaseB.at.IsZero() {
-		t.Fatalf("RIG [%s]: the hooks did not run (A=%v B=%v)", arm.name, phaseA.at, phaseB.at)
+	if phaseA.at.IsZero() || phaseB.at.IsZero() || phaseP.at.IsZero() || phaseT.at.IsZero() || !pubAddRan {
+		t.Fatalf("RIG [%s]: the hooks did not run (A=%v B=%v P=%v T=%v publication add=%v)", arm.name, phaseA.at, phaseB.at, phaseP.at, phaseT.at, pubAddRan)
+	}
+	if !phaseP.at.Before(phaseT.at) || !phaseT.at.Before(phaseA.at) {
+		t.Fatalf("RIG [%s]: phases out of order (P=%v T=%v A=%v)", arm.name, phaseP.at, phaseT.at, phaseA.at)
 	}
 	phaseC.apply(t, arm.src)
 	if !arm.noDrain {
@@ -235,7 +276,7 @@ func runPGNoDrainArm(t *testing.T, arm pgndwArm) pgndwOutcome {
 	if _, ok := tgtRows[ndwMarkerID]; !ok {
 		t.Fatalf("RIG [%s]: the post-add marker never reached the target", arm.name)
 	}
-	if want := ndwSeedRows - 20 - 30 - 10 - 5 + 10 + 10 + 10 + 5 + 1; len(srcRows) != want {
+	if want := ndwSeedRows - 20 - 30 - 10 - 5 - 5 - 5 + 10 + 10 + 10 + 5 + 5 + 5 + 1; len(srcRows) != want {
 		t.Fatalf("RIG [%s]: source holds %d orders rows; want %d", arm.name, len(srcRows), want)
 	}
 	if !strings.Contains(logs.String()[logOffset:], "add-table: snapshot captured") {
@@ -285,6 +326,52 @@ func requirePGDrainedExact(t *testing.T, arm pgndwArm) {
 	out := runPGNoDrainArm(t, arm)
 	if out.stale+out.changed+out.missing > 0 {
 		t.Errorf("CONTROL [%s]: drained add against a stopped stream is not exact: %d stale, %d changed, %d missing", arm.name, out.stale, out.changed, out.missing)
+	}
+	// Per phase too: the whole-table diff compares the target with what the
+	// source holds, so a phase whose changes never reached the source either
+	// (a rolled-back T, say) would pass it; the phase verdict compares with
+	// what the phase meant to write.
+	if len(out.results) != len(out.phases) {
+		t.Fatalf("RIG [%s]: %d phase verdicts for %d phases", arm.name, len(out.results), len(out.phases))
+	}
+	for i, r := range out.results {
+		if r != (ndwPhaseResult{}) {
+			t.Errorf("CONTROL [%s]: phase %s not exact on the target: %d deletes kept, %d updates stale, %d inserts missing",
+				arm.name, out.phases[i].name, r.staleDeletes, r.staleUpdates, r.missingInserts)
+		}
+	}
+}
+
+// pgndwOpenTx runs the phase inside a transaction on one source connection
+// and returns, uncommitted, the function that commits it and stamps the
+// phase.
+func pgndwOpenTx(t *testing.T, src ndwDB, p *ndwPhase) (commit func()) {
+	t.Helper()
+	db, err := sql.Open(src.driver, src.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		cancel()
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	for _, s := range p.statements() {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
+			_ = tx.Rollback()
+			cancel()
+			_ = db.Close()
+			t.Fatalf("open-transaction phase %s: exec %q: %v", p.name, s, err)
+		}
+	}
+	return func() {
+		defer func() { cancel(); _ = db.Close() }()
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("open-transaction phase %s: commit: %v", p.name, err)
+		}
+		p.at = time.Now()
 	}
 }
 

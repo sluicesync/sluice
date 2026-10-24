@@ -127,7 +127,7 @@ func TestStreamer_UniqueKeyDoor_Review5AddTableAcceptedKey(t *testing.T) {
 	// (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED in docs/dev/audit-backlog.md).
 	// --no-drain is withdrawn on Postgres too (Bug 332), so there is no live
 	// add left to twin this with; when that door closes, this state is only
-	// reachable from a pre-v0.163.9 binary's record.
+	// reachable from a pre-v0.163.10 binary's record.
 	if err := (&AddTable{
 		Source: mysqlEng, Target: mysqlEng, SourceDSN: srcDSN, TargetDSN: tgtDSN,
 		StreamID: streamID, TableName: "kd", AcceptTargetOnlyUniqueKeys: accept,
