@@ -552,5 +552,5 @@ modernc.org/token v1.1.0 h1:Xl7Ap9dKaEs5kLoOQeQmPWevfnk/DM5qcLcYlA8ys6Y=
 modernc.org/token v1.1.0/go.mod h1:UGzOrNV1mAFSEB63lOFHIpNRUVMvYTc6yu1SMY/XTDM=
 pgregory.net/rapid v1.3.0 h1:vBvO0VSqti75J1jjYqpgPNBLKMd1+gxa9fYo7vk/Exc=
 pgregory.net/rapid v1.3.0/go.mod h1:dPlE4OBBxgXPqkP79flB6sJL1dx5azpI7HQ9MY9Z7uk=
-vitess.io/vitess v0.24.4 h1:fjIFc28fGYF6Bxu4heHsKvx+huPbA4NmIeLJL4clbc8=
-vitess.io/vitess v0.24.4/go.mod h1:RBAgMy0bUlfA3PfcZzmMbd0Cf4p09kSwQUV+9ft9DIs=
+vitess.io/vitess v0.24.5 h1:MYmyGJpqRCs8GSnAyrrzC1ISldWeS5v76QPW7fcngXI=
+vitess.io/vitess v0.24.5/go.mod h1:J5PrduqQRzSHoR2ffkTuBAEW4jDncK33KxY12bvg1Ds=

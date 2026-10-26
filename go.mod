@@ -52,7 +52,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.60.1
 	pgregory.net/rapid v1.3.0
-	vitess.io/vitess v0.24.4
+	vitess.io/vitess v0.24.5
 )
 
 require (
