@@ -135,11 +135,21 @@ func TestSettle_StopEndingRetriableIsNotGraceful(t *testing.T) {
 func TestStopNotDrainedExitStatus(t *testing.T) {
 	s := &Streamer{}
 	err := s.settleUndrainedStop(context.Background(), "st", nil, stopCutOffByWatchdog)
+	// The real attempt-end settle with an owed backfill (one that stopped
+	// early), not a hand-built join.
+	owing := &Streamer{Source: orderedTestEngine{}}
+	e := owing.addedColumnBackfills.open("public.dj", []string{"flag"})
+	owing.addedColumnBackfills.finished(e, errors.New("connection reset"))
+	settled := owing.settleAddedColumnBackfills(context.Background(), ledgerTestApplier{pos: testPos(7), ok: true}, "st", err)
+	var gap *addedColumnBackfillIncompleteError
+	if !errors.As(settled, &gap) {
+		t.Fatalf("RIG: the settle owed no backfill: %v", settled)
+	}
 	type exitCoder interface{ ExitCode() int }
 	for name, e := range map[string]error{
-		"alone":             err,
-		"wrapped":           fmt.Errorf("pipeline: run: %w", err),
-		"joined with a gap": errors.Join(&addedColumnBackfillIncompleteError{runErr: err}, err),
+		"alone":                       err,
+		"wrapped":                     fmt.Errorf("pipeline: run: %w", err),
+		"through the backfill settle": settled,
 	} {
 		var ec exitCoder
 		if !errors.As(e, &ec) || ec.ExitCode() != sluicecode.ExitStopNotDrained {
