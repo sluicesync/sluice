@@ -751,12 +751,23 @@ func (s *Supervisor) Snapshot() []SyncStatusSnapshot {
 func (s *Supervisor) aggregateFailures() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var errs []error
+	// A leg whose `sync stop` did not drain goes first: the process exit
+	// status is the first ExitCoder in the joined chain (kong's errors.As),
+	// and STOP-DRAIN-HARD-CANCELLED's exit 4 is the one a service manager
+	// must see to not restart the fleet against the stop (the second
+	// fix-aimed review of 6b5898dc, F1). Fleet order is kept otherwise.
+	var undrained, errs []error
 	for _, id := range s.order {
 		st := s.states[id]
-		if st != nil && st.state == SyncFailed && st.lastErr != nil {
-			errs = append(errs, fmt.Errorf("sync %q: %w", id, st.lastErr))
+		if st == nil || st.state != SyncFailed || st.lastErr == nil {
+			continue
 		}
+		err := fmt.Errorf("sync %q: %w", id, st.lastErr)
+		if errors.Is(st.lastErr, ErrStopDrainHardCancelled) {
+			undrained = append(undrained, err)
+			continue
+		}
+		errs = append(errs, err)
 	}
-	return errors.Join(errs...)
+	return errors.Join(append(undrained, errs...)...)
 }

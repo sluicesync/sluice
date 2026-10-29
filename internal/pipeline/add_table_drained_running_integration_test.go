@@ -466,7 +466,7 @@ func TestStreamer_AddTableDrainedLivenessFromPositionWrites_Binlog(t *testing.T)
 		applyDDLMySQL(t, srcDSN, "INSERT INTO users VALUES (3, 'u3')")
 		drainHBWaitUser(t, tgtDSN, 3, stream)
 	}}
-	tgt := &drainHBStoppedTarget{Engine: eng.(mysql.Engine), stoppedReads: 2}
+	tgt := &drainHBStoppedTarget{Engine: eng.(mysql.Engine), stoppedReads: 3} // the preflight, and the recheck's two reads (its grace probe and its judgement)
 	err = (&AddTable{Source: src, Target: tgt, SourceDSN: srcDSN, TargetDSN: tgtDSN, StreamID: streamID, TableName: "orders"}).
 		Run(context.Background())
 	if !errors.Is(err, errStreamNotStopped) || !strings.Contains(err.Error(), "NOT handed to the stream") {

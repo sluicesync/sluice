@@ -1204,6 +1204,23 @@ type streamPositionMark struct {
 // (heartbeat to the epoch, under this run's token, as a failed add does), so
 // the evidence survives as an incomplete add rather than vanishing.
 func (a *AddTable) recheckStreamStoppedAfterPending(ctx context.Context, applier ir.ChangeApplier) error {
+	// A start that a supervisor makes in this window stamps running, reads
+	// this add's pending entry, defers and puts the stop back on its way
+	// out; wait that out for up to [postCopyStopGrace], as the post-copy
+	// check does, still passing only on the stopped marker (the second
+	// fix-aimed review of 6b5898dc, F8). A stream that really runs keeps its
+	// stamp and is refused when the grace runs out.
+	if store, ok := applier.(ir.StreamLivenessStore); ok {
+		l, rerr := store.ReadStreamLiveness(ctx, a.StreamID)
+		for deadline := time.Now().Add(postCopyStopGrace); rerr == nil && l.Found && l.Recorded && !l.Stopped && time.Now().Before(deadline); {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(postCopyStopPoll):
+			}
+			l, rerr = store.ReadStreamLiveness(ctx, a.StreamID)
+		}
+	}
 	err := a.refuseRunningStream(ctx, applier)
 	if err == nil {
 		return nil

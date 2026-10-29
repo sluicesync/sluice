@@ -691,17 +691,22 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 // stampAlive adds the stream's liveness stamp (the server's clock in Unix ms,
 // [appliershared.StreamLivenessColumn]) to the same upsert: a stream that
 // advances its position is running, and the stamp riding the position write
-// is what keeps a drained add-table from passing while the stream applies,
-// whatever happens to the Run's own stamping goroutine. It overwrites a stopped
-// marker, as the run's first stamp does. False only when the control table
-// has no such column (a role that could not add it).
+// is what keeps a drained add-table from passing while the stream applies.
+// It overwrites a stopped marker, as the run's first stamp does. The value
+// is GREATEST(now, previous + 1), so every writer of the column is strictly
+// monotonic and never rewrites the value it replaces: a start's
+// compare-and-set restore ([appliershared.RestoreStreamStopped]) can then
+// never mistake a position write for its own stamp, whatever the clocks do.
+// False only when the control table has no such column (a role that could
+// not add it).
 func buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64, stampAlive bool) (stmt string, args []any) {
 	tableRef := controlTableRef(schema)
 	aliveCol, aliveVal, aliveSet := "", "", ""
 	if stampAlive {
 		aliveCol = ", " + appliershared.StreamLivenessColumn
 		aliveVal = ", " + pgNowMillisExpr
-		aliveSet = ", " + appliershared.StreamLivenessColumn + " = EXCLUDED." + appliershared.StreamLivenessColumn
+		col := appliershared.StreamLivenessColumn
+		aliveSet = ", " + col + " = GREATEST(EXCLUDED." + col + ", COALESCE(" + tableRef + "." + col + ", 0) + 1)"
 	}
 	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied" + aliveCol + ") " +
 		"VALUES ($1, $2, " + utcNowSQL + ", NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8" + aliveVal + ") " +

@@ -2851,6 +2851,18 @@ func confirmStopRecorded(ctx context.Context, applier ir.ChangeApplier, streamID
 		return nil
 	}
 	l, err := store.ReadStreamLiveness(ctx, streamID)
+	// A drain whose stop record failed clears the flag anyway (the data is
+	// drained; the record is the only thing missing), and the stopping Run
+	// retries the record once more through a fresh applier on its way out.
+	// Give that second attempt a bounded moment before judging.
+	for deadline := time.Now().Add(stopRecordGrace); err == nil && l.Recorded && !l.Stopped && time.Now().Before(deadline); {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(stopRecordPoll):
+		}
+		l, err = store.ReadStreamLiveness(ctx, streamID)
+	}
 	switch {
 	case err != nil:
 		return fmt.Errorf("stream %q cleared its stop request, but whether it recorded its stop could not be read: %w", streamID, err)
@@ -2861,29 +2873,41 @@ func confirmStopRecorded(ctx context.Context, applier ir.ChangeApplier, streamID
 		fmt.Fprintf(os.Stdout, "stream %q cleared its stop request; this target keeps no liveness record, so sluice cannot confirm that it recorded its stop\n", streamID)
 		return nil
 	}
-	return fmt.Errorf("stream %q's stop request was cleared, but the stream did not record a stop: something started it "+
-		"again — systemd Restart=on-failure, a `sluice sync run` fleet reload or supervisor, or a manual start — and it is "+
-		"running now. If its previous run exited with %s (exit status %d: the stop did not drain), a service manager "+
-		"restarted it; set RestartPreventExitStatus=%d. Stop it again with `sluice sync stop --wait` once whatever "+
-		"blocked the drain is gone", streamID, pipeline.StopDrainHardCancelledMarker, sluicecode.ExitStopNotDrained, sluicecode.ExitStopNotDrained)
+	return fmt.Errorf("stream %q's stop request was cleared, but the stream did not record a stop, for one of two reasons "+
+		"sluice cannot tell apart from the control row. Either something started it again — systemd Restart=on-failure, a "+
+		"`sluice sync run` fleet reload or supervisor, or a manual start — and it is running now: if its previous run "+
+		"exited with %s (exit status %d: the stop did not drain), a service manager restarted it; set "+
+		"RestartPreventExitStatus=%d, and stop it again with `sluice sync stop --wait` once whatever blocked the drain is "+
+		"gone. Or it drained and stopped but could not write its stop record (its log shows %s): then it is stopped, and "+
+		"a drained `sluice schema add-table` refuses against it until a start that reaches streaming and a `sync stop "+
+		"--wait` record the stop", streamID, pipeline.StopDrainHardCancelledMarker, sluicecode.ExitStopNotDrained,
+		sluicecode.ExitStopNotDrained, pipeline.StreamLivenessUnrecordedMarker)
 }
+
+// stopRecordGrace and stopRecordPoll bound [confirmStopRecorded]'s wait for
+// a stopping Run's second attempt at its stop record. Variables only so
+// tests can shorten them.
+var (
+	stopRecordGrace = 10 * time.Second
+	stopRecordPoll  = 500 * time.Millisecond
+)
 
 // stopWaitTimeoutError is `sync stop --wait`'s timeout. It cannot claim the
 // drain is still going: the control row reads the same (stop request set, a
 // running stamp on stream_alive_ms) for three different states, and the
 // commonest at the default --timeout (5m, against the streamer's 30s drain
 // watchdog) is a stream that is no longer draining at all — its drain was
-// hard-cancelled and it exited 1 with STOP-DRAIN-HARD-CANCELLED, or no
+// hard-cancelled and it exited 4 with STOP-DRAIN-HARD-CANCELLED, or no
 // process was running it to begin with. So the message names all three and
 // the remedy the first two share.
 func stopWaitTimeoutError(streamID string, timeout time.Duration) error {
 	return fmt.Errorf("stream %q did not complete drain within %s, and its stop request is still set. "+
-		"Either the stream's drain timed out and it exited without draining (its log ends with %s and the process exited 1), "+
+		"Either the stream's drain timed out and it exited without draining (its log ends with %s and the process exited %d), "+
 		"or no process was running the stream, or its apply is still wedged. sluice cannot tell these apart from the control row. "+
 		"In the first two cases the stop is not recorded and `sluice schema add-table` refuses against the stream: start it once "+
 		"with the same --stream-id (it resumes from its last committed position and clears the stop request), then stop it "+
 		"again with `sluice sync stop --wait`. If the process is still running, find what is blocking its apply on the target",
-		streamID, timeout, pipeline.StopDrainHardCancelledMarker)
+		streamID, timeout, pipeline.StopDrainHardCancelledMarker, sluicecode.ExitStopNotDrained)
 }
 
 // isStreamNotFoundErr returns true when err wraps an engine's stream-

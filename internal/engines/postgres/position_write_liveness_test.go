@@ -75,7 +75,7 @@ func isStampsLivenessCall(e ast.Expr) bool {
 func TestBuildWritePositionSQL_LivenessStamp(t *testing.T) {
 	col := appliershared.StreamLivenessColumn
 	with, _ := buildWritePositionSQL("public", "s", "t", "", "", "", "", "", 0, true)
-	for _, want := range []string{", " + col + ") VALUES", ", " + pgNowMillisExpr + ")", col + " = EXCLUDED." + col} {
+	for _, want := range []string{", " + col + ") VALUES", ", " + pgNowMillisExpr + ")", col + " = GREATEST(EXCLUDED." + col + ", COALESCE(" + controlTableRef("public") + "." + col + ", 0) + 1)"} {
 		if !strings.Contains(with, want) {
 			t.Errorf("stamping upsert lacks %q:\n%s", want, with)
 		}

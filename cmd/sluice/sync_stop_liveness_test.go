@@ -19,11 +19,21 @@ type livenessFakeApplier struct {
 	*fakeApplier
 	liveness ir.StreamLiveness
 	err      error
+	// later, when set, is returned from the second read on (a stopping
+	// Run's second attempt at its stop record landing).
+	later *ir.StreamLiveness
+	reads *int
 }
 
 var _ ir.StreamLivenessStore = livenessFakeApplier{}
 
 func (a livenessFakeApplier) ReadStreamLiveness(context.Context, string) (ir.StreamLiveness, error) {
+	if a.reads != nil {
+		*a.reads++
+		if a.later != nil && *a.reads > 1 {
+			return *a.later, nil
+		}
+	}
 	return a.liveness, a.err
 }
 
@@ -52,17 +62,28 @@ func TestWaitForStopComplete_RequiresTheRecordedStop(t *testing.T) {
 		name     string
 		liveness ir.StreamLiveness
 		readErr  error
+		later    *ir.StreamLiveness
 		wantErr  []string // nil = success
 	}{
 		{name: "graceful drain: the stop is recorded", liveness: ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}},
 		{
 			name:     "hard-cancelled, then restarted: the flag cleared and the stream runs",
 			liveness: ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now, Now: now},
-			wantErr:  []string{"did not record a stop", pipeline.StopDrainHardCancelledMarker, "RestartPreventExitStatus=4"},
+			wantErr:  []string{"did not record a stop", pipeline.StopDrainHardCancelledMarker, "RestartPreventExitStatus=4", pipeline.StreamLivenessUnrecordedMarker},
+		},
+		// F3: the drain's own stop record failed, and the Run's second attempt
+		// on its way out lands a moment later: success, not "running".
+		{
+			name:     "stop record lands on the Run's second attempt",
+			liveness: ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now, Now: now},
+			later:    &ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now},
 		},
 		{name: "a target without the liveness column cannot prove it either way", liveness: ir.StreamLiveness{Found: true, Now: now}},
 		{name: "the record cannot be read", readErr: errors.New("connection reset"), wantErr: []string{"could not be read"}},
 	}
+	prevGrace, prevPoll := stopRecordGrace, stopRecordPoll
+	stopRecordGrace, stopRecordPoll = 300*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { stopRecordGrace, stopRecordPoll = prevGrace, prevPoll })
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			base := &fakeApplier{}
@@ -71,7 +92,7 @@ func TestWaitForStopComplete_RequiresTheRecordedStop(t *testing.T) {
 				time.Sleep(30 * time.Millisecond)
 				base.stopRequested.Store(false) // a graceful drain, or a restart's start
 			}()
-			err := waitForStopComplete(context.Background(), livenessFakeApplier{base, tc.liveness, tc.readErr}, "s1", 5*time.Second)
+			err := waitForStopComplete(context.Background(), livenessFakeApplier{fakeApplier: base, liveness: tc.liveness, err: tc.readErr, later: tc.later, reads: new(int)}, "s1", 5*time.Second)
 			if tc.wantErr == nil {
 				if err != nil {
 					t.Fatalf("want success, got %v", err)

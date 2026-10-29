@@ -115,12 +115,12 @@ func TestWaitForStopComplete_Timeout(t *testing.T) {
 	// was hard-cancelled (it exited, stop not recorded), so the message
 	// names the hard-cancel marker and its remedy, and must not promise
 	// the drain continues.
-	for _, want := range []string{pipeline.StopDrainHardCancelledMarker, "start it once", "sluice sync stop --wait"} {
+	for _, want := range []string{pipeline.StopDrainHardCancelledMarker, "start it once", "sluice sync stop --wait", "process exited 4"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("timeout message lacks %q: %v", want, err)
 		}
 	}
-	if strings.Contains(err.Error(), "continue draining") {
+	if strings.Contains(err.Error(), "continue draining") || strings.Contains(err.Error(), "exited 1") {
 		t.Errorf("timeout message still claims the drain continues: %v", err)
 	}
 	// The timeout is a PLAIN error — kong's generic exit 1, per the
