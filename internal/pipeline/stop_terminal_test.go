@@ -148,7 +148,7 @@ func TestStopObservedRunIsTerminal_Supervisor(t *testing.T) {
 			runs++
 			return stopTerminal(&stop, refusal)
 		}),
-	}}, fastTestPolicy(0))
+	}}, fastTestPolicy(3)) // bounded, so a restart shows as runs > 1 instead of a hang
 	err := sup.Run(context.Background())
 	if runs != 1 {
 		t.Fatalf("the leg ran %d times; want 1 (not restarted after its stop)", runs)
