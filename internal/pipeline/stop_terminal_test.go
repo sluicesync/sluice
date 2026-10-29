@@ -53,6 +53,24 @@ func TestStopObservedRunIsTerminal_RetryLoop(t *testing.T) {
 			t.Fatalf("Run = %v; want the invalid position kept, marked stop-requested, not an undrained stop", err)
 		}
 	})
+	// A RETRIABLE error can still leave a stop-observed attempt marked but not
+	// converted to an undrained stop — the reshard-reopen exit wraps whatever
+	// the reopen returned. The retry loop must not retry it either: the early
+	// return in runWithRetry is what holds this, not the reactive check.
+	t.Run("stop observed, retriable error: no retry", func(t *testing.T) {
+		s := fastRetryStreamer(t, true, 8)
+		calls := 0
+		var stop stopSignal
+		stop.observed.Store(true)
+		s.runOnceFn = func(context.Context) error {
+			calls++
+			return stopTerminal(&stop, fakeRetriableErr{msg: "vtgate: transient reopen failure"})
+		}
+		err := s.Run(context.Background())
+		if calls != 1 || !errors.Is(err, ErrStopRequestedRun) {
+			t.Fatalf("attempts %d, err %v; want one attempt ending stop-requested", calls, err)
+		}
+	})
 	// The single-attempt path Run falls back to when the retry loop cannot
 	// open its position reader has its own reactive re-snapshot loop.
 	t.Run("stop observed, single-attempt path: no re-snapshot", func(t *testing.T) {
