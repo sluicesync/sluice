@@ -115,7 +115,7 @@ func TestWaitForStopComplete_Timeout(t *testing.T) {
 	// was hard-cancelled (it exited, stop not recorded), so the message
 	// names the hard-cancel marker and its remedy, and must not promise
 	// the drain continues.
-	for _, want := range []string{pipeline.StopDrainHardCancelledMarker, "start it once", "sluice sync stop --wait", "process exited 4"} {
+	for _, want := range []string{pipeline.StopDrainHardCancelledMarker, "start it once", "sluice sync stop --wait", "process exited 4", "its stop is recorded, but the request stays set"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("timeout message lacks %q: %v", want, err)
 		}

@@ -1981,6 +1981,12 @@ func (s *Streamer) isReactiveInvalidPosition(err error) bool {
 	if !errors.Is(err, ir.ErrPositionInvalid) {
 		return false
 	}
+	// A run that ended after its `sync stop` was observed is terminal: a
+	// re-snapshot would start a new attempt that clears the stop request and
+	// streams on (ErrStopRequestedRun).
+	if errors.Is(err, ErrStopRequestedRun) {
+		return false
+	}
 	// A genuine ctx termination (operator Ctrl-C / sync stop) must not be
 	// mistaken for an invalid-position recovery trigger. ErrPositionInvalid
 	// never wraps ctx errors in practice, but guard explicitly.
@@ -2515,10 +2521,10 @@ func (s *Streamer) applyWithReshardFollow(
 				// reopened settles like any undrained stop, not as a reopen
 				// failure (the fix-aimed review of c421369a, LOW).
 				if stop != nil && stop.hardCancelled.Load() {
-					return s.settleUndrainedStop(ctx, streamID, rerr, stopCutOffByWatchdog)
+					return stopTerminal(stop, s.settleUndrainedStop(ctx, streamID, rerr, stopCutOffByWatchdog))
 				}
 				if rerr != nil {
-					return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: reshard reopen: %w", rerr))
+					return stopTerminal(stop, migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: reshard reopen: %w", rerr)))
 				}
 				reshardReopens++
 				if reshardReopens > maxReshardReopensPerRun {
@@ -2542,7 +2548,9 @@ func (s *Streamer) applyWithReshardFollow(
 		// the dispatch error (Bug 57: retriable before ctx-termination),
 		// surface a source CDC pump error (GitHub #19), and clear the stop
 		// flag after a graceful drain.
-		return s.phaseSettleDispatch(ctx, applier, streamID, dispatchErr, stop)
+		// A Run whose stop was observed is terminal whatever it ends with
+		// (stopTerminal, ErrStopRequestedRun).
+		return stopTerminal(stop, s.phaseSettleDispatch(ctx, applier, streamID, dispatchErr, stop))
 	}
 }
 

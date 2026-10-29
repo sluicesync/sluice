@@ -196,6 +196,12 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		if err == nil {
 			return nil
 		}
+		// A run whose `sync stop` was observed is terminal: neither the retry
+		// below nor the reactive re-snapshot may start an attempt, which would
+		// clear the stop request and stream on (ErrStopRequestedRun).
+		if errors.Is(err, ErrStopRequestedRun) {
+			return err
+		}
 		// ADR-0093: a reactive [ir.ErrPositionInvalid] (e.g. a VStream
 		// resume from a purged GTID position surfaced via the pump's Recv)
 		// is NOT retriable — retrying the same purged position spins

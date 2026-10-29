@@ -143,6 +143,35 @@ func (e *stopNotDrainedError) Unwrap() error { return ErrStopDrainHardCancelled 
 // ExitCode implements kong's ExitCoder.
 func (e *stopNotDrainedError) ExitCode() int { return sluicecode.ExitStopNotDrained }
 
+// ErrStopRequestedRun marks a Run that ended in an error after its `sync
+// stop` was observed. Such a Run is terminal, whatever the error: the
+// in-process retry, the ADR-0093 reactive re-snapshot and the fleet
+// supervisor's restart all start a new attempt, and every attempt clears
+// stop_requested_at at its start (runOnce step 2.5), stamps the stream
+// running and streams on against the operator's stop — and a reactive
+// re-snapshot on a native binlog source would also drop and recreate the
+// in-scope target tables (the third fix-aimed review of d2bbcad8).
+var ErrStopRequestedRun = errors.New("sync stop was requested during this run")
+
+// stopObservedError carries a Run's own error unchanged — its message, its
+// sentinels, its exit status (errors.As finds the inner error's ExitCoder
+// first) — and adds [ErrStopRequestedRun] so the retry loop, the reactive
+// re-snapshot and the supervisor can see the run must not restart.
+type stopObservedError struct{ err error }
+
+func (e *stopObservedError) Error() string   { return e.err.Error() }
+func (e *stopObservedError) Unwrap() []error { return []error{e.err, ErrStopRequestedRun} }
+
+// stopTerminal wraps err as a stop-observed, terminal error when the
+// attempt's stop-signal poll saw a `sync stop`; it returns err unchanged
+// otherwise (and for nil).
+func stopTerminal(stop *stopSignal, err error) error {
+	if err == nil || stop == nil || !stop.observed.Load() || errors.Is(err, ErrStopRequestedRun) {
+		return err
+	}
+	return &stopObservedError{err: err}
+}
+
 // settleUndrainedStop ends an attempt whose `sync stop` did not drain (see
 // [stopUndrainedHow]). It is deliberately NOT the graceful path:
 //
