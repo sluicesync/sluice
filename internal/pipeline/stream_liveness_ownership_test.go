@@ -141,6 +141,79 @@ func (a storePositionApplier) ReadPosition(context.Context, string) (ir.Position
 	return ir.Position{Token: a.token}, true, nil
 }
 
+// seqDriftApplier answers liveness reads from a sequence (the last value
+// repeats), over the scope-drift test applier.
+type seqDriftApplier struct {
+	livenessDriftApplier
+	seq   []ir.StreamLiveness
+	reads *int
+}
+
+func (a seqDriftApplier) ReadStreamLiveness(context.Context, string) (ir.StreamLiveness, error) {
+	i := *a.reads
+	*a.reads++
+	if i >= len(a.seq) {
+		i = len(a.seq) - 1
+	}
+	return a.seq[i], nil
+}
+
+// TestRecheckAfterPendingWaitsOutADeferringStart (the second fix-aimed review
+// of 6b5898dc, F8): a start that a supervisor makes right after the add
+// writes its pending entry stamps running, defers and puts the stop back; the
+// post-pending recheck waits that out, as the post-copy check does, instead
+// of refusing a good add. A record that stays running still refuses.
+func TestRecheckAfterPendingWaitsOutADeferringStart(t *testing.T) {
+	withPostCopyStopGrace(t, 300*time.Millisecond, 5*time.Millisecond)
+	now := time.Now()
+	running := ir.StreamLiveness{Found: true, Recorded: true, AliveAt: now, Now: now}
+	stopped := ir.StreamLiveness{Found: true, Recorded: true, Stopped: true, Now: now}
+	for _, tc := range []struct {
+		name   string
+		seq    []ir.StreamLiveness
+		refuse bool
+	}{
+		{name: "running for a few reads, then the stop is back: passes", seq: []ir.StreamLiveness{running, running, running, stopped}},
+		{name: "running throughout: refuses after the grace", seq: []ir.StreamLiveness{running}, refuse: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := seqDriftApplier{livenessDriftApplier: livenessDriftApplier{scopeDriftApplier: &scopeDriftApplier{}}, seq: tc.seq, reads: new(int)}
+			a := &AddTable{StreamID: "live", TableName: "nt"}
+			err := a.recheckStreamStoppedAfterPending(context.Background(), app)
+			if tc.refuse != errors.Is(err, errStreamNotStopped) {
+				t.Fatalf("recheck = %v; want refused=%v", err, tc.refuse)
+			}
+		})
+	}
+}
+
+// TestDrainedStopRecordRetriedAtRunExit (the second fix-aimed review of
+// 6b5898dc, F3): when a graceful drain's stop record fails, settle still
+// clears the flag (the drain itself completed), and Run's exit tries the
+// record once more through a fresh applier; `sync stop --wait` waits a
+// bounded moment for exactly that attempt (TestWaitForStopComplete_*).
+func TestDrainedStopRecordRetriedAtRunExit(t *testing.T) {
+	store := &fakeLivenessStore{value: 500, recordFails: 1}
+	app := livenessOnlyApplier{store}
+	s := &Streamer{Applier: app, livenessOpen: func(context.Context) (ir.StreamLivenessStore, func(), error) {
+		return store, func() {}, nil
+	}}
+	s.liveness = &runLiveness{ctx: context.Background()}
+	s.armStreamLiveness("st")
+	var stop stopSignal
+	stop.observed.Store(true)
+	if err := s.phaseSettleDispatch(context.Background(), app, "st", nil, &stop); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if store.stopped() {
+		t.Fatal("RIG: the first stop record was meant to fail")
+	}
+	s.stopStreamLiveness()
+	if !store.stopped() || strings.Join(store.snapshot(), ",") != "stop-failed,stop" {
+		t.Fatalf("calls %v, stopped=%v; want the failed record retried once at Run's exit", store.snapshot(), store.stopped())
+	}
+}
+
 // TestStampAttemptStartFailsClosedOverAStop is the review's MEDIUM: a stamp
 // that fails while the record still reads the stopped marker (or cannot be
 // read) fails the attempt, rather than streaming with its position writes

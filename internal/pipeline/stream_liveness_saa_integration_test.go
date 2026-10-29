@@ -11,14 +11,20 @@ import (
 	"testing"
 )
 
-// TestStreamer_SchemaAlreadyAppliedStillStampsLiveness_Binlog is the
-// fix-aimed review of c421369a, MEDIUM: under --schema-already-applied a
-// start skips EnsureControlTable, whose probe was the only other place an
-// applier learned the liveness column exists. Stopped with `sync stop --wait`
-// (the record holds the stopped marker), the stream is started again with
-// SchemaAlreadyApplied and applies a change: the record must say running, so
-// a drained add refuses it, exactly as without the flag (which the other
-// tests in this package run).
+// TestStreamer_SchemaAlreadyAppliedStillStampsLiveness_Binlog runs the
+// --schema-already-applied start path (which skips EnsureControlTable) end
+// to end: stopped with `sync stop --wait` (the record holds the stopped
+// marker), the stream is started again with SchemaAlreadyApplied and applies
+// a change, and the record must say running, so a drained add refuses it.
+//
+// WHAT IT DOES NOT PIN, stated so it is not read as broader: the review's
+// MEDIUM (c421369a) was a stamp that FAILS under this flag. With a working
+// stamp the applier learns the column from the stamp itself, so this test
+// passes with or without StampStreamAlive's detect-first change. The
+// failing-stamp half is pinned by TestStampAttemptStartFailsClosedOverAStop
+// (fail-closed over a stop); the detect-first call itself has no
+// discriminating pin — reproducing a stamp that fails after the detect needs
+// a fault seam in the engine, which this change does not add.
 func TestStreamer_SchemaAlreadyAppliedStillStampsLiveness_Binlog(t *testing.T) {
 	srcDSN, tgtDSN, eng, filter, cleanup := drainHBRig(t)
 	defer cleanup()

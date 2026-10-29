@@ -162,4 +162,20 @@ func TestPositionWriteStampsLiveness(t *testing.T) {
 	if err != nil || l.Stopped || !l.Recorded || l.Age() > time.Minute || l.Age() < -time.Minute {
 		t.Fatalf("after a position write over a stopped marker: %+v, %v; want a fresh running stamp", l, err)
 	}
+	// Monotonic (the second fix-aimed review of 6b5898dc, F5): over a stamp
+	// from the future a position write writes previous+1.
+	future := time.Now().Add(time.Hour).UnixMilli()
+	if _, err := db.ExecContext(ctx, "UPDATE sluice_cdc_state SET stream_alive_ms = $1 WHERE stream_id = 's1'", future); err != nil {
+		t.Fatal(err)
+	}
+	if err := applier.(ir.PositionWriter).WritePosition(ctx, "s1", ir.Position{Engine: "postgres", Token: "tok-4"}); err != nil {
+		t.Fatal(err)
+	}
+	var got int64
+	if err := db.QueryRowContext(ctx, "SELECT stream_alive_ms FROM sluice_cdc_state WHERE stream_id = 's1'").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != future+1 {
+		t.Fatalf("a position write over a future stamp %d wrote %d; want %d (previous + 1)", future, got, future+1)
+	}
 }

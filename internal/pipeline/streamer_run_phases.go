@@ -1494,7 +1494,11 @@ func (s *Streamer) phaseSettleDispatch(ctx context.Context, applier ir.ChangeApp
 	// applier.
 	if dispatchErr == nil {
 		if srcErr := surfaceSourceError(s.sourceErrFn); srcErr != nil {
-			if stopObserved {
+			// Only a pump error the retry loop would retry is an undrained
+			// stop; a refusal or an invalid position keeps its own identity
+			// (and exit status), as on the dispatch-error arm above (the
+			// second fix-aimed review of 6b5898dc, F4).
+			if _, retriable := classifyRetriable(srcErr); stopObserved && (retriable || isRetriableConnectFailure(srcErr)) {
 				return s.settleUndrainedStop(ctx, streamID, srcErr, stopEndedRetriable)
 			}
 			return migcore.WrapWithHint(migcore.PhaseCDC, fmt.Errorf("pipeline: source cdc reader: %w", srcErr))

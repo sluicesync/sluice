@@ -84,6 +84,8 @@ type fakeLivenessStore struct {
 	clock    int64
 	stampErr error
 	readErr  error
+	// recordFails makes the next that many RecordStreamStopped calls fail.
+	recordFails int
 }
 
 var _ ir.StreamLivenessStore = (*fakeLivenessStore)(nil)
@@ -113,6 +115,11 @@ func (f *fakeLivenessStore) otherRunStamps() {
 func (f *fakeLivenessStore) RecordStreamStopped(context.Context, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.recordFails > 0 {
+		f.recordFails--
+		f.calls = append(f.calls, "stop-failed")
+		return errors.New("stop record failed (test)")
+	}
 	f.calls = append(f.calls, "stop")
 	f.value, f.null = 0, false
 	return nil
@@ -276,6 +283,7 @@ var _ ir.StreamLivenessStore = livenessDriftApplier{}
 // recheck, which refuses and takes the entry back out; a stream still
 // stopped passes and the entry stays.
 func TestAddTableRecheckAfterPending(t *testing.T) {
+	withPostCopyStopGrace(t, 50*time.Millisecond, 5*time.Millisecond)
 	now := time.Now()
 	t.Run("a stream that started meanwhile refuses and the entry is removed", func(t *testing.T) {
 		app := livenessDriftApplier{

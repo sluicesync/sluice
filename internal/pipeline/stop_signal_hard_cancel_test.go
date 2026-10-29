@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -87,11 +88,15 @@ func TestSettle_StopEndingRetriableIsNotGraceful(t *testing.T) {
 		dispatchErr error
 		sourceErr   error
 		undrained   bool
+		keeps       error // a sentinel the result must still carry
 	}{
 		{name: "stop observed, apply ends retriable", observed: true, dispatchErr: retriable, undrained: true},
-		{name: "stop observed, source pump error", observed: true, sourceErr: errors.New("read: connection reset"), undrained: true},
+		{name: "stop observed, retriable source pump error", observed: true, sourceErr: fakeRetriableErr{msg: "read: connection reset"}, undrained: true},
+		// F4: a refusal or an invalid position from the pump keeps its identity
+		// (and exit status) even under a stop.
+		{name: "stop observed, source refuses with an invalid position", observed: true, sourceErr: fmt.Errorf("vstream: %w", ir.ErrPositionInvalid), keeps: ir.ErrPositionInvalid},
 		{name: "no stop, apply ends retriable (retried as before)", dispatchErr: retriable},
-		{name: "no stop, source pump error (retried as before)", sourceErr: errors.New("read: connection reset")},
+		{name: "no stop, source pump error (retried as before)", sourceErr: fakeRetriableErr{msg: "read: connection reset"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,7 +115,10 @@ func TestSettle_StopEndingRetriableIsNotGraceful(t *testing.T) {
 			s.stopStreamLiveness()
 			if !tc.undrained {
 				if errors.Is(err, ErrStopDrainHardCancelled) || err == nil {
-					t.Fatalf("without a stop the error must go back to the retry loop unchanged, got %v", err)
+					t.Fatalf("the error must keep its own identity, not become an undrained stop, got %v", err)
+				}
+				if tc.keeps != nil && !errors.Is(err, tc.keeps) {
+					t.Fatalf("settle = %v; want it to keep %v", err, tc.keeps)
 				}
 				return
 			}
@@ -158,6 +166,32 @@ func TestStopNotDrainedExitStatus(t *testing.T) {
 		if !errors.Is(e, ErrStopDrainHardCancelled) {
 			t.Errorf("%s: lost ErrStopDrainHardCancelled: %v", name, e)
 		}
+	}
+}
+
+// TestSupervisor_UndrainedStopExitWinsInAFleet (the second fix-aimed review
+// of 6b5898dc, F1): in a two-leg fleet whose first leg fails with a coded
+// refusal (exit 3) and whose second ends with an undrained stop (exit 4), the
+// fleet's error — what `sync run` returns to the exit boundary — must exit
+// 4, or a service manager restarts the fleet against the stop.
+func TestSupervisor_UndrainedStopExitWinsInAFleet(t *testing.T) {
+	undrained := (&Streamer{}).settleUndrainedStop(context.Background(), "b", nil, stopCutOffByWatchdog)
+	refusal := sluicecode.Wrap(sluicecode.CodeColdStartTargetNotEmpty, "empty the target", errors.New("target not empty"))
+	sup := NewSupervisor([]SupervisedSync{
+		{ID: "a", Runner: runnerFunc(func(context.Context) error { return refusal })},
+		{ID: "b", Runner: runnerFunc(func(context.Context) error { return undrained })},
+	}, fastTestPolicy(1))
+	err := sup.Run(context.Background())
+	var ec interface{ ExitCode() int }
+	if !errors.As(err, &ec) || ec.ExitCode() != sluicecode.ExitStopNotDrained {
+		got := -1
+		if ec != nil {
+			got = ec.ExitCode()
+		}
+		t.Fatalf("the fleet's error exits %d; want %d: %v", got, sluicecode.ExitStopNotDrained, err)
+	}
+	if !errors.Is(err, ErrStopDrainHardCancelled) {
+		t.Fatalf("the fleet's error lost the undrained stop: %v", err)
 	}
 }
 

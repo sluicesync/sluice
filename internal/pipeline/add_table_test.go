@@ -155,6 +155,7 @@ func TestAddTableRefusesRunningStream(t *testing.T) {
 		}
 	}
 	t.Run("a stream that starts after the first read is caught by the recheck", func(t *testing.T) {
+		withPostCopyStopGrace(t, 100*time.Millisecond, 10*time.Millisecond)
 		src := newAddTableSourceEngine("source")
 		src.schema = &ir.Schema{Tables: []*ir.Table{
 			{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
@@ -170,8 +171,8 @@ func TestAddTableRefusesRunningStream(t *testing.T) {
 		if !errors.Is(err, errStreamNotStopped) {
 			t.Fatalf("want the %s refusal from the recheck, got %v", DrainedAddTableStreamNotStoppedMarker, err)
 		}
-		if tgt.applier.livenessReads != 2 || len(tgt.phaseLog) != 0 || src.snapshotCalls != 0 {
-			t.Fatalf("reads %d (want 2: the preflight and the recheck), phases %v, snapshots %d",
+		if tgt.applier.livenessReads < 2 || len(tgt.phaseLog) != 0 || src.snapshotCalls != 0 {
+			t.Fatalf("reads %d (want the preflight and the recheck's grace re-reads), phases %v, snapshots %d",
 				tgt.applier.livenessReads, tgt.phaseLog, src.snapshotCalls)
 		}
 	})

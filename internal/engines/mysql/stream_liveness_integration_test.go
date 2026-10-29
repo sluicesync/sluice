@@ -127,4 +127,23 @@ func TestPositionWriteStampsLiveness(t *testing.T) {
 	if err != nil || l.Stopped || !l.Recorded || l.Age() > time.Minute || l.Age() < -time.Minute {
 		t.Fatalf("after a position write over a stopped marker: %+v, %v; want a fresh running stamp", l, err)
 	}
+	// Monotonic (the second fix-aimed review of 6b5898dc, F5): a position
+	// write over a stamp from the future (a skewed clock, a stamp raised
+	// past its predecessor) writes previous+1, never the value it replaces
+	// and never an older one, so a start's compare-and-set restore cannot
+	// mistake it for that start's own stamp.
+	future := time.Now().Add(time.Hour).UnixMilli()
+	if _, err := db.ExecContext(ctx, "UPDATE sluice_cdc_state SET stream_alive_ms = ? WHERE stream_id = 's1'", future); err != nil {
+		t.Fatal(err)
+	}
+	if err := applier.(ir.PositionWriter).WritePosition(ctx, "s1", ir.Position{Engine: "mysql", Token: "tok-4"}); err != nil {
+		t.Fatal(err)
+	}
+	var got int64
+	if err := db.QueryRowContext(ctx, "SELECT stream_alive_ms FROM sluice_cdc_state WHERE stream_id = 's1'").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != future+1 {
+		t.Fatalf("a position write over a future stamp %d wrote %d; want %d (previous + 1)", future, got, future+1)
+	}
 }

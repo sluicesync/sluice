@@ -1136,8 +1136,10 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 // stampAlive adds the stream's liveness stamp (the server's clock in Unix ms,
 // [appliershared.StreamLivenessColumn]) to the same upsert, overwriting a
 // stopped marker: a stream that advances its position is running, so a
-// drained add-table cannot pass while it applies, whatever happens to the
-// Run's own stamping goroutine. updated_at keeps its position-write
+// drained add-table cannot pass while it applies. The value is GREATEST(now,
+// previous + 1), so every writer of the column is strictly monotonic and a
+// start's compare-and-set restore cannot mistake a position write for its
+// own stamp, whatever the clocks do. updated_at keeps its position-write
 // semantics (its ON UPDATE fires for this statement as it always has). False
 // (byte-identical to the historical statement) only when the control table
 // has no such column.
@@ -1146,7 +1148,8 @@ func writePositionUpsertSQL(controlKeyspace string, upsert upsertSpelling, stamp
 	aliveCol, aliveVal, aliveSet := "", "", ""
 	if stampAlive {
 		col := appliershared.StreamLivenessColumn
-		aliveCol, aliveVal, aliveSet = ", "+col, ", "+mysqlNowMillisExpr, ", "+col+" = "+upsert.newRowRef(col)
+		aliveCol, aliveVal = ", "+col, ", "+mysqlNowMillisExpr
+		aliveSet = ", " + col + " = GREATEST(" + upsert.newRowRef(col) + ", COALESCE(" + ref + "." + col + ", 0) + 1)"
 	}
 	return "INSERT INTO " + ref + " " +
 		"(stream_id, source_position, slot_name, publication_name, row_filter_hash, source_dsn_fingerprint, target_schema, rows_applied" + aliveCol + ") " +

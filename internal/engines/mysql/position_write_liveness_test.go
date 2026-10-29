@@ -99,7 +99,7 @@ func TestWritePositionUpsertSQL_LivenessStamp(t *testing.T) {
 	col := appliershared.StreamLivenessColumn
 	for _, u := range []upsertSpelling{upsertRowAlias, upsertValuesFunc} {
 		with := writePositionUpsertSQL("ctl", u, true)
-		for _, want := range []string{", " + col + ") VALUES", ", " + mysqlNowMillisExpr + ")", col + " = " + u.newRowRef(col)} {
+		for _, want := range []string{", " + col + ") VALUES", ", " + mysqlNowMillisExpr + ")", col + " = GREATEST(" + u.newRowRef(col) + ", COALESCE(" + controlTableRef("ctl", controlTableName) + "." + col + ", 0) + 1)"} {
 			if !strings.Contains(with, want) {
 				t.Errorf("stamping upsert (spelling %d) lacks %q:\n%s", u, want, with)
 			}
