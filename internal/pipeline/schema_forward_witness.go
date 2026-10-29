@@ -261,6 +261,11 @@ type firstBoundaryWitness struct {
 	// shardColumn is the Shape A discriminator (--inject-shard-column);
 	// "" on the single-stream path.
 	shardColumn string
+	// keylessBoundaries is whether the source's change stream projects its
+	// boundaries without a key (a VStream source: FIELD events carry
+	// columns only), so a boundary with no primary key says nothing about
+	// the source's key (SHAPE-A-KEYLESS-BOUNDARY, [firstBoundaryWitness.expected]).
+	keylessBoundaries bool
 }
 
 // witnessVerdictKind is the outcome of comparing a first boundary against
@@ -422,7 +427,26 @@ func (w *firstBoundaryWitness) keyCollationChanges(post, prior, target *ir.Table
 // ([witnessOptions.pinned]).
 func (w *firstBoundaryWitness) expected(post *ir.Table) (*ir.Table, error) {
 	schema := &ir.Schema{Tables: []*ir.Table{post}}
-	if w.shardColumn != "" {
+	if w.shardColumn != "" && w.keylessBoundaries && (post.PrimaryKey == nil || len(post.PrimaryKey.Columns) == 0) {
+		// SHAPE-A-KEYLESS-BOUNDARY: a VStream boundary is projected from
+		// FIELD events, which carry no key (projectVStreamFields), so its
+		// table never has a primary key, and InjectShardColumn refused it —
+		// every Shape A stream from a PlanetScale/Vitess source stopped at
+		// its first change (measured on vttestserver, v0.163.10). The
+		// discriminator's key fold exists to build the CREATE's composite
+		// key; this comparison is column by column, so the boundary gets the
+		// discriminator column appended and no key. Scoped to keyless-
+		// boundary sources: on a lane whose boundaries carry the key
+		// (binlog, pgoutput) a keyless boundary is a source that lost its
+		// key, and InjectShardColumn's refusal below still stands for it.
+		// A VStream source's key was never judged at a boundary, Shape A
+		// or not, because it is never there to judge.
+		keyless := *post
+		keyless.Columns = append(append([]*ir.Column(nil), post.Columns...), &ir.Column{
+			Name: w.shardColumn, Type: ir.Varchar{Length: 64}, SluiceInjected: true,
+		})
+		schema = &ir.Schema{Tables: []*ir.Table{&keyless}}
+	} else if w.shardColumn != "" {
 		var err error
 		schema, err = translate.InjectShardColumn(schema, w.shardColumn, ir.Varchar{Length: 64})
 		if err != nil {

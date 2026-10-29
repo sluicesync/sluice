@@ -1386,6 +1386,7 @@ func (s *Streamer) firstBoundaryWitness() *firstBoundaryWitness {
 	}
 	if s.InjectShardColumn.Engaged() {
 		w.shardColumn = s.InjectShardColumn.Name
+		w.keylessBoundaries = s.Source.Capabilities().CDC == ir.CDCVStream
 	}
 	return w
 }
