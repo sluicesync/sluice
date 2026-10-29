@@ -1221,6 +1221,19 @@ type Streamer struct {
 	// unique across shards; the safe default is false (guard active).
 	AllowCrossShardMerge bool
 
+	// AssertNoCrossShardRowMoves is the operator's guarantee
+	// (`--assert-no-cross-shard-row-moves`) that the application never
+	// moves a row to another shard while keeping its primary key. On a
+	// stream that merges shards (no InjectShardColumn, more than one shard
+	// read — AllowCrossShardMerge or not) it turns the
+	// CROSS-SHARD-VINDEX-NOT-IN-PK refusal (a table whose primary vindex is
+	// not within its primary key, Bugs 337/338) into a recorded WARN; if a
+	// row does move, the
+	// target can lose it silently. Zero-value safe: false keeps refusing,
+	// for every construction (fleet, tests). Not on [Migrator]: migrate
+	// applies no change stream (TestCrossShardRowMoveDoorRoster_EveryMergeEntryPoint).
+	AssertNoCrossShardRowMoves bool
+
 	// NoCoordinateLiveDDL opts OUT of ADR-0054 Shape A Phase 2 live
 	// cross-shard DDL coordination (CLI: `--no-coordinate-live-ddl`).
 	// OPT-OUT-named so the Go zero value (false) keeps live
@@ -1884,6 +1897,16 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// resume) — an unsupported predicate or a mis-configured source refuses
 	// up front, never after data moves. No-op when RowFilters is empty.
 	if err := s.preflightRowFilters(ctx); err != nil {
+		return err
+	}
+
+	// CROSS-SHARD-VINDEX-NOT-IN-PK (Bugs 337/338): on a stream that merges
+	// shards, a table that can hold one key on two shards in turn loses a
+	// row whenever the two shards' changes to it reach the target out of
+	// order. Once here, before any attempt and whatever
+	// AllowCrossShardMerge says, so a cold start AND a warm resume refuse
+	// before anything is read or written (cross_shard_row_move_door.go).
+	if err := s.preflightCrossShardRowMoves(ctx); err != nil {
 		return err
 	}
 

@@ -15,7 +15,10 @@ import (
 // stream entirely under an apply-deficit backlog (a liveness wedge, reproduced
 // 4×), while the relaxed path drained to completion with exactly-once intact.
 // The relaxation is correctness-safe under range-sharding (a (table, PK) lives
-// in one shard; the key-hash apply lanes serialize same-key within a shard;
+// in one shard — true only while the table's primary vindex is within its PK,
+// which the pipeline's CROSS-SHARD-VINDEX-NOT-IN-PK door requires of a merged
+// stream unless --assert-no-cross-shard-row-moves; the key-hash apply lanes
+// serialize same-key within a shard;
 // StopOnReshard closes the only cross-shard window) — see the ADR-0120 consumer
 // audit + the four gated A/B harnesses.
 //

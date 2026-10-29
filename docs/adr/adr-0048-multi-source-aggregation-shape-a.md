@@ -169,6 +169,30 @@ value → cross-shard overwrite or mid-copy abort, Bug-9 class).
 > (at-least-once, no overwrite). The two preflights are mutually exclusive
 > by construction (one fires only when the discriminator is set, the other
 > only when it isn't).
+>
+> **Implementation note (2026-10-28, Bugs 337/338): `--allow-cross-shard-merge`
+> asserts uniqueness at rest, not that a key stays on one shard.** A table
+> whose primary vindex is not within its primary key moves a row between
+> shards as a DELETE on one and an INSERT of the same key on the other
+> (Vitess refuses an in-place vindex UPDATE, VT12001), and the merged stream
+> cannot order the two, so a MySQL target loses the row whenever the INSERT
+> lands first and any target can lose a row moved away and back. A third
+> door, `CROSS-SHARD-VINDEX-NOT-IN-PK`
+> (`internal/pipeline/cross_shard_row_move_door.go`), runs on every stream
+> without a discriminator whose source resolves to more than one shard —
+> keyed on the topology, not on the override, because the override is not
+> persisted and Bug 152's door, which requires it, runs only on a fresh cold
+> start. It reads each keyed table's primary vindex from the source VSchema
+> (`ir.ShardRoutingReader`) and refuses unless it is functional and lies
+> within the key, or the operator passes `--assert-no-cross-shard-row-moves`. Its remedy is this ADR's shape with
+> one stream per shard (`vstream_shards=<shard>`, a distinct VALUE each):
+> two shards' copies of a key are then two target rows, exact in any order.
+> **Divergence from the "mutually exclusive by construction" sentence
+> above, flagged:** it holds for the two preflights, but `--inject-shard-column`
+> on ONE stream spanning every shard stamps one VALUE on all of them and is
+> caught by neither (filed as `INJECT-SHARD-COLUMN-MERGED-STREAM`); the
+> disjointness this ADR rests on comes from the per-shard topology, which
+> nothing checks.
 
 Introduce `preflightShardConsolidation`, fired when
 `--inject-shard-column NAME=VALUE` is set AND the target is non-empty.

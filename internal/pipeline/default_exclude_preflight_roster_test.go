@@ -47,6 +47,9 @@ var defaultExcludeCallSites = map[string]string{
 		"host never reaches here",
 	"streamer_run_phases.go:(*Streamer).phaseResolveStreamIdentity": "PREFLIGHTED — Streamer.Run calls " +
 		"preflightDSNValidation once before the first runOnce, for the same reason",
+	"cross_shard_row_move_door.go:(*Streamer).preflightCrossShardRowMoves": "PREFLIGHTED — called from " +
+		"Streamer.Run after its preflightDSNValidation, so it scopes the CROSS-SHARD-VINDEX-NOT-IN-PK check " +
+		"exactly as phaseResolveStreamIdentity will scope the stream",
 	"backup/backup.go:(*Backup).Run": "NOT PREFLIGHTED — `sluice backup` runs no driver/host validation, so " +
 		"a vanilla-mysql DSN aimed at a PlanetScale host reaches the excluder and gets the `_vt_*` " +
 		"exclusion it needs. Whether backup SHOULD refuse that pairing up front is an open question " +

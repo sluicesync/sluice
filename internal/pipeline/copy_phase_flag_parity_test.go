@@ -75,6 +75,10 @@ func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 		"UpfrontIndexes",     // both: build secondary indexes before the copy (item 111 phase 2)
 		"RaiseQueryTimeout",  // both: ADR-0182 query-timeout raise around the copy (item 111 phase 3)
 		"AnalyzeAfter",       // both: advisory post-copy ANALYZE statistics refresh (item 111)
+
+		// Streamer only, recorded below: sits beside AllowCrossShardMerge,
+		// which IS on both, so its absence from Migrator is a decision.
+		"AssertNoCrossShardRowMoves",
 	}
 
 	// parityExempt: field -> reason, for deliberate or pending asymmetries. An
@@ -82,13 +86,19 @@ func TestCopyPhaseFlagParityMigratorStreamer(t *testing.T) {
 	// wires it to both (or renames it away) this gate fails and forces the
 	// exemption to be removed — a stale exemption cannot rot silently.
 	//
-	// EMPTY as of item 111: every copy-phase flag above is wired to BOTH
-	// entry points — full parity. The map and its enforcement stay in place so
+	// One entry since Bugs 337/338 (AssertNoCrossShardRowMoves, a CDC-only
+	// guarantee); every copy-phase flag above is wired to BOTH entry points
+	// (item 111 closed the last copy-phase gap). The map and its enforcement stay in place so
 	// the moment a future copy-phase flag lands on one struct and not the other,
 	// the gate fails until it's either wired to both or exempted here with a
 	// reason. (UpfrontIndexes/RaiseQueryTimeout/AnalyzeAfter were each exempt in
 	// turn during item 111 and dropped as they were wired.)
-	parityExempt := map[string]string{}
+	parityExempt := map[string]string{
+		"AssertNoCrossShardRowMoves": "the CROSS-SHARD-VINDEX-NOT-IN-PK guarantee guards two shards' CHANGES applied out of " +
+			"order, and migrate applies no change stream; a row moved during its copy is the non-snapshot posture of a " +
+			"live-source copy, which --inject-shard-column does not make exact either. Its sibling AllowCrossShardMerge " +
+			"governs the copy-time collision and is on both (TestCrossShardRowMoveDoorRoster_EveryMergeEntryPoint)",
+	}
 
 	migType := reflect.TypeOf(Migrator{})
 	strType := reflect.TypeOf(Streamer{})

@@ -433,6 +433,7 @@ restore --target-tls-ca
 restore --verify-key
 schema add-table --abandon
 schema add-table --accept-target-only-unique-key
+schema add-table --assert-no-cross-shard-row-moves
 schema add-table --control-keyspace
 schema add-table --dry-run
 schema add-table --expr-override
@@ -568,6 +569,7 @@ sync start --apply-retry-backoff-base
 sync start --apply-retry-backoff-cap
 sync start --apply-tune-target-latency
 sync start --assert-copy-finished
+sync start --assert-no-cross-shard-row-moves
 sync start --auto-prune-change-log
 sync start --auto-prune-interval
 sync start --auto-prune-keep

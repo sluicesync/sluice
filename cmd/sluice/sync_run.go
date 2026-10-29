@@ -115,6 +115,16 @@ type SyncSpec struct {
 	InjectShardColumn    string `koanf:"inject-shard-column"`
 	AllowCrossShardMerge bool   `koanf:"allow-cross-shard-merge"`
 
+	// AssertNoCrossShardRowMoves mirrors `sync start
+	// --assert-no-cross-shard-row-moves`: the operator's guarantee, for a
+	// leg that merges shards (no inject-shard-column, more than one shard
+	// read), that the application never moves a row to another shard while
+	// keeping its primary key, which turns the
+	// CROSS-SHARD-VINDEX-NOT-IN-PK refusal into a WARN. It is standing
+	// config, not a one-shot acknowledgement: the door judges every start of
+	// the leg, so a leg needs it as long as it merges such a table.
+	AssertNoCrossShardRowMoves bool `koanf:"assert-no-cross-shard-row-moves"`
+
 	// NoCoordinateLiveDDL mirrors `sync start --no-coordinate-live-ddl`
 	// (ADR-0054 Shape A Phase 2): opt OUT of live cross-shard DDL
 	// coordination and keep the v0.72.x drained model. Omitted (false) =
@@ -1038,6 +1048,8 @@ func buildStreamerFromSpec(ctx context.Context, spec *SyncSpec, g *Globals) (*pi
 		InjectShardColumn:    shardSpec,
 		AllowCrossShardMerge: spec.AllowCrossShardMerge,
 		NoCoordinateLiveDDL:  spec.NoCoordinateLiveDDL,
+
+		AssertNoCrossShardRowMoves: spec.AssertNoCrossShardRowMoves,
 
 		ApplyBatchSize:   applyBatchSize,
 		AutoTune:         !spec.NoAutoTune,

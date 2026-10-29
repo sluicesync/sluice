@@ -54,6 +54,19 @@ other eighteen.
 
 ---
 
+## 2026-10-28 — Bugs 337 and 338 (CROSS-SHARD-VINDEX-NOT-IN-PK): what the door leaves open
+
+Indexed when filed. Residuals named while building the door (no audit pass).
+
+- CROSS-SHARD-MYSQL-FULL-IMAGE-DELETE filed
+- CROSS-SHARD-UNIQUE-KEY-RESIDENCY filed
+- CROSS-SHARD-BACKUP-LANE filed
+- INJECT-SHARD-COLUMN-MERGED-STREAM filed
+- PLANETSCALE-SHOW-VSCHEMA-ACCESS-UNMEASURED filed
+- BUG152-ZERO-SHARDS-PASSES filed
+- CROSS-SHARD-LIVE-ADDED-NOT-REJUDGED filed
+- CROSS-SHARD-VSCHEMA-CHANGE-MIDSTREAM filed
+
 ## 2026-10-28 — SHAPE-A-KEYLESS-BOUNDARY: found while measuring the Bugs 337/338 remedy
 
 Indexed when filed (no audit pass).

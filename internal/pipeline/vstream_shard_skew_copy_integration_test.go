@@ -406,6 +406,13 @@ func vskRunCell(t *testing.T, r vskRig, sh vskShape, run int) vskCellResult {
 		mk := func() *Streamer {
 			s := r.streamer(streamID, tables, sh.extraDSN)
 			s.AllowCrossShardMerge = r.sharded()
+			// The tables are sharded by hash(k) with PRIMARY KEY(id), a
+			// primary vindex outside the key, so CROSS-SHARD-VINDEX-NOT-IN-PK
+			// refuses them. No cell moves a row to another shard while
+			// keeping its id (the key changes here keep k, so the row stays
+			// on its shard), which is the guarantee the flag states; making
+			// k part of the key would change what the cells measure.
+			s.AssertNoCrossShardRowMoves = r.sharded()
 			return s
 		}
 		s := mk()

@@ -226,6 +226,12 @@ type AddTable struct {
 	// path so a newly-added table is PII-clean from the first row.
 	Redactor *redact.Registry
 
+	// AssertNoCrossShardRowMoves is [Streamer.AssertNoCrossShardRowMoves]
+	// for the table being added (`--assert-no-cross-shard-row-moves`): the
+	// operator's guarantee that the application never moves its rows to
+	// another shard while keeping their primary key. Zero-value safe.
+	AssertNoCrossShardRowMoves bool
+
 	// AcceptTargetOnlyUniqueKeys is [Streamer.AcceptTargetOnlyUniqueKeys]
 	// for the table being added: unique keys a pre-created target table
 	// carries beyond the source's, accepted with its fingerprint (`<table>.<key>=<fingerprint>`).
@@ -353,6 +359,16 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return err
 	}
 
+	// CROSS-SHARD-VINDEX-NOT-IN-PK (Bugs 337/338): add-table has no
+	// discriminator, so on a multi-shard source it always merges every
+	// shard into the one target table, and a table whose primary vindex is
+	// not within its primary key can lose a moved row once the restarted
+	// stream applies it. Judged here, for this table, before anything is
+	// written; the restarted stream's own door judges its filter's scope.
+	if err := a.preflightCrossShardRowMoves(ctx, scoped); err != nil {
+		migcore.CloseIf(sr)
+		return err
+	}
 	if err := a.preflightAddTableShape(ctx, sr, scoped); err != nil {
 		migcore.CloseIf(sr)
 		return err

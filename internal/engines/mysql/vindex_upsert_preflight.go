@@ -196,6 +196,28 @@ func readPrimaryVindexColumns(ctx context.Context, db *sql.DB, keyspace, table s
 // readColumnVindexes returns each column vindex of keyspace.table as its
 // columns, in the order `SHOW VSCHEMA VINDEXES ON` lists them.
 func readColumnVindexes(ctx context.Context, db *sql.DB, keyspace, table string) ([][]string, error) {
+	typed, err := readColumnVindexesTyped(ctx, db, keyspace, table)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]string, 0, len(typed))
+	for _, v := range typed {
+		out = append(out, v.columns)
+	}
+	return out, nil
+}
+
+// columnVindex is one row of `SHOW VSCHEMA VINDEXES ON`: the vindex's columns
+// and its Type ("hash", "lookup_unique", …).
+type columnVindex struct {
+	columns []string
+	typ     string
+}
+
+// readColumnVindexesTyped is [readColumnVindexes] with each vindex's Type,
+// read from the same statement's Type field (measured on vttestserver:
+// Columns, Name, Type, Params, Owner). A missing Type field reads as "".
+func readColumnVindexesTyped(ctx context.Context, db *sql.DB, keyspace, table string) ([]columnVindex, error) {
 	// A SHOW statement takes no bind parameters; both names are quoted
 	// identifiers, so nothing an operator named can escape them.
 	rows, err := db.QueryContext(ctx, "SHOW VSCHEMA VINDEXES ON "+quoteIdent(keyspace)+"."+quoteIdent(table))
@@ -211,16 +233,19 @@ func readColumnVindexes(ctx context.Context, db *sql.DB, keyspace, table string)
 	if err != nil {
 		return nil, err
 	}
-	colsAt := -1
+	colsAt, typeAt := -1, -1
 	for i, n := range names {
-		if strings.EqualFold(n, "Columns") {
+		switch {
+		case strings.EqualFold(n, "Columns"):
 			colsAt = i
+		case strings.EqualFold(n, "Type"):
+			typeAt = i
 		}
 	}
 	if colsAt < 0 {
 		return nil, fmt.Errorf("mysql: SHOW VSCHEMA VINDEXES returned no Columns field (got %v)", names)
 	}
-	var out [][]string
+	var out []columnVindex
 	for rows.Next() {
 		vals := make([]sql.NullString, len(names))
 		ptrs := make([]any, len(names))
@@ -237,7 +262,11 @@ func readColumnVindexes(ctx context.Context, db *sql.DB, keyspace, table string)
 			}
 		}
 		if len(cols) > 0 {
-			out = append(out, cols)
+			v := columnVindex{columns: cols}
+			if typeAt >= 0 {
+				v.typ = strings.TrimSpace(vals[typeAt].String)
+			}
+			out = append(out, v)
 		}
 	}
 	return out, rows.Err()

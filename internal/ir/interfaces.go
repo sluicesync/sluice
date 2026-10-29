@@ -1516,6 +1516,71 @@ type ShardDiscoverer interface {
 	DiscoverShards(ctx context.Context, dsn string) ([]string, error)
 }
 
+// ShardRoutingReader is the optional surface a sharded source [Engine]
+// implements to report which shards a change stream reads and how each
+// table's rows are placed on them — on Vitess/PlanetScale, the stream's
+// resolved shard set and the table's PRIMARY vindex in the keyspace's
+// VSchema.
+//
+// The orchestrator's cross-shard row-move door (CROSS-SHARD-VINDEX-NOT-IN-PK,
+// Bugs 337/338) consults it whenever a stream merges shards into one target
+// table: a table whose primary vindex is not within its primary key can hold
+// one key on two shards in turn (a move is a DELETE on one shard and an
+// INSERT on another), and nothing orders the two shards' changes, so the
+// merged stream can apply them in the wrong order and lose the row. A table
+// whose primary vindex IS within the key, and is functional (the key
+// computes it), cannot: the key fixes the vindex value, which fixes the
+// shard.
+//
+// StreamShards returns the shards a change stream opened on dsn reads — the
+// DSN's explicit pin if it carries one, else the discovered layout — and
+// sharded=false (without connecting) for a source that is not a sharded
+// flavor. A sharded source that resolves to no shard returns the empty list
+// with sharded=true; the door treats that as unverified, never as unsharded.
+//
+// ShardRouting returns one entry per named table. An error means the
+// routing could not be read at all; the door refuses on it rather than skip
+// (it is a silent-loss guard).
+type ShardRoutingReader interface {
+	StreamShards(ctx context.Context, dsn string) (shards []string, sharded bool, err error)
+	ShardRouting(ctx context.Context, dsn string, tables []string) (map[string]ShardRouting, error)
+}
+
+// ShardRoutingKind classifies how a sharded source places a table's rows.
+// The zero value is [ShardRoutingUnknown], so a routing nobody established
+// is judged as one that proves nothing.
+type ShardRoutingKind int
+
+const (
+	// ShardRoutingUnknown means the source has no routing for the table (on
+	// Vitess, the keyspace's VSchema has no entry for it), so nothing says
+	// which shard a key lives on.
+	ShardRoutingUnknown ShardRoutingKind = iota
+	// ShardRoutingVindex means rows are placed by a function of the values
+	// of [ShardRouting.PrimaryVindex].
+	ShardRoutingVindex
+	// ShardRoutingEveryShard means every shard holds every row (a Vitess
+	// reference table), so every key's changes arrive once per shard.
+	ShardRoutingEveryShard
+	// ShardRoutingNonFunctional means the primary vindex places a row by a
+	// lookup, not by a function of its columns (a Vitess lookup_unique /
+	// consistent_lookup_unique primary vindex, or a type the engine does not
+	// know to be functional), so even a key containing the vindex columns
+	// does not fix the shard.
+	ShardRoutingNonFunctional
+)
+
+// ShardRouting is one table's entry in a [ShardRoutingReader] answer.
+type ShardRouting struct {
+	Kind ShardRoutingKind
+	// PrimaryVindex is the column list of the table's primary vindex, set
+	// for [ShardRoutingVindex] and [ShardRoutingNonFunctional].
+	PrimaryVindex []string
+	// VindexType is the primary vindex's type as the source reports it
+	// (e.g. "hash", "lookup_unique"), for the refusal's message.
+	VindexType string
+}
+
 // DSNValidator is the optional surface an [Engine] implements to reject
 // a DSN it can tell — from the DSN string alone, with no connection —
 // is misconfigured for this engine BEFORE any work begins. The

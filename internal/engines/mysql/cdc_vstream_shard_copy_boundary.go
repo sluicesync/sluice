@@ -75,8 +75,12 @@ import (
 // cannot be touched by an earlier shard's held change, because a row lives on
 // one shard (vtgate refuses an UPDATE of a primary-vindex column, VT12001, so
 // a row changes shard only by an application DELETE on one shard and INSERT
-// on another, two changes the tail replays like any cross-shard pair, which
-// is what --allow-cross-shard-merge already accepts).
+// on another). That holds per KEY only while the table's primary vindex is
+// within its primary key: otherwise the DELETE and the INSERT carry the same
+// key from two shards, nothing orders them, and the moved row can be lost
+// (Bugs 337/338). The pipeline's CROSS-SHARD-VINDEX-NOT-IN-PK door refuses
+// that shape under --allow-cross-shard-merge unless the operator asserts
+// --assert-no-cross-shard-row-moves.
 //
 // A single-shard stream sees its per-scope and stream-wide COPY_COMPLETED in
 // one batch, holds nothing, and keeps its position byte for byte.

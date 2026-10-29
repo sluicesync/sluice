@@ -279,9 +279,13 @@ var inertFlagExemptions = map[string]string{
 	// --- runtime-probe keyed (topology / chain shape / predicate shape) ---
 	"migrate --allow-cross-shard-merge":    "no effect on a single-shard source: sharding topology is a runtime vtgate probe, not a static capability",
 	"sync start --allow-cross-shard-merge": "no effect on a single-shard source: sharding topology is a runtime vtgate probe, not a static capability",
-	"sync start --notify-router-cpu-util":  "inert on a target with no routing layer: Neki router presence is a runtime probe, not a static capability",
-	"sync start --where-strict-collation":  "no effect on numeric/byte-exact comparisons: keyed on the --where predicate's shape, not an engine",
-	"restore --apply-concurrency":          "no effect on a single-full restore: keyed on the archive's chain shape (a manifest fact), not an engine",
+	"sync start --assert-no-cross-shard-row-moves": "consulted only by the CROSS-SHARD-VINDEX-NOT-IN-PK door, which runs on a stream without " +
+		"--inject-shard-column whose shard set (the DSN pin, else a runtime vtgate probe) has more than one shard; a flag dependency plus a topology probe, not a static capability",
+	"schema add-table --assert-no-cross-shard-row-moves": "consulted only by the CROSS-SHARD-VINDEX-NOT-IN-PK door, which runs on a " +
+		"source a runtime vtgate probe finds sharded; topology is not a static capability",
+	"sync start --notify-router-cpu-util": "inert on a target with no routing layer: Neki router presence is a runtime probe, not a static capability",
+	"sync start --where-strict-collation": "no effect on numeric/byte-exact comparisons: keyed on the --where predicate's shape, not an engine",
+	"restore --apply-concurrency":         "no effect on a single-full restore: keyed on the archive's chain shape (a manifest fact), not an engine",
 	"sync start --copy-fanout-degree": "inert on the ADR-0079 FAST cold-start path, which coldStartFastEligible decides at RUNTIME (resume state, --schema-already-applied, the A0 client-copy fallback); " +
 		"a static engine predicate would WARN on exactly the postgres cold-starts that DO take the serial path and use it",
 

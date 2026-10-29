@@ -66,7 +66,13 @@ package mysql
 // from full-before-match to PK-based — correct, indeed self-healing, for a
 // keyed stream (ADR-0140 §Correctness): the PK form realises "this PK's row
 // becomes <after> / is gone" and corrects a drifted target rather than
-// silently skipping it.
+// silently skipping it. "Keyed stream" means one source orders every change
+// to a PK. A merged multi-shard VStream source whose table's primary vindex is
+// not within its PK breaks that: two shards hold the PK in turn, a late DELETE
+// from the old shard removes the moved row by PK alone (Bug 337). The
+// pipeline's CROSS-SHARD-VINDEX-NOT-IN-PK door refuses that shape unless the
+// operator asserts it away; a full before-image DELETE for merged sources is
+// filed as defence in depth (CROSS-SHARD-MYSQL-FULL-IMAGE-DELETE).
 //
 // # The precondition that self-healing claim rests on (audit 2026-08-05)
 //
