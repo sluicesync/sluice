@@ -3103,6 +3103,20 @@ type LineageVerifier interface {
 	VerifyLineage(ctx context.Context, from Position) error
 }
 
+// ResumeVerifier is the OPTIONAL [CDCReader] surface that runs the whole
+// position check StreamChanges runs on a resume — lineage, retention,
+// anchors — without opening a stream or mutating anything, and returns
+// exactly the error StreamChanges would return for it (nil when the
+// position resumes). Unlike [LineageVerifier] it narrows nothing: it exists
+// so the pipeline can tell, BEFORE it writes to the target, whether a resume
+// will pass. A target on the same MySQL server as its source logs sluice's
+// own control-row writes into the source's GTID executed set, so a write
+// made before the check can make a source rolled back behind the position
+// look caught up, or an emptied one (RESET MASTER) look non-empty.
+type ResumeVerifier interface {
+	VerifyResumable(ctx context.Context, from Position) error
+}
+
 // MultiDatabaseRouter is the OPTIONAL surface a [ChangeApplier]
 // implements to enable per-change target-namespace routing for a
 // multi-database fan-out CDC run (ADR-0074 Phase 1b). The applier stays

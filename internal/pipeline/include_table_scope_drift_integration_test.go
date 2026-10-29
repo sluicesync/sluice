@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"sluicesync.dev/sluice/internal/appliershared"
+	"sluicesync.dev/sluice/internal/engines"
 	"sluicesync.dev/sluice/internal/ir"
 
 	_ "sluicesync.dev/sluice/internal/engines/mysql"
@@ -127,6 +128,28 @@ func (r *scopeDriftRig) addTable(table string, extra ...string) (int, string) {
 	args = append(append(args, "--stream-id="+r.streamID, "--yes"), extra...)
 	stdout, stderr, code := runSluice(r.t, r.bin, args...)
 	return code, stdout + stderr
+}
+
+// stopSync stops a `sync start` the way an operator does before a drained
+// `schema add-table`: `sluice sync stop --wait`, which records the stream's
+// stop. run.end() kills the process (SIGKILL on Linux), which no handler
+// can catch — a crash, after which the record still says running and a
+// drained add-table refuses (DRAINED-ADD-TABLE-STREAM-NOT-STOPPED), by
+// design: a crashed stream and an idle running one read the same. A run
+// that has already exited (a refused start) is only reaped.
+func (r *scopeDriftRig) stopSync(run *straddleBinaryRun) {
+	r.t.Helper()
+	if run.exited() == nil {
+		stdout, stderr, code := runSluice(r.t, r.bin, "sync", "stop", "--wait", "--timeout=120s",
+			"--target-driver="+r.driver, "--target="+r.tgt, "--stream-id="+r.streamID)
+		if code != 0 {
+			r.t.Fatalf("sync stop --wait: exit %d\n%s%s%s", code, stdout, stderr, run.logTail())
+		}
+		if !waitExit(run, 60*time.Second) {
+			r.t.Fatalf("the stopped stream did not exit%s", run.logTail())
+		}
+	}
+	run.end()
 }
 
 // health runs `sync health` and returns its exit code and output.
@@ -271,7 +294,7 @@ func (r *scopeDriftRig) establishKD(tables string) {
 	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
 		r.t.Fatalf("cdc: target kd = %q, want 1|a,2|b%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second) // the source notices the dropped replication connection
 }
 
@@ -307,7 +330,7 @@ func TestIncludeTableScopeDrift_PgoutputWidenedTableRefusedThenAddTableConverges
 	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c,4|d", 60*time.Second); !ok {
 		t.Fatalf("after add-table: target kd = %q, want 1|a,2|b,3|c,4|d%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 
 	// No false refusal: the same scope again, with writes on both tables.
@@ -317,7 +340,7 @@ func TestIncludeTableScopeDrift_PgoutputWidenedTableRefusedThenAddTableConverges
 	if got, ok := r.waitRows(tgt, "nt", "e", "1|x,2|y,3|z,4|w,5|v", 60*time.Second); !ok {
 		t.Fatalf("unchanged restart: target nt = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 
 	// Narrowing is the operator's choice, not a refusal. nt came in by
@@ -336,7 +359,7 @@ func TestIncludeTableScopeDrift_PgoutputWidenedTableRefusedThenAddTableConverges
 	// …and nt's changes are discarded from here on: a write it will never see.
 	r.exec(src, "INSERT INTO nt VALUES (6, 'u')")
 	time.Sleep(3 * time.Second)
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 
 	// Coming back to nt refuses: it stayed in the publication, so only the
@@ -457,7 +480,7 @@ func TestIncludeTableScopeDrift_PgoutputRestartFromScratchRemedy(t *testing.T) {
 	if got, ok := r.waitRows(tgt, "nt", "e", "1|x,2|y,3|z", 60*time.Second); !ok {
 		t.Fatalf("--restart-from-scratch then CDC: target nt = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	// The re-copy recorded nt as established: a plain restart streams on.
 	requireStreaming(t, r.startSync("kd,nt"), 8*time.Second, "plain restart after the re-copy")
@@ -583,7 +606,7 @@ func TestIncludeTableScopeDrift_MySQLFailedAddTableRestartFromScratch(t *testing
 	if got, ok := r.waitRows(tgt, "nt", "e", "1|x,2|y,3|z,4|w,5|v", 60*time.Second); !ok {
 		t.Fatalf("--restart-from-scratch then CDC: target nt = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	if _, out := r.health(); strings.Contains(out, "pending_added_table") {
 		t.Fatalf("the re-copy left the pending record\n%s", out)
@@ -640,7 +663,7 @@ func (r *scopeDriftRig) establishTwo(second, tables string, extra ...string) {
 	// keeps the copied set the anchor recorded (R9b); before R9b it left no
 	// record at all — the CI failure this wait came from.
 	r.waitRecorded(run)
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 }
 
@@ -667,7 +690,7 @@ func (r *scopeDriftRig) narrowThenChange(table, tables string, extra ...string) 
 	}
 	r.exec(r.src, "UPDATE "+table+" SET e = 'Y' WHERE id = 2; DELETE FROM "+table+" WHERE id = 1; INSERT INTO "+table+" VALUES (3, 'z')")
 	time.Sleep(3 * time.Second)
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 }
 
@@ -719,7 +742,7 @@ func TestIncludeTableScopeDrift_MySQLExcludedPendingRefuses(t *testing.T) {
 	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b,3|c", 60*time.Second); !ok {
 		t.Fatalf("--restart-from-scratch then CDC: target kd = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	if code, out := r.health(); code != 1 || !strings.Contains(out, "pending_added_table: nt") {
 		t.Fatalf("a re-copy that did not copy nt cleared its pending record (exit %d)\n%s", code, out)
@@ -1014,7 +1037,7 @@ func TestIncludeTableScopeDrift_MultiDatabaseRemedyIsTheRecopy(t *testing.T) {
 	if got, ok := r.waitRows(r.tgt, "shop_db.kd", "k", "1|b,2|c", 60*time.Second); !ok {
 		t.Fatalf("multi-database cdc: target shop_db.kd = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 
 	r.exec(r.src, "CREATE TABLE source_db.nt (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO source_db.nt VALUES (1, 'x')")
@@ -1159,7 +1182,7 @@ func stagedWaveKeepsTheAddedTable(t *testing.T, r *scopeDriftRig) {
 	if got, ok := r.waitRows(r.tgt, "users", "e", "1|x,2|y", 60*time.Second); !ok {
 		t.Fatalf("the added table stopped streaming on a restart whose --include-table does not name it: target users = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 
 	args := append([]string{"schema", "add-table", "users", "--abandon", "--yes"}, r.connArgs()...)
@@ -1370,7 +1393,7 @@ func stoppedWindowReachesTheAddedTable(t *testing.T, r *scopeDriftRig) {
 			t.Fatalf("restart %d: target users = %q, want %q (source %q) — the changes made to the added table while the "+
 				"stream was stopped never reached the target (Bug 322)%s", round+1, got, w.want, r.rows(r.src, "users", "e"), run.logTail())
 		}
-		run.end()
+		r.stopSync(run)
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -1444,7 +1467,7 @@ func TestIncludeTableScopeDrift_BinlogAddedTableRecopyRemedyConverges(t *testing
 	if got, ok := r.waitRows(tgt, "users", "e", "1|x,2|y2,4|w", 60*time.Second); !ok {
 		t.Fatalf("restart: target users = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	// What an affected stream's target holds: row 4 missing, row 2 stale,
 	// row 3 still present.
@@ -1519,7 +1542,7 @@ func TestIncludeTableScopeDrift_ExcludeOfAnAddedTableRefuses(t *testing.T) {
 	if got, ok := r.waitRows(tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
 		t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	r.exec(src, "CREATE TABLE users (id INT PRIMARY KEY, e VARCHAR(20)); INSERT INTO users VALUES (1, 'x')")
 	if code, out := r.addTable("users"); code != 0 {
@@ -1536,7 +1559,7 @@ func TestIncludeTableScopeDrift_ExcludeOfAnAddedTableRefuses(t *testing.T) {
 	}
 	r.exec(src, "INSERT INTO users VALUES (2, 'y')")
 	time.Sleep(3 * time.Second)
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 
 	r.requireScopeDriftRefusal(r.startSync("", "--exclude-table=other"), "users", scopeDriftReasonDropped)
@@ -1578,8 +1601,20 @@ func liveAddOfAnExcludedTable(t *testing.T, r *scopeDriftRig) {
 	// The add cannot know the stream's flags. It usually completes before the
 	// poll sees it; if the stream's refusal abandons it first, it stops with
 	// PENDING-ADD-SUPERSEDED (R8). Either is correct.
-	if code, out := r.addTable("tmp_keep"); code != 0 && !strings.Contains(out, "PENDING-ADD-SUPERSEDED") {
-		t.Fatalf("schema add-table tmp_keep: exit %d\n%s", code, out)
+	// The drained add against the running stream: a current add-table
+	// refuses that (DRAINED-ADD-TABLE-STREAM-NOT-STOPPED), so the add runs
+	// in-process against mixedVersionTarget — the idle-older-binary state in
+	// which a current add still runs beside the stream and leaves exactly
+	// this record.
+	eng, ok := engines.Get(r.driver)
+	if !ok {
+		t.Fatalf("RIG: engine %q not registered", r.driver)
+	}
+	if err := (&AddTable{
+		Source: eng, Target: mixedVersionTarget(t, eng), SourceDSN: r.src, TargetDSN: r.tgt,
+		StreamID: r.streamID, TableName: "tmp_keep",
+	}).Run(context.Background()); err != nil && !strings.Contains(err.Error(), "PENDING-ADD-SUPERSEDED") {
+		t.Fatalf("schema add-table tmp_keep: %v", err)
 	}
 	r.exec(r.src, "UPDATE tmp_keep SET e = 'changed' WHERE id = 1")
 	requireLiveAddedExcludedRefusal(t, run, "tmp_keep", "stopped when it saw the add", "recorded the table as dropped")
@@ -1663,7 +1698,7 @@ func TestIncludeTableScopeDrift_CorruptRecordRecovers(t *testing.T) {
 	run = r.startSync("kd", "--restart-from-scratch")
 	r.waitRecopyHandedOff(run, "the re-copy over a corrupt record")
 	waitLog(t, run, "does not decode")
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 
 	requireStreaming(t, r.startSync("kd"), 8*time.Second, "plain restart after the re-copy rewrote the record")
@@ -1690,7 +1725,7 @@ func TestIncludeTableScopeDrift_CorruptDroppedSetDoesNotOutliveTheRecopy(t *test
 	}
 	run := r.startSync("", "--restart-from-scratch")
 	r.waitRecopyHandedOff(run, "the re-copy over a corrupt dropped set")
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	if got, _ := r.waitScalar(tgt, `SELECT (COALESCE(dropped_tables, '') LIKE '%all-uncopied%')::text FROM sluice_cdc_state WHERE stream_id = 'itsd'`, "false", 5*time.Second); got != "false" {
 		t.Fatalf("the re-copy left the all-uncopied marker in the dropped set (LIKE = %s)", got)
@@ -1734,7 +1769,7 @@ func (r *scopeDriftRig) renameWhileStopped(sourceDDL, targetDDL string) {
 	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
 		r.t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	r.exec(r.src, sourceDDL)
 	if targetDDL != "" {
@@ -1752,7 +1787,7 @@ func (r *scopeDriftRig) requireRenameFollowed(extra ...string) {
 	if got, ok := r.waitRows(r.tgt, "t8b", "e", "1|x,2|y,3|z", 60*time.Second); !ok {
 		r.t.Fatalf("target t8b = %q after the rename%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	requireStreaming(r.t, r.startSync(""), 8*time.Second, "the next restart, on the record that followed the rename")
 }
@@ -1838,7 +1873,7 @@ func (r *scopeDriftRig) establishPairThenStop(sourceDDL string) {
 	if got, ok := r.waitRows(r.tgt, "kd", "k", "1|a,2|b", 60*time.Second); !ok {
 		r.t.Fatalf("cdc: target kd = %q%s", got, run.logTail())
 	}
-	run.end()
+	r.stopSync(run)
 	time.Sleep(2 * time.Second)
 	r.exec(r.src, sourceDDL)
 }

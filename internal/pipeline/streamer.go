@@ -1801,6 +1801,10 @@ type Streamer struct {
 	// [runLiveness] says when a Run owns the record), discharged when Run
 	// returns. nil outside Run.
 	liveness *runLiveness
+	// attemptStampDeferred: this attempt is a warm resume whose start stamp
+	// waits for the source's position check ([Streamer.phaseStampAttemptStart]).
+	// Per attempt; Run's goroutine only.
+	attemptStampDeferred bool
 
 	// resolvedApplyConcurrency is the per-attempt resolution of the operator's
 	// [ApplyConcurrency] field (ADR-0106, item 31): `0 → auto:N`, `1 → 1`
@@ -2291,6 +2295,14 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 		return s.logDryRunPlan(ctx, streamID, persisted, found)
 	}
 
+	// ---- 3.52. The attempt-start liveness stamp (stream_liveness.go) ----
+	// After the position lookup, before every door that reads pending adds
+	// and before the change stream opens; a warm resume defers it until the
+	// source has confirmed the position resumes.
+	if err := s.phaseStampAttemptStart(ctx, applier, streamID, found); err != nil {
+		return err
+	}
+
 	// ---- 3.55. The persisted unforwarded-schema-change refusal ----
 	// Before ANY change stream opens, on every dispatch branch below: a
 	// refusal a previous run recorded is replayed unless the operator
@@ -2392,6 +2404,11 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 		// coldStart returns (nil, nil) when the source schema is
 		// empty — nothing to do.
 		return nil
+	}
+	// A deferred attempt-start stamp no warm path made before its open
+	// (phaseStampAttemptStart): the open just ran the position check itself.
+	if err := s.stampAfterOpen(ctx, applier, streamID); err != nil {
+		return err
 	}
 
 	// ---- 4b. ADR-0049 Chunk C: prime the applier's active-version

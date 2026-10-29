@@ -464,15 +464,11 @@ func (s *Streamer) phasePrepareControlTable(ctx context.Context, applier ir.Chan
 			// (ARCH-4 — this runs on every retry re-establish).
 			return connectHint(fmt.Errorf("pipeline: clear stop signal: %w", err))
 		}
-		// DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED: the attempt stamps that
-		// the stream is running through its own applier, overwriting the
-		// previous run's stopped marker, before it opens its change stream
-		// (stream_liveness.go). It also lets this applier's position writes
-		// stamp on a control table that only now got the column. A failure
-		// over a recorded stop fails the attempt (stampAttemptStart).
-		if err := s.stampAttemptStart(ctx, applier, streamID); err != nil {
-			return connectHint(err)
-		}
+		// The attempt-start liveness stamp is NOT made here: it waits until
+		// the persisted position has been read and checked
+		// ([Streamer.phaseStampAttemptStart]), because on a target that
+		// shares the source's MySQL server the stamp is itself a
+		// GTID-logged transaction on the source.
 	}
 
 	// ---- 2.6. Record the active stream's resolved slot name on the
@@ -903,6 +899,11 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			if err := s.recordAfterCopyDoor(ctx, applier, streamID, recordKind); err != nil {
 				return nil, func() {}, false, err
 			}
+		}
+		// The deferred attempt-start stamp, now that every refusal door has
+		// passed and before the reader opens (phaseStampAttemptStart).
+		if err := s.stampBeforeWarmResume(ctx, applier, streamID, persisted); err != nil {
+			return nil, func() {}, false, err
 		}
 		changes, stop, err = s.warmResume(streamCtx, persisted)
 		warmResumed = err == nil
