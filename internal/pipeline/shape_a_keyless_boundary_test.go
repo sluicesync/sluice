@@ -43,6 +43,14 @@ func TestFirstBoundaryWitness_ShapeAKeylessBoundary(t *testing.T) {
 		}
 		w.keylessBoundaries = true
 
+		// A source column already named like the discriminator: refused, as
+		// InjectShardColumn refuses it. Matching would let the applier's
+		// shard stamp overwrite the source's own column on every row.
+		_, err := w.verdict(ctx, keylessProjection(wcol("ts", dt(6)), wcol("src_shard", ir.Integer{Width: 32})), ir.Position{}, nil)
+		if err == nil || !strings.Contains(err.Error(), `already has a column named "src_shard"`) {
+			t.Errorf("%s→%s: keyless boundary carrying its own src_shard: err = %v; want the column-collision refusal", pair[0], pair[1], err)
+		}
+
 		v, err := w.verdict(ctx, keylessProjection(wcol("ts", dt(6))), ir.Position{}, nil)
 		if err != nil || v.kind != witnessMatch {
 			t.Errorf("%s→%s: the keyless projection of an unchanged table: verdict = %d, %v (%s); want match",

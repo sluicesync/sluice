@@ -79,23 +79,54 @@ func InjectShardColumn(s *ir.Schema, name string, valueType ir.Type) (*ir.Schema
 				tbl.Name, tbl.Name, tbl.Name,
 			)
 		}
-		// Reject the silent-collision case where the operator's source
-		// schema *already* has a column named `name` — stamping over
-		// it would either redefine a real source column or shadow it
-		// to the operator's confusion. Both flavours are operator
-		// error; refuse with a recovery suggestion.
-		if existing := findColumn(tbl, name); existing != nil {
-			return nil, fmt.Errorf(
-				"translate: InjectShardColumn: table %q already has a column named %q — "+
-					"`--inject-shard-column %s=…` would collide with the existing source column. "+
-					"Recovery: pick a different discriminator column name, "+
-					"or rename the source column out of the way",
-				tbl.Name, name, name,
-			)
+		if err := shardColumnCollision(tbl, name); err != nil {
+			return nil, err
 		}
 		out.Tables[i] = rewriteTableForShard(tbl, name, valueType)
 	}
 	return out, nil
+}
+
+// AppendShardColumn is [InjectShardColumn] for ONE table whose primary key
+// the caller does not know — a schema boundary projected without a key (a
+// VStream FIELD event). It appends the same discriminator column and leaves
+// the key alone, and it keeps InjectShardColumn's column-collision refusal:
+// a source column already named `name` would otherwise be overwritten by the
+// shard value on every row the applier stamps. It does not refuse for a
+// missing key, which is the caller's reason for calling it.
+func AppendShardColumn(tbl *ir.Table, name string, valueType ir.Type) (*ir.Table, error) {
+	if tbl == nil {
+		return nil, errors.New("translate: AppendShardColumn: table is nil")
+	}
+	if name == "" {
+		return nil, errors.New("translate: AppendShardColumn: column name is empty")
+	}
+	if err := shardColumnCollision(tbl, name); err != nil {
+		return nil, err
+	}
+	out := *tbl
+	out.Columns = append(append(make([]*ir.Column, 0, len(tbl.Columns)+1), tbl.Columns...), &ir.Column{
+		Name: name, Type: valueType, Nullable: false, SluiceInjected: true,
+	})
+	return &out, nil
+}
+
+// shardColumnCollision rejects the silent-collision case where the
+// operator's source schema *already* has a column named `name` — stamping
+// over it would either redefine a real source column or shadow it to the
+// operator's confusion. Both flavours are operator error; refuse with a
+// recovery suggestion.
+func shardColumnCollision(tbl *ir.Table, name string) error {
+	if existing := findColumn(tbl, name); existing == nil {
+		return nil
+	}
+	return fmt.Errorf(
+		"translate: InjectShardColumn: table %q already has a column named %q — "+
+			"`--inject-shard-column %s=…` would collide with the existing source column. "+
+			"Recovery: pick a different discriminator column name, "+
+			"or rename the source column out of the way",
+		tbl.Name, name, name,
+	)
 }
 
 // rewriteTableForShard returns a copy of tbl with the discriminator

@@ -242,3 +242,26 @@ func TestInjectShardColumn_CarriesSequences(t *testing.T) {
 		t.Errorf("Views not carried through: %+v", out.Views)
 	}
 }
+
+// TestAppendShardColumn pins the keyless variant: the discriminator is
+// appended with InjectShardColumn's shape, the key is left alone, the input
+// is not mutated, and a source column already named like the discriminator
+// refuses exactly as InjectShardColumn refuses it.
+func TestAppendShardColumn(t *testing.T) {
+	tbl := &ir.Table{Name: "xt", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	out, err := AppendShardColumn(tbl, "src_shard", ir.Varchar{Length: 64})
+	if err != nil {
+		t.Fatalf("AppendShardColumn: %v", err)
+	}
+	if len(out.Columns) != 2 || out.Columns[1].Name != "src_shard" || !out.Columns[1].SluiceInjected || out.Columns[1].Nullable {
+		t.Fatalf("appended column = %+v; want a NOT NULL SluiceInjected src_shard last", out.Columns)
+	}
+	if out.PrimaryKey != nil || len(tbl.Columns) != 1 {
+		t.Fatalf("key = %v, input columns = %d; want no key and an untouched input", out.PrimaryKey, len(tbl.Columns))
+	}
+	tbl.Columns = append(tbl.Columns, &ir.Column{Name: "src_shard", Type: ir.Integer{Width: 32}})
+	if _, err := AppendShardColumn(tbl, "src_shard", ir.Varchar{Length: 64}); err == nil ||
+		!strings.Contains(err.Error(), `already has a column named "src_shard"`) {
+		t.Fatalf("collision: err = %v; want the InjectShardColumn collision refusal", err)
+	}
+}
