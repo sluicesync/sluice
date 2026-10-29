@@ -434,18 +434,28 @@ func (w *firstBoundaryWitness) expected(post *ir.Table) (*ir.Table, error) {
 		// every Shape A stream from a PlanetScale/Vitess source stopped at
 		// its first change (measured on vttestserver, v0.163.10). The
 		// discriminator's key fold exists to build the CREATE's composite
-		// key; this comparison is column by column, so the boundary gets the
-		// discriminator column appended and no key. Scoped to keyless-
-		// boundary sources: on a lane whose boundaries carry the key
-		// (binlog, pgoutput) a keyless boundary is a source that lost its
-		// key, and InjectShardColumn's refusal below still stands for it.
-		// A VStream source's key was never judged at a boundary, Shape A
-		// or not, because it is never there to judge.
-		keyless := *post
-		keyless.Columns = append(append([]*ir.Column(nil), post.Columns...), &ir.Column{
-			Name: w.shardColumn, Type: ir.Varchar{Length: 64}, SluiceInjected: true,
-		})
-		schema = &ir.Schema{Tables: []*ir.Table{&keyless}}
+		// key, so the boundary gets the discriminator column appended and no
+		// key (translate.AppendShardColumn, which keeps InjectShardColumn's
+		// refusal of a source column already carrying the discriminator's
+		// name — without it the applier's shard stamp would overwrite that
+		// column on every row). Scoped to keyless-boundary sources: on a
+		// lane whose boundaries carry the key (binlog, pgoutput) a keyless
+		// boundary is a source that lost its key, and InjectShardColumn's
+		// refusal below still stands for it.
+		//
+		// What this comparison cannot see on a VStream source is the key
+		// itself. A key dropped while the stream was stopped is caught by
+		// UNIQUE-KEY-STOPPED-WINDOW-DOOR at the next start (it compares the
+		// two catalogs). A key dropped MID-stream on a table whose only key
+		// is its primary key is not re-checked on VStream (unique_key_door.go
+		// re-checks tables with a unique key besides the primary key), the
+		// same exposure a single-stream VStream sync already has; filed as
+		// VSTREAM-PK-ONLY-MIDSTREAM-KEY-DROP.
+		keyless, err := translate.AppendShardColumn(post, w.shardColumn, ir.Varchar{Length: 64})
+		if err != nil {
+			return nil, fmt.Errorf("inject the shard column into %q: %w", post.Name, err)
+		}
+		schema = &ir.Schema{Tables: []*ir.Table{keyless}}
 	} else if w.shardColumn != "" {
 		var err error
 		schema, err = translate.InjectShardColumn(schema, w.shardColumn, ir.Varchar{Length: 64})

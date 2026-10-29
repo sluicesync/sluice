@@ -54,6 +54,13 @@ other eighteen.
 
 ---
 
+## 2026-10-28 — SHAPE-A-KEYLESS-BOUNDARY: found while measuring the Bugs 337/338 remedy
+
+Indexed when filed (no audit pass).
+
+- SHAPE-A-KEYLESS-BOUNDARY filed
+- VSTREAM-PK-ONLY-MIDSTREAM-KEY-DROP filed
+
 ## 2026-10-18 — Bug 321 (INCLUDE-TABLE-SCOPE-DRIFT): residuals named by its fourth review
 
 Indexed when filed. Residuals named while fixing Bug 321 (no audit pass).

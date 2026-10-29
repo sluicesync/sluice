@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows [Keep a Chan
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--inject-shard-column` from a PlanetScale/Vitess source no longer stops at the first change (`SHAPE-A-KEYLESS-BOUNDARY`, loud, pre-existing).** A VStream schema boundary carries the table's columns and no key, and the consolidated-target check refused it for having no primary key ("InjectShardColumn: table … has no primary key"), with or without `--no-coordinate-live-ddl`, so every Shape A stream from a VStream source exited at its first CDC change. The check now compares such a boundary's columns with the discriminator column added, and still refuses a source column that already carries the discriminator's name. On a binlog or Postgres source, whose boundaries carry the key, a boundary without one still refuses.
+
+### Not closed
+
+- **A primary key dropped mid-stream on a PlanetScale/Vitess table whose only key is its primary key is not re-checked (`VSTREAM-PK-ONLY-MIDSTREAM-KEY-DROP`).** The VStream boundary carries no key, and the mid-stream unique-key re-check covers only tables with a unique key besides the primary key. A key dropped while the stream is stopped is caught at the next start (`UNIQUE-KEY-STOPPED-WINDOW-DOOR`). Single-stream and `--inject-shard-column` streams share this; filed.
+
 ## [0.163.10] - 2026-10-23
 
 ### Fixed
