@@ -1782,18 +1782,21 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
-		if err != nil {
-			return false, err
-		}
-		// The primary key decides which SET entries the builder may leave
-		// out ([dropUnchangedKeyColumns], GC-41 (e)). Cached after the first
-		// change per table, like the insert arm's lookup.
+		// The primary key decides what the WHERE compares
+		// ([appliershared.KeyPredicate], Bug 339) and which SET entries the
+		// builder may leave out ([dropUnchangedKeyColumns], GC-41 (e)).
+		// Cached after the first change per table, like the insert arm's
+		// lookup.
 		pk, err := a.pkFor(ctx, tx, schema, v.Table)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, pk, colTypes)
+		before := appliershared.KeyPredicate(v.Before, pk, colTypes, nil)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, before, v.After, pk, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1811,7 +1814,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// below reads the UPDATE's diagnostics area: logZeroRowsAffected and
 		// checkKeyScopedResult read only the driver-cached rows-affected count
 		// (rowAddressFor's key probe ran on the pool, before the UPDATE).
-		if err := checkKeyScopedResult("update", schema, v.Table, v.Before, res); err != nil {
+		if err := checkKeyScopedResult("update", schema, v.Table, before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
@@ -1826,11 +1829,16 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		pk, err := a.pkFor(ctx, tx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
+		}
+		before := appliershared.KeyPredicate(v.Before, pk, colTypes, nil)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, before, colTypes)
 		if err != nil {
 			return false, err
 		}
-		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, v.Before, colTypes)
+		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, before, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1839,7 +1847,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("mysql: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
-		if err := checkKeyScopedResult("delete", schema, v.Table, v.Before, res); err != nil {
+		if err := checkKeyScopedResult("delete", schema, v.Table, before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)

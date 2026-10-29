@@ -62,8 +62,9 @@ func (e *keyScopedMultiMatchError) Terminal() bool            { return true }
 func (e *keyScopedMultiMatchError) SourceTxSplitNote() string { return keyScopedMultiMatchSplitNote }
 
 // RefuseKeyScopedMultiMatch builds the loud refusal for an UPDATE or DELETE
-// whose WHERE predicate — the change's before-image, which the source
-// readers narrow to the row's identity key — matched `matched` > 1 rows on
+// whose WHERE predicate — the change's before-image, narrowed to the
+// target's primary key by [KeyPredicate] (and by the binlog and pgoutput
+// readers before it) — matched `matched` > 1 rows on
 // the target (GC-42).
 //
 // A key-scoped write that touches two rows has, by construction, touched a

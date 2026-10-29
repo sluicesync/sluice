@@ -30,6 +30,17 @@ package pipeline
 // updated right after the ALTER therefore ends at its updated value, never
 // at the backfilled one — pinned by the update-after-ALTER cells.
 //
+// The first half of that argument rests on a premise about the APPLIER: the
+// replay of a change committed before T must still land, although its
+// before-image holds the added column's DEFAULT and the target now holds the
+// backfilled value. It lands only because every UPDATE/DELETE WHERE compares
+// the primary key, not the whole image ([appliershared.KeyPredicate]). Until
+// Bug 339 the VStream lanes compared the whole image, the replay matched no
+// row, and every column that UPDATE changed — and every later change of the
+// row, a DELETE included — was dropped at exit 0. Pinned by
+// TestStreamer_AddColumnBackfill_StaleBeforeImage_VStream and, for the
+// appliers, TestChangeApplier_StaleFullBeforeImage_AppliesByKey.
+//
 // Default-on, opt-out: [Streamer.SuppressAddedColumnBackfill] is the only
 // way to skip it, so every construction that is not the CLI gets it.
 //

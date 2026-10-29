@@ -2024,11 +2024,15 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
 		}
-		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		before, err := a.keyPredicateFor(ctx, schema, v.Table, v.Before, colTypes, shardKeys)
 		if err != nil {
 			return false, err
 		}
-		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, colTypes, shardKeys)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, before, v.After, colTypes, shardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -2052,7 +2056,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
 		}
-		if err := checkKeyScopedResult("update", schema, v.Table, v.Before, res); err != nil {
+		if err := checkKeyScopedResult("update", schema, v.Table, before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
@@ -2067,11 +2071,21 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		// The routing columns stay in a sharded Neki target's WHERE, so the
+		// DELETE still reaches the row's shard (nil on every other target).
+		shardKeys, err := a.shardKeyColumnsFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
+		}
+		before, err := a.keyPredicateFor(ctx, schema, v.Table, v.Before, colTypes, shardKeys)
 		if err != nil {
 			return false, err
 		}
-		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, v.Before, colTypes)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, before, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
@@ -2081,7 +2095,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
-		if err := checkKeyScopedResult("delete", schema, v.Table, v.Before, res); err != nil {
+		if err := checkKeyScopedResult("delete", schema, v.Table, before, res); err != nil {
 			return false, err
 		}
 		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)

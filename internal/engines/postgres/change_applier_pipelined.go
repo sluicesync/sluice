@@ -340,11 +340,15 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
 		}
-		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		before, err := a.keyPredicateFor(ctx, schema, v.Table, v.Before, colTypes, shardKeys)
 		if err != nil {
 			return false, err
 		}
-		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, v.Before, v.After, colTypes, shardKeys)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildUpdateSQL(addr, schema, v.Table, before, v.After, colTypes, shardKeys)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -355,7 +359,7 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		}
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
 		b.queue(stmt, args,
-			queuedStmt{schema: schema, table: v.Table, kind: "update", keyScoped: guardKeyScopedWrite("update", v.Before)})
+			queuedStmt{schema: schema, table: v.Table, kind: "update", keyScoped: guardKeyScopedWrite("update", before)})
 		return false, nil
 
 	case ir.Delete:
@@ -367,16 +371,26 @@ func (a *ChangeApplier) dispatchPipelined(ctx context.Context, b *pgxBatchTx, st
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		addr, err := a.rowAddressFor(ctx, schema, v.Table, v.Before, colTypes)
+		// The routing columns stay in a sharded Neki target's WHERE, so the
+		// DELETE still reaches the row's shard (nil on every other target).
+		shardKeys, err := a.shardKeyColumnsFor(ctx, schema, v.Table)
+		if err != nil {
+			return false, fmt.Errorf("postgres: applier: resolve shard key for %s.%s: %w", schema, v.Table, err)
+		}
+		before, err := a.keyPredicateFor(ctx, schema, v.Table, v.Before, colTypes, shardKeys)
 		if err != nil {
 			return false, err
 		}
-		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, v.Before, colTypes)
+		addr, err := a.rowAddressFor(ctx, schema, v.Table, before, colTypes)
+		if err != nil {
+			return false, err
+		}
+		stmt, args, err := buildDeleteSQL(addr, schema, v.Table, before, colTypes)
 		if err != nil {
 			return false, fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
 		a.noteUnenforcedDeferrable(ctx, schema, v.Table)
-		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete", keyScoped: guardKeyScopedWrite("delete", v.Before)})
+		b.queue(stmt, args, queuedStmt{schema: schema, table: v.Table, kind: "delete", keyScoped: guardKeyScopedWrite("delete", before)})
 		return false, nil
 
 	case ir.Truncate:

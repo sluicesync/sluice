@@ -33,9 +33,13 @@ func TestChangeApplier_Apply_JSONColumnUnderReplicaIdentityFull(t *testing.T) {
 	dsn, cleanup := startPostgresForApplier(t)
 	defer cleanup()
 
+	// Keyless on purpose: on a keyed target the applier narrows the WHERE to
+	// the primary key ([appliershared.KeyPredicate], Bug 339), so the json
+	// column would never reach it. A keyless table's whole-row WHERE is the
+	// path that still compares a json column.
 	applyPGApplier(t, dsn, `
 		CREATE TABLE json_under_full (
-			id   BIGINT PRIMARY KEY,
+			id   BIGINT NOT NULL,
 			doc  JSON   NOT NULL,
 			lbl  TEXT   NOT NULL
 		);

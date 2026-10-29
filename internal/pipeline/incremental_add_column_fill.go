@@ -43,7 +43,11 @@ package pipeline
 //   - r changed or was deleted AFTER the window's end but before the read:
 //     the fill carries the newer value (or nothing, for a deleted row). The
 //     NEXT link replays that change with its own image of c, so the chain as
-//     a whole restores the source exactly; a restore that stops at THIS link
+//     a whole restores the source exactly — because the applier addresses
+//     the replayed change by primary key, not by its before-image, whose c
+//     is the older value ([appliershared.KeyPredicate]; before Bug 339 a
+//     chain captured from a VStream source carried full before-images and
+//     that replay matched no row); a restore that stops at THIS link
 //     holds r's newer c a link early. Named, not hidden: a chain has no
 //     point-in-time stop inside a link, and the restored tip converges the
 //     moment the next link or a resumed sync replays.
