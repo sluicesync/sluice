@@ -57,6 +57,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,6 +168,15 @@ func TestVitessReshard_SnapshotTailSkew_EveryShardDelivers(t *testing.T) {
 	windowWG.Wait()
 	t.Logf("copy delivered %d rows; window commits %v", copied, win.commits)
 	win.requireShape(t, logs.String())
+	// PHASEA-DEBUG (Bug 334 CI triage): watch each small shard's window row
+	// reach its final source value on the tail.
+	for _, sh := range tskShards[:2] {
+		var v int64
+		if err := shardDB[sh].QueryRowContext(ctx, "SELECT v FROM "+tskTable+" WHERE id = ?", smallIDs[sh]).Scan(&v); err != nil {
+			t.Fatalf("PHASEA: read final window value on %q: %v", sh, err)
+		}
+		target.watch(smallIDs[sh], v)
+	}
 
 	// Markers: one INSERT per shard per round, rounds a few seconds apart,
 	// so every shard has writes after the copy (the real-cluster check's
@@ -190,6 +200,8 @@ func TestVitessReshard_SnapshotTailSkew_EveryShardDelivers(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	markerRound(0)
 
+	tailOpenAt := time.Now()
+	tailOpenBytes := tskProxyDownBytes.Load()
 	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
 		t.Fatalf("StreamChanges: %v", err)
@@ -222,6 +234,33 @@ func TestVitessReshard_SnapshotTailSkew_EveryShardDelivers(t *testing.T) {
 	deadline := lastCommit.Add(tskArrivalBudget)
 	for time.Now().Before(deadline) && target.arrivedCount(committedAt) < len(committedAt) {
 		time.Sleep(250 * time.Millisecond)
+	}
+	// PHASEA-DEBUG: keep waiting (forensics only) so the eventual arrival
+	// of a late marker is recorded, then dump the timeline.
+	for extra := time.Now().Add(150 * time.Second); time.Now().Before(extra) && target.arrivedCount(committedAt) < len(committedAt); {
+		time.Sleep(250 * time.Millisecond)
+	}
+	{
+		var b strings.Builder
+		fmt.Fprintf(&b, "PHASEA timeline: tail opened %s; proxy down bytes at tail open %d, now %d; tail changes %d\n",
+			tailOpenAt.Format(time.RFC3339Nano), tailOpenBytes, tskProxyDownBytes.Load(), target.tailChanges())
+		for _, sh := range tskShards[:2] {
+			at, ok := target.reached(smallIDs[sh])
+			fmt.Fprintf(&b, "  window %s (%d commits): drained=%v at %s (+%s after tail open)\n",
+				sh, win.commits[sh], ok, at.Format(time.RFC3339Nano), at.Sub(tailOpenAt))
+		}
+		ids := make([]int64, 0, len(committedAt))
+		for id := range committedAt {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		for _, id := range ids {
+			at, ok := target.arrivedAt(id)
+			fmt.Fprintf(&b, "  marker %s:%d committed %s arrived=%v %s latency %s (+%s after tail open)\n",
+				markerShard[id], id, committedAt[id].Format(time.RFC3339Nano), ok, at.Format(time.RFC3339Nano),
+				at.Sub(committedAt[id]), at.Sub(tailOpenAt))
+		}
+		t.Log(b.String())
 	}
 	perShard := map[string]string{}
 	late := []string{}
@@ -461,6 +500,9 @@ func (w *tskWindow) requireShape(t *testing.T, logs string) {
 // proxy uses).
 const tskDownstreamBytesPerSec = 512 << 10
 
+// tskProxyDownBytes is PHASEA-DEBUG: total vtgate->sluice bytes.
+var tskProxyDownBytes atomic.Int64
+
 // startTskProxy is a pass-through TCP proxy to target whose downstream
 // (vtgate → sluice) direction is throttled to tskDownstreamBytesPerSec.
 func startTskProxy(t *testing.T, target string) net.Listener {
@@ -517,6 +559,7 @@ func tskThrottledCopy(dst io.Writer, src io.Reader) {
 				return
 			}
 			sent += int64(n)
+			tskProxyDownBytes.Add(int64(n))
 			due := start.Add(time.Duration(float64(sent) / tskDownstreamBytesPerSec * float64(time.Second)))
 			if d := time.Until(due); d > 0 {
 				time.Sleep(d)
@@ -606,6 +649,40 @@ type tskTarget struct {
 	mu      sync.Mutex
 	rows    map[int64]int64
 	arrived map[int64]time.Time
+
+	// PHASEA-DEBUG
+	watched   map[int64]int64
+	reachedAt map[int64]time.Time
+	nTail     int
+}
+
+// PHASEA-DEBUG
+func (tg *tskTarget) watch(id, v int64) {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	if tg.watched == nil {
+		tg.watched = map[int64]int64{}
+		tg.reachedAt = map[int64]time.Time{}
+	}
+	tg.watched[id] = v
+	if got, ok := tg.rows[id]; ok && got >= v {
+		tg.reachedAt[id] = time.Now()
+	}
+}
+
+// PHASEA-DEBUG
+func (tg *tskTarget) reached(id int64) (time.Time, bool) {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	at, ok := tg.reachedAt[id]
+	return at, ok
+}
+
+// PHASEA-DEBUG
+func (tg *tskTarget) tailChanges() int {
+	tg.mu.Lock()
+	defer tg.mu.Unlock()
+	return tg.nTail
 }
 
 func (tg *tskTarget) put(t *testing.T, row ir.Row) {
@@ -618,11 +695,19 @@ func (tg *tskTarget) put(t *testing.T, row ir.Row) {
 	}
 	tg.mu.Lock()
 	tg.rows[id] = v
+	if want, ok := tg.watched[id]; ok && v >= want {
+		if _, done := tg.reachedAt[id]; !done {
+			tg.reachedAt[id] = time.Now()
+		}
+	}
 	tg.mu.Unlock()
 }
 
 func (tg *tskTarget) apply(t *testing.T, ch ir.Change) {
 	t.Helper()
+	tg.mu.Lock()
+	tg.nTail++
+	tg.mu.Unlock()
 	switch c := ch.(type) {
 	case ir.Insert:
 		tg.put(t, c.Row)
