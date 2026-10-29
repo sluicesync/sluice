@@ -54,6 +54,13 @@ other eighteen.
 
 ---
 
+## 2026-10-28 — Extended-suites reshard leg: two failures that are not Bug 334
+
+Indexed when filed. Found triaging the Bug 334 Extended run (no audit pass).
+
+- VSTREAM-RESHARD-RESTART-SCHEMA-READ-TERMINAL filed
+- RESHARD-HARNESS-SWITCHTRAFFIC-DURING-COPY filed
+
 ## 2026-10-18 — Bug 321 (INCLUDE-TABLE-SCOPE-DRIFT): residuals named by its fourth review
 
 Indexed when filed. Residuals named while fixing Bug 321 (no audit pass).

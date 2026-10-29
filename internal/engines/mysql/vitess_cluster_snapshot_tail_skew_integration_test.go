@@ -30,9 +30,30 @@
 // -40 4/4 markers, the other shards 0/4, vtgate logging "Skew found,
 // laggard is commerce/-40" for the tail it opened with minimize_skew=true.
 //
-// THE ORACLE: one INSERT on EVERY shard every few seconds after the copy;
-// every one must reach the stream within 30s of its commit, and the
-// stream-applied target must then equal the source exactly (read back
+// THE ORACLE measures a STALL, not catch-up speed. A rewound shard's tail
+// must first re-deliver its held window through the same throttled proxy,
+// so a marker behind it waits for the window however healthy the tail is,
+// and how big the window gets is a property of the runner. Measured on CI
+// (Extended run 40809348648, Phase-A instrumentation): unpaced windows of
+// 2,036 and 9,073 commits, ~11 MB of tail at the proxy's 512 KiB/s, so
+// 40-80's window drained 21.0s after the tail opened and all four of its
+// markers landed in that same millisecond (per-shard order: they queue
+// behind the window), with every big-shard marker delayed ~13s by the
+// shared pipe and no vtgate "Skew found" on the tail. A desktop commits a
+// tenth as many window rows and drains them in milliseconds. Run
+// 40777503295's 10,267-commit window pushed 40-80's markers past a flat
+// 30s-from-commit budget, a catch-up delay misread as a hold. So:
+//   - each small shard's held window must reach the stream (the window
+//     row's final source value lands on the target) within
+//     tskWindowDrainBudget of the tail opening, which a hold never does —
+//     it freezes the held shard on the window's first event;
+//   - one INSERT on EVERY shard every few seconds after the copy must
+//     reach the stream within tskArrivalBudget of the LATER of its commit
+//     and its shard's window drain (a big shard has no window, so its
+//     clock is its commit);
+//   - the window writer is paced (tskWindowCommitEvery), which bounds the
+//     window at a size any runner re-delivers well inside the budgets.
+// Then the stream-applied target must equal the source exactly (read back
 // through vtgate, never from sluice's state). The rig proves its own shape
 // first ([tskWindow.requireShape]): both small shards finished and took
 // their windows while the copy still had seconds to run, so a run where the
@@ -57,7 +78,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,9 +93,25 @@ const (
 	// whatever the hash vindex would pick; the seed ids stay far below.
 	tskMarkerBase = int64(50_000_000)
 
-	// tskArrivalBudget is the per-marker deadline: a marker committed on
-	// any shard must reach the stream within this long.
+	// tskArrivalBudget is the per-marker deadline: a marker must reach the
+	// stream within this long of the later of its commit and its shard's
+	// held-window drain.
 	tskArrivalBudget = 30 * time.Second
+
+	// tskWindowDrainBudget bounds how long after the tail opens each small
+	// shard's held window may take to reach the stream. Under the Bug 334
+	// hold the window never drains (vtgate's skew timeout is 10 minutes);
+	// the paced window is a few hundred to ~1,500 commits.
+	tskWindowDrainBudget = 90 * time.Second
+
+	// tskWindowCommitEvery paces the window writer to at most one commit
+	// per interval per shard. Unpaced, a Linux runner commits ~500/s and
+	// the held window grew to 9-10k commits (runs 40777503295,
+	// 40809348648), so the test measured how fast the throttled proxy
+	// replays a backlog instead of whether a shard is held. Paced, the
+	// windows are ~150 and ~600-1,000 commits (measured locally: 150/656,
+	// 141/571).
+	tskWindowCommitEvery = 20 * time.Millisecond
 )
 
 // tskShards is the four-shard layout; the first two are the small,
@@ -168,12 +204,12 @@ func TestVitessReshard_SnapshotTailSkew_EveryShardDelivers(t *testing.T) {
 	windowWG.Wait()
 	t.Logf("copy delivered %d rows; window commits %v", copied, win.commits)
 	win.requireShape(t, logs.String())
-	// PHASEA-DEBUG (Bug 334 CI triage): watch each small shard's window row
-	// reach its final source value on the tail.
+	// A held window has reached the stream when its row's final source
+	// value lands on the target.
 	for _, sh := range tskShards[:2] {
 		var v int64
 		if err := shardDB[sh].QueryRowContext(ctx, "SELECT v FROM "+tskTable+" WHERE id = ?", smallIDs[sh]).Scan(&v); err != nil {
-			t.Fatalf("PHASEA: read final window value on %q: %v", sh, err)
+			t.Fatalf("read the final window value on %q: %v", sh, err)
 		}
 		target.watch(smallIDs[sh], v)
 	}
@@ -201,7 +237,6 @@ func TestVitessReshard_SnapshotTailSkew_EveryShardDelivers(t *testing.T) {
 	markerRound(0)
 
 	tailOpenAt := time.Now()
-	tailOpenBytes := tskProxyDownBytes.Load()
 	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
 		t.Fatalf("StreamChanges: %v", err)
@@ -225,67 +260,70 @@ func TestVitessReshard_SnapshotTailSkew_EveryShardDelivers(t *testing.T) {
 		markerRound(r)
 	}
 
-	var lastCommit time.Time
+	// Wait until every window drained and every marker arrived, or until
+	// the last deadline any of them could have.
+	waitEnd := tailOpenAt.Add(tskWindowDrainBudget + tskArrivalBudget)
 	for _, at := range committedAt {
-		if at.After(lastCommit) {
-			lastCommit = at
+		if end := at.Add(tskArrivalBudget); end.After(waitEnd) {
+			waitEnd = end
 		}
 	}
-	deadline := lastCommit.Add(tskArrivalBudget)
-	for time.Now().Before(deadline) && target.arrivedCount(committedAt) < len(committedAt) {
+	for time.Now().Before(waitEnd) && (target.arrivedCount(committedAt) < len(committedAt) || !target.allReached()) {
 		time.Sleep(250 * time.Millisecond)
 	}
-	// PHASEA-DEBUG: keep waiting (forensics only) so the eventual arrival
-	// of a late marker is recorded, then dump the timeline.
-	for extra := time.Now().Add(150 * time.Second); time.Now().Before(extra) && target.arrivedCount(committedAt) < len(committedAt); {
-		time.Sleep(250 * time.Millisecond)
+
+	var stalled []string
+	var timeline strings.Builder
+	drainedAt := map[string]time.Time{}
+	for _, sh := range tskShards[:2] {
+		at, ok := target.reached(smallIDs[sh])
+		if !ok || at.Sub(tailOpenAt) > tskWindowDrainBudget {
+			stalled = append(stalled, fmt.Sprintf("window %s (%d commits) did not reach the stream within %s of the tail opening", sh, win.commits[sh], tskWindowDrainBudget))
+			fmt.Fprintf(&timeline, "  window %s (%d commits): not drained within the budget\n", sh, win.commits[sh])
+			continue
+		}
+		drainedAt[sh] = at
+		fmt.Fprintf(&timeline, "  window %s (%d commits): drained %s after the tail opened\n", sh, win.commits[sh], at.Sub(tailOpenAt))
 	}
-	{
-		var b strings.Builder
-		fmt.Fprintf(&b, "PHASEA timeline: tail opened %s; proxy down bytes at tail open %d, now %d; tail changes %d\n",
-			tailOpenAt.Format(time.RFC3339Nano), tailOpenBytes, tskProxyDownBytes.Load(), target.tailChanges())
-		for _, sh := range tskShards[:2] {
-			at, ok := target.reached(smallIDs[sh])
-			fmt.Fprintf(&b, "  window %s (%d commits): drained=%v at %s (+%s after tail open)\n",
-				sh, win.commits[sh], ok, at.Format(time.RFC3339Nano), at.Sub(tailOpenAt))
-		}
-		ids := make([]int64, 0, len(committedAt))
-		for id := range committedAt {
-			ids = append(ids, id)
-		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		for _, id := range ids {
-			at, ok := target.arrivedAt(id)
-			fmt.Fprintf(&b, "  marker %s:%d committed %s arrived=%v %s latency %s (+%s after tail open)\n",
-				markerShard[id], id, committedAt[id].Format(time.RFC3339Nano), ok, at.Format(time.RFC3339Nano),
-				at.Sub(committedAt[id]), at.Sub(tailOpenAt))
-		}
-		t.Log(b.String())
+	ids := make([]int64, 0, len(committedAt))
+	for id := range committedAt {
+		ids = append(ids, id)
 	}
-	perShard := map[string]string{}
-	late := []string{}
-	for _, sh := range tskShards {
-		got := 0
-		for id, s := range markerShard {
-			if s != sh {
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	perShard := map[string]int{}
+	for _, id := range ids {
+		sh := markerShard[id]
+		clock := committedAt[id]
+		if _, small := smallIDs[sh]; small {
+			d, ok := drainedAt[sh]
+			if !ok {
+				fmt.Fprintf(&timeline, "  marker %s:%d: its shard's window did not drain within the budget\n", sh, id)
+				stalled = append(stalled, fmt.Sprintf("marker %s:%d (window held)", sh, id))
 				continue
 			}
-			at, ok := target.arrivedAt(id)
-			if ok && at.Sub(committedAt[id]) <= tskArrivalBudget {
-				got++
-				continue
+			if d.After(clock) {
+				clock = d
 			}
-			late = append(late, fmt.Sprintf("%s:%d", sh, id))
 		}
-		perShard[sh] = fmt.Sprintf("%d/%d", got, rounds)
+		at, ok := target.arrivedAt(id)
+		switch {
+		case !ok:
+			fmt.Fprintf(&timeline, "  marker %s:%d: never arrived\n", sh, id)
+			stalled = append(stalled, fmt.Sprintf("marker %s:%d", sh, id))
+		case at.Sub(clock) > tskArrivalBudget:
+			fmt.Fprintf(&timeline, "  marker %s:%d: arrived %s after its clock (commit or window drain)\n", sh, id, at.Sub(clock))
+			stalled = append(stalled, fmt.Sprintf("marker %s:%d", sh, id))
+		default:
+			perShard[sh]++
+			fmt.Fprintf(&timeline, "  marker %s:%d: arrived %s after its clock\n", sh, id, at.Sub(clock))
+		}
 	}
-	if len(late) > 0 {
-		sort.Strings(late)
-		t.Fatalf("markers did not reach the CDC tail within %s of their commit (per shard %v; late %v) — "+
-			"the snapshot tail stalled behind vtgate's skew hold (Bug 334).\nsluice logs:\n%s\nvtgate skew lines:\n%s",
-			tskArrivalBudget, perShard, late, tskVStreamLines(logs.String()), tskVtgateSkewLines(c))
+	if len(stalled) > 0 {
+		t.Fatalf("the snapshot tail stalled (Bug 334): %s.\nper-shard markers on time %v of %d\ntimeline:\n%s\nsluice logs:\n%s\nvtgate skew lines:\n%s",
+			strings.Join(stalled, "; "), perShard, rounds, timeline.String(), tskVStreamLines(logs.String()), tskVtgateSkewLines(c))
 	}
-	t.Logf("every shard delivered every marker within %s: %v\nvtgate skew lines:\n%s", tskArrivalBudget, perShard, tskVtgateSkewLines(c))
+	t.Logf("every window drained and every marker arrived on time: %v of %d\ntimeline:\n%s\nvtgate skew lines:\n%s",
+		perShard, rounds, timeline.String(), tskVtgateSkewLines(c))
 
 	// Exact: the stream-applied target equals the source, key and value.
 	want := tskSourceRows(t, c)
@@ -455,9 +493,15 @@ func (w *tskWindow) run(ctx context.Context, logs *logcapture.Buffer, shardDB ma
 		}
 	}
 	write := func(sh string, until time.Time) {
+		tick := time.NewTicker(tskWindowCommitEvery)
+		defer tick.Stop()
 		for ctx.Err() == nil && (until.IsZero() || time.Now().Before(until)) {
 			if _, err := shardDB[sh].ExecContext(ctx, "UPDATE "+tskTable+" SET v = v + 1 WHERE id = ?", smallIDs[sh]); err == nil {
 				w.commits[sh]++
+			}
+			select {
+			case <-ctx.Done():
+			case <-tick.C:
 			}
 		}
 	}
@@ -499,9 +543,6 @@ func (w *tskWindow) requireShape(t *testing.T, logs string) {
 // copy for well over ten seconds (the rate TestStreamer_VStreamShardSkewCopy's
 // proxy uses).
 const tskDownstreamBytesPerSec = 512 << 10
-
-// tskProxyDownBytes is PHASEA-DEBUG: total vtgate->sluice bytes.
-var tskProxyDownBytes atomic.Int64
 
 // startTskProxy is a pass-through TCP proxy to target whose downstream
 // (vtgate → sluice) direction is throttled to tskDownstreamBytesPerSec.
@@ -559,7 +600,6 @@ func tskThrottledCopy(dst io.Writer, src io.Reader) {
 				return
 			}
 			sent += int64(n)
-			tskProxyDownBytes.Add(int64(n))
 			due := start.Add(time.Duration(float64(sent) / tskDownstreamBytesPerSec * float64(time.Second)))
 			if d := time.Until(due); d > 0 {
 				time.Sleep(d)
@@ -650,27 +690,24 @@ type tskTarget struct {
 	rows    map[int64]int64
 	arrived map[int64]time.Time
 
-	// PHASEA-DEBUG
+	// watched maps a held window's row to its final source value, and
+	// reachedAt records when the tail first delivered that value.
 	watched   map[int64]int64
 	reachedAt map[int64]time.Time
-	nTail     int
 }
 
-// PHASEA-DEBUG
-func (tg *tskTarget) watch(id, v int64) {
+// watch starts tracking when id's value on the target reaches want.
+func (tg *tskTarget) watch(id, want int64) {
 	tg.mu.Lock()
 	defer tg.mu.Unlock()
 	if tg.watched == nil {
 		tg.watched = map[int64]int64{}
 		tg.reachedAt = map[int64]time.Time{}
 	}
-	tg.watched[id] = v
-	if got, ok := tg.rows[id]; ok && got >= v {
-		tg.reachedAt[id] = time.Now()
-	}
+	tg.watched[id] = want
 }
 
-// PHASEA-DEBUG
+// reached is when the tail delivered id's watched value.
 func (tg *tskTarget) reached(id int64) (time.Time, bool) {
 	tg.mu.Lock()
 	defer tg.mu.Unlock()
@@ -678,11 +715,11 @@ func (tg *tskTarget) reached(id int64) (time.Time, bool) {
 	return at, ok
 }
 
-// PHASEA-DEBUG
-func (tg *tskTarget) tailChanges() int {
+// allReached reports whether every watched value has been delivered.
+func (tg *tskTarget) allReached() bool {
 	tg.mu.Lock()
 	defer tg.mu.Unlock()
-	return tg.nTail
+	return len(tg.reachedAt) == len(tg.watched)
 }
 
 func (tg *tskTarget) put(t *testing.T, row ir.Row) {
@@ -705,9 +742,6 @@ func (tg *tskTarget) put(t *testing.T, row ir.Row) {
 
 func (tg *tskTarget) apply(t *testing.T, ch ir.Change) {
 	t.Helper()
-	tg.mu.Lock()
-	tg.nTail++
-	tg.mu.Unlock()
 	switch c := ch.(type) {
 	case ir.Insert:
 		tg.put(t, c.Row)
