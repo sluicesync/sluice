@@ -206,16 +206,20 @@ func (s *Streamer) stopStreamLiveness() {
 //
 // A cold start (no position, or one being re-copied) has no position to
 // check and stamps now. A warm resume defers: attemptStampDeferred is set,
-// and the plain warm-resume branch stamps right before it opens the reader,
-// once every refusal door has passed and the source's own position check
-// ([ir.ResumeVerifier]) says the resume will pass — then re-asks the door
-// that reads pending adds, so the add/start race stays closed (the add writes
-// its pending entry, then reads the record; the stream stamps, then reads the
-// pending entries; whichever goes second sees the other). Any warm path that
-// did not stamp by the time its change stream opened (a failed check that
-// the open then passed, the multi-database and interrupted-copy branches)
-// stamps right after the open, which leaves only the post-copy check of a
-// concurrent add to catch that narrow window.
+// and the warm-resume branches (single- and multi-database) stamp right
+// before they open the reader, once every refusal door has passed and the
+// source's own position check ([ir.ResumeVerifier]) says the resume will
+// pass — then re-ask the door that reads pending adds, so the add/start race
+// stays closed (the add writes its pending entry, then reads the record; the
+// stream stamps, then reads the pending entries; whichever goes second sees
+// the other). When the check fails, a warm resume that then falls through to
+// the automatic re-snapshot stamps right before the re-snapshot's copy
+// ([Streamer.stampDeferredNow]): the open already returned ErrPositionInvalid
+// and a foreign lineage was refused before it, so the stamp masks nothing,
+// and a copy that can run for hours never runs under the previous run's
+// stop. A warm open that passes although the check failed stamps right after
+// the open, which leaves only the post-copy check of a concurrent add for
+// that narrow window.
 func (s *Streamer) phaseStampAttemptStart(ctx context.Context, applier ir.ChangeApplier, streamID string, found bool) error {
 	s.attemptStampDeferred = false
 	if s.DryRun {
@@ -231,7 +235,8 @@ func (s *Streamer) phaseStampAttemptStart(ctx context.Context, applier ir.Change
 	return nil
 }
 
-// stampBeforeWarmResume is the plain warm-resume branch's half of
+// stampBeforeWarmResume is the warm-resume branches' (single- and
+// multi-database) half of
 // [Streamer.phaseStampAttemptStart]: with every refusal door passed and
 // before the reader opens, stamp if the source confirms the position
 // resumes, and re-ask the scope door so a pending add written since its
@@ -248,8 +253,12 @@ func (s *Streamer) stampBeforeWarmResume(ctx context.Context, applier ir.ChangeA
 	return s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID)
 }
 
-// stampAfterOpen makes a deferred stamp no warm path made before its open.
-func (s *Streamer) stampAfterOpen(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+// stampDeferredNow makes a deferred attempt-start stamp now: right before a
+// warm resume falls through to an automatic re-snapshot (its open already
+// returned ErrPositionInvalid, and a foreign lineage was refused before it,
+// so the stamp can no longer mask a lineage verdict), and right after any
+// warm open that did not stamp before it. A no-op once the attempt stamped.
+func (s *Streamer) stampDeferredNow(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
 	if !s.attemptStampDeferred {
 		return nil
 	}
@@ -261,15 +270,27 @@ func (s *Streamer) stampAfterOpen(ctx context.Context, applier ir.ChangeApplier,
 }
 
 // resumeVerifies runs the source reader's position check without streaming
-// ([ir.ResumeVerifier]); a source without one, or a reader that cannot be
-// opened, counts as verified (the stamp then goes ahead as it always did).
+// ([ir.ResumeVerifier]) and reports whether the attempt may stamp before the
+// open. It fails CLOSED: a reader that cannot be opened, or a check that
+// does not pass, answers false and the stamp waits for the real open
+// ([Streamer.stampDeferredNow]), which meets the same failure. A source
+// whose reader has no check answers true — the hazard the deferral exists
+// for belongs to readers that verify against state sluice's own control
+// writes can move, and such a reader declares the check.
+//
+// It opens a reader even for engines that turn out to have no check,
+// because the capability lives on the READER, not the engine: the MySQL
+// engine chooses its reader type (binlog or VStream) per flavor at open,
+// so the engine cannot answer without opening. For the engines without a
+// check that open is a connection pool or one HTTP round trip — the same
+// open the stream makes right after — and it writes nothing.
 func (s *Streamer) resumeVerifies(ctx context.Context, persisted ir.Position) bool {
 	if s.Source == nil {
 		return true
 	}
 	reader, err := s.Source.OpenCDCReader(ctx, s.SourceDSN)
 	if err != nil {
-		return true
+		return false
 	}
 	defer migcore.CloseIf(reader)
 	verifier, ok := reader.(ir.ResumeVerifier)

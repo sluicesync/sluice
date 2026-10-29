@@ -31,6 +31,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -258,15 +259,23 @@ func TestStreamer_MySQLForeignLineage_RefusesTheAutomaticRecopy(t *testing.T) {
 	})
 
 	t.Run("same server after RESET MASTER: the automatic re-snapshot still runs", func(t *testing.T) {
+		// The previous run's recorded stop, written unlogged: a logged write
+		// would put a GTID under this server's uuid into the emptied set.
+		drainHBSetAlive(t, tgtDSN, "test-foreign-lineage", 0)
 		// Empty executed set: no other lineage here, the re-copy is right.
 		applyDDLMySQL(t, srcDSN, "RESET MASTER;")
 		if got := mysqlGlobal(t, srcDSN, "gtid_executed"); strings.TrimSpace(got) != "" {
 			t.Fatalf("premise gone: gtid_executed = %q after RESET MASTER; want empty", got)
 		}
+		// Hold the re-snapshot's copy at its first touch of the target table,
+		// and require the stream's record to say running while it is held.
+		release := holdTargetTableMySQL(t, tgtDSN, "users")
 		rctx, rcancel := context.WithCancel(context.Background())
 		defer rcancel()
 		errCh := make(chan error, 1)
 		go func() { errCh <- newStream().Run(rctx) }()
+		requireRecordedRunningDuringHeldCopy(t, mysqlEng, tgtDSN, "test-foreign-lineage", errCh)
+		release()
 		// The re-copy lands the replacement's one row (that is what the
 		// source now holds); a refusal here would strand a legitimate
 		// reset behind --restart-from-scratch for nothing.
@@ -328,4 +337,160 @@ func waitForExactRowCountMySQLRows(t *testing.T, dsn, table string, want int, ti
 		time.Sleep(200 * time.Millisecond)
 	}
 	return false
+}
+
+// holdTargetTableMySQL takes a WRITE lock on table through a session of its
+// own, so the next statement any other session runs against the table — the
+// re-snapshot's drop, clear or first row write — waits until release. The
+// lock is metadata-only and unlogged. release is idempotent and also runs at
+// cleanup.
+func holdTargetTableMySQL(t *testing.T, dsn, table string) (release func()) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(context.Background(), "LOCK TABLES "+table+" WRITE"); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		t.Fatalf("RIG: lock %s: %v", table, err)
+	}
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			_, _ = conn.ExecContext(context.Background(), "UNLOCK TABLES")
+			_ = conn.Close()
+			_ = db.Close()
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// requireRecordedRunningDuringHeldCopy requires the stream's liveness record
+// to say running while its automatic re-snapshot is held before the copy
+// (holdTargetTableMySQL). The fourth fix-aimed review of the drained
+// add-table heartbeat (F1): a warm resume defers its attempt-start stamp
+// until the source's position check passes, and when the check fails and
+// the resume falls through to the re-snapshot, the stamp must come before
+// that copy — not after it, hours later, at the stream's open — or a drained
+// `schema add-table` run during the copy reads the previous run's stop and
+// passes against a running stream.
+func requireRecordedRunningDuringHeldCopy(t *testing.T, eng ir.Engine, dsn, streamID string, runErr <-chan error) {
+	t.Helper()
+	applier, err := eng.OpenChangeApplier(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer migcore.CloseIf(applier)
+	store, ok := applier.(ir.StreamLivenessStore)
+	if !ok {
+		t.Fatal("the mysql applier no longer records stream liveness")
+	}
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-runErr:
+			t.Fatalf("the run ended while its re-snapshot was held: %v", err)
+		default:
+		}
+		l, err := store.ReadStreamLiveness(context.Background(), streamID)
+		if err != nil {
+			t.Fatalf("ReadStreamLiveness: %v", err)
+		}
+		if l.Recorded && !l.Stopped {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("the stream's record still says stopped while its automatic re-snapshot waits to copy: a drained " +
+		"`schema add-table` would pass against this running stream (the deferred attempt-start stamp must come " +
+		"before the re-snapshot's copy)")
+}
+
+// TestStreamer_MySQLAutoResnapshot_MultiDatabase_StampsBeforeTheCopy is the
+// multi-database twin of the RESET MASTER cell above: the fan-out's warm
+// resume falls through to its own automatic re-snapshot
+// (coldStartMultiDatabase), and the stream's record must say running before
+// that copy. Source and target are separate servers; the deferral does not
+// depend on the topology.
+func TestStreamer_MySQLAutoResnapshot_MultiDatabase_StampsBeforeTheCopy(t *testing.T) {
+	srcDSN, _, srcCleanup := startMySQLGTID(t)
+	defer srcCleanup()
+	_, tgtHomeDSN, tgtCleanup := startMySQLGTID(t)
+	defer tgtCleanup()
+
+	applyDDLMySQL(t, srcDSN, `
+		CREATE TABLE users (id BIGINT NOT NULL, email VARCHAR(255) NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB;
+		INSERT INTO users VALUES (1, 'a'), (2, 'b'), (3, 'c');`)
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	const streamID = "test-autoresnapshot-multidb"
+	newStream := func() *Streamer {
+		return &Streamer{
+			Source:         mysqlEng,
+			Target:         mysqlEng,
+			SourceDSN:      serverDSN(t, srcDSN),
+			TargetDSN:      tgtHomeDSN,
+			StreamID:       streamID,
+			DatabaseFilter: DatabaseFilter{Include: []string{"source_db"}},
+		}
+	}
+	tgtUsersDSN, err := buildMySQLDSN(tgtHomeDSN, "source_db")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- newStream().Run(ctx) }()
+	if !waitForRowCountMySQL(t, tgtUsersDSN, "users", 3, 90*time.Second) {
+		t.Fatal("the fan-out's cold copy did not deliver the seed rows")
+	}
+	applyDDLMySQL(t, srcDSN, "INSERT INTO users VALUES (4, 'd');")
+	if !waitForRowCountMySQL(t, tgtUsersDSN, "users", 4, 60*time.Second) {
+		t.Fatal("CDC did not deliver the live insert")
+	}
+	cancel()
+	select {
+	case <-runErr:
+	case <-time.After(30 * time.Second):
+		t.Fatal("streamer did not stop after cancel")
+	}
+
+	// The persisted position names GTIDs the emptied source no longer has:
+	// the warm resume's check fails and it falls through to the re-snapshot.
+	drainHBSetAlive(t, tgtHomeDSN, streamID, 0)
+	applyDDLMySQL(t, srcDSN, "RESET MASTER;")
+	release := holdTargetTableMySQL(t, tgtUsersDSN, "users")
+	rctx, rcancel := context.WithCancel(context.Background())
+	defer rcancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- newStream().Run(rctx) }()
+	requireRecordedRunningDuringHeldCopy(t, mysqlEng, tgtHomeDSN, streamID, errCh)
+	release()
+	// And the re-snapshot completes once released, then streams: the
+	// source's four rows and one written after it.
+	applyDDLMySQL(t, srcDSN, "INSERT INTO users VALUES (5, 'e');")
+	if !waitForExactRowCountMySQLRows(t, tgtUsersDSN, "users", 5, 2*time.Minute) {
+		select {
+		case err := <-errCh:
+			t.Fatalf("the re-snapshot did not complete: %v", err)
+		default:
+			t.Fatalf("the re-snapshot never delivered; target holds %d rows", pollRowCountMySQL(tgtUsersDSN, "users"))
+		}
+	}
+	rcancel()
+	select {
+	case <-errCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("streamer did not stop after cancel")
+	}
 }

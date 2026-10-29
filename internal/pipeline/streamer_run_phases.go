@@ -784,6 +784,9 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 					return nil, func() {}, false, err
 				}
 			}
+			if err := s.stampBeforeWarmResume(ctx, applier, streamID, persisted); err != nil {
+				return nil, func() {}, false, err
+			}
 			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, applier, streamID)
 			warmResumed = err == nil
 			if err == nil {
@@ -819,6 +822,13 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 					slog.String("err", err.Error()),
 				)
 				stop()
+				// The deferred attempt-start stamp, before the re-snapshot's
+				// copy: a drained add-table during a copy that can run for
+				// hours must not read the previous run's stop (the fourth
+				// fix-aimed review of d2bbcad8, F1).
+				if serr := s.stampDeferredNow(ctx, applier, streamID); serr != nil {
+					return nil, func() {}, false, serr
+				}
 				// Auto-resnapshot re-copies onto the populated target (its
 				// persisted server-wide position was purged) — but ONLY for
 				// GTID/binlog sources where a purge is routine. A PG
@@ -953,6 +963,11 @@ func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, applier
 			// warmResume failed; its stop is the no-op (it cleaned up
 			// its reader inline). coldStart's stop supersedes it.
 			stop()
+			// The deferred attempt-start stamp, before the re-snapshot's
+			// copy (see the multi-database branch above).
+			if serr := s.stampDeferredNow(ctx, applier, streamID); serr != nil {
+				return nil, func() {}, false, serr
+			}
 			// Auto-resnapshot re-copies onto the EXISTING (populated) target
 			// whose persisted position was purged — but ONLY for GTID/binlog
 			// sources (CDCBinlog/CDCVStream) where a purge is routine: there

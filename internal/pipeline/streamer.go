@@ -2407,7 +2407,7 @@ func (s *Streamer) runOnce(ctx context.Context) (err error) {
 	}
 	// A deferred attempt-start stamp no warm path made before its open
 	// (phaseStampAttemptStart): the open just ran the position check itself.
-	if err := s.stampAfterOpen(ctx, applier, streamID); err != nil {
+	if err := s.stampDeferredNow(ctx, applier, streamID); err != nil {
 		return err
 	}
 

@@ -899,16 +899,12 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	// purged/unreachable GTID (error 1236 → ir.ErrPositionInvalid). So
 	// the probe would only emit a misleading "degraded" WARN on every
 	// MariaDB stream open. See ADR-0170.
-	if r.flavor != FlavorMariaDB {
-		if uuid, err := sourceServerUUID(ctx, r.db); err == nil {
-			r.serverUUID = uuid
-		} else {
-			slog.WarnContext(
-				ctx, "mysql: cdc: could not read @@server_uuid; "+
-					"node-replace position-loss detection degraded to binlog-filename-only",
-				slog.String("err", err.Error()),
-			)
-		}
+	if err := r.readSourceInstanceIdentity(ctx); err != nil {
+		slog.WarnContext(
+			ctx, "mysql: cdc: could not read @@server_uuid; "+
+				"node-replace position-loss detection degraded to binlog-filename-only",
+			slog.String("err", err.Error()),
+		)
 	}
 
 	// The binlog CDC-open preflight set (row image / format / replica
@@ -3023,6 +3019,32 @@ func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUI
 		"so it is not the answer there); `backup incremental` and `backup stream` need a fresh "+
 		"`backup full`, neither having a --restart-from-scratch flag at all: %w",
 		currentUUID, persistedUUID, ir.ErrPositionForeignLineage))
+}
+
+// readSourceInstanceIdentity reads the source's @@server_uuid into
+// r.serverUUID, which the file/pos arm of verifyPositionResumable
+// compares against the position's recorded instance. StreamChanges and the
+// stream-less VerifyResumable call it before they verify; without it the
+// identity check degrades to "could not run" and passes a replaced
+// instance under a misleading UNVERIFIED-INSTANCE-IDENTITY WARN, which is
+// what VerifyResumable did while its contract promised StreamChanges'
+// verdict (the fourth fix-aimed review of the drained-add-table heartbeat,
+// F2). VerifyLineage does not call it yet: see
+// REACTIVE-LINEAGE-DOOR-SKIPS-INSTANCE-IDENTITY in docs/dev/audit-backlog.md.
+//
+// A no-op on MariaDB, which has no @@server_uuid (see StreamChanges). On
+// a failed read r.serverUUID is left empty and the error is returned; the
+// callers decide whether to WARN.
+func (r *CDCReader) readSourceInstanceIdentity(ctx context.Context) error {
+	if r.flavor == FlavorMariaDB {
+		return nil
+	}
+	uuid, err := sourceServerUUID(ctx, r.db)
+	if err != nil {
+		return err
+	}
+	r.serverUUID = uuid
+	return nil
 }
 
 // sourceServerUUID reads the source instance's @@server_uuid — a

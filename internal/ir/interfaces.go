@@ -3106,8 +3106,14 @@ type LineageVerifier interface {
 // ResumeVerifier is the OPTIONAL [CDCReader] surface that runs the whole
 // position check StreamChanges runs on a resume — lineage, retention,
 // anchors — without opening a stream or mutating anything, and returns
-// exactly the error StreamChanges would return for it (nil when the
-// position resumes). Unlike [LineageVerifier] it narrows nothing: it exists
+// the error StreamChanges' position verification would return for it (nil
+// when the position resumes). An implementation must perform every probe
+// that verification reads before it runs (the MySQL binlog reader reads
+// @@server_uuid first, exactly as StreamChanges does — skipping it once
+// let a replaced instance pass a file/pos check), so the verdict differs
+// from the stream open's only by what changes on the source in between.
+// The CDC-open preflights (row image, binlog format, filters) are not
+// position checks and are not run. Unlike [LineageVerifier] it narrows nothing: it exists
 // so the pipeline can tell, BEFORE it writes to the target, whether a resume
 // will pass. A target on the same MySQL server as its source logs sluice's
 // own control-row writes into the source's GTID executed set, so a write

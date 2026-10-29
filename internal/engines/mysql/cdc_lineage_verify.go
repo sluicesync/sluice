@@ -67,12 +67,17 @@ func (r *vstreamCDCReader) VerifyLineage(ctx context.Context, from ir.Position) 
 }
 
 // VerifyResumable implements [ir.ResumeVerifier] for the binlog reader:
-// the full position check StreamChanges runs, every outcome reported.
+// the full position check StreamChanges runs, every outcome reported —
+// including the @@server_uuid read StreamChanges makes first, without which
+// a file/pos position's identity check cannot run.
 func (r *CDCReader) VerifyResumable(ctx context.Context, from ir.Position) error {
 	decoded, ok, err := decodeBinlogPos(from)
 	if err != nil || !ok {
 		return err
 	}
+	// As in StreamChanges, a failed read is not itself a refusal: the
+	// identity check then WARNs that it could not run.
+	_ = r.readSourceInstanceIdentity(ctx)
 	return r.verifyPositionResumable(ctx, decoded)
 }
 

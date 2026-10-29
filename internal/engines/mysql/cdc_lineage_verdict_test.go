@@ -9,11 +9,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/logcapture"
 	"sluicesync.dev/sluice/internal/sluicecode"
 )
 
@@ -67,6 +69,12 @@ func (c *lineageFakeConn) QueryContext(_ context.Context, query string, _ []driv
 			return nil, errors.New("lineage fake: @@global.server_uuid is not readable on this source (no uuid= in the cell's DSN)")
 		}
 		return &lineageFakeRows{cols: []string{"contained", "executed", "server_uuid"}, vals: []driver.Value{c.contained, c.executed, c.uuid}}, nil
+	case "SELECT @@global.server_uuid":
+		// The file/pos identity read (readSourceInstanceIdentity).
+		if !c.hasUUID {
+			return nil, errors.New("lineage fake: @@global.server_uuid is not readable on this source (no uuid= in the cell's DSN)")
+		}
+		return &lineageFakeRows{cols: []string{"@@global.server_uuid"}, vals: []driver.Value{c.uuid}}, nil
 	case "SELECT @@gtid_binlog_state":
 		return &lineageFakeRows{cols: []string{"@@gtid_binlog_state"}, vals: []driver.Value{c.state}}, nil
 	}
@@ -303,5 +311,47 @@ func TestVerifyLineage_AnswersOnlyTheForeignQuestion(t *testing.T) {
 	}
 	if err := foreign.VerifyLineage(ctx, ir.Position{}); err != nil {
 		t.Fatalf("undecodable position: VerifyLineage = %v; want nil", err)
+	}
+}
+
+// TestVerifyResumableReadsTheSourceIdentity pins that VerifyResumable
+// returns the verdict StreamChanges would on a file/pos position from a
+// REPLACED instance. StreamChanges reads @@server_uuid before it verifies;
+// VerifyResumable once skipped that read, so the identity check saw an
+// empty current identity, took its "could not run" arm, PASSED the
+// replaced instance and logged a false UNVERIFIED-INSTANCE-IDENTITY WARN
+// (the fourth fix-aimed review of the drained-add-table heartbeat, F2).
+// The pipeline stamps the stream's liveness on a VerifyResumable nil, so a
+// false pass there is a false liveness signal over a stream that will
+// refuse at open.
+//
+// VerifyLineage reaches the same arm with the same gap and is deliberately
+// NOT changed or pinned here (REACTIVE-LINEAGE-DOOR-SKIPS-INSTANCE-IDENTITY
+// in docs/dev/audit-backlog.md): closing it widens a refusal, which ships in
+// its own release.
+func TestVerifyResumableReadsTheSourceIdentity(t *testing.T) {
+	var buf logcapture.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ctx := context.Background()
+	pos, err := encodeBinlogPos(binlogPos{
+		Mode: positionModeFilePos, File: "binlog.000003", Pos: 157,
+		ServerUUID: "aaaaaaaa-0000-0000-0000-000000000001",
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	replaced := "uuid=bbbbbbbb-0000-0000-0000-000000000002"
+
+	r := &CDCReader{db: newLineageFakeDB(t, replaced), flavor: FlavorVanilla}
+	if err := r.VerifyResumable(ctx, pos); !errors.Is(err, ir.ErrPositionForeignLineage) {
+		t.Errorf("VerifyResumable on a replaced instance = %v; want the identity refusal StreamChanges returns "+
+			"(ErrPositionForeignLineage, %s)", err, instanceIdentityChangedMarker)
+	}
+	if strings.Contains(buf.String(), unverifiedInstanceIdentityMarker) {
+		t.Errorf("VerifyResumable logged %s although the source's identity was readable — it verified "+
+			"without reading it:\n  %s", unverifiedInstanceIdentityMarker, strings.TrimSpace(buf.String()))
 	}
 }
