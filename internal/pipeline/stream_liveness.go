@@ -189,6 +189,96 @@ func (s *Streamer) stopStreamLiveness() {
 	}
 }
 
+// phaseStampAttemptStart makes the attempt-start stamp once the persisted
+// position is known — now for a cold start, and for a warm resume only after
+// the source has confirmed the position resumes
+// ([Streamer.stampBeforeWarmResume]).
+//
+// Why not at control-table preparation, where it used to be: on a target
+// that shares its source's MySQL server, the stamp is a GTID-logged
+// transaction on the source. Made before the reader checked the persisted
+// position against the source's executed set, it made a source rolled back
+// BEHIND its own position look caught up (the FOREIGN-LINEAGE refusal never
+// fired and the stream ran) and an emptied one (RESET MASTER) look non-empty
+// (the legitimate automatic re-snapshot was refused). Measured by
+// TestStreamer_MySQLForeignLineage_RefusesTheAutomaticRecopy, which the
+// heartbeat broke and this restores.
+//
+// A cold start (no position, or one being re-copied) has no position to
+// check and stamps now. A warm resume defers: attemptStampDeferred is set,
+// and the plain warm-resume branch stamps right before it opens the reader,
+// once every refusal door has passed and the source's own position check
+// ([ir.ResumeVerifier]) says the resume will pass — then re-asks the door
+// that reads pending adds, so the add/start race stays closed (the add writes
+// its pending entry, then reads the record; the stream stamps, then reads the
+// pending entries; whichever goes second sees the other). Any warm path that
+// did not stamp by the time its change stream opened (a failed check that
+// the open then passed, the multi-database and interrupted-copy branches)
+// stamps right after the open, which leaves only the post-copy check of a
+// concurrent add to catch that narrow window.
+func (s *Streamer) phaseStampAttemptStart(ctx context.Context, applier ir.ChangeApplier, streamID string, found bool) error {
+	s.attemptStampDeferred = false
+	if s.DryRun {
+		return nil
+	}
+	if found && !s.RestartFromScratch && !s.ResetTargetData {
+		s.attemptStampDeferred = true
+		return nil
+	}
+	if err := s.stampAttemptStart(ctx, applier, streamID); err != nil {
+		return connectHint(err)
+	}
+	return nil
+}
+
+// stampBeforeWarmResume is the plain warm-resume branch's half of
+// [Streamer.phaseStampAttemptStart]: with every refusal door passed and
+// before the reader opens, stamp if the source confirms the position
+// resumes, and re-ask the scope door so a pending add written since its
+// first ask defers this start. When the check fails nothing is written; the
+// open will fail the same way (or, if it passes, stamp after it).
+func (s *Streamer) stampBeforeWarmResume(ctx context.Context, applier ir.ChangeApplier, streamID string, persisted ir.Position) error {
+	if !s.attemptStampDeferred || !s.resumeVerifies(ctx, persisted) {
+		return nil
+	}
+	if err := s.stampAttemptStart(ctx, applier, streamID); err != nil {
+		return connectHint(err)
+	}
+	s.attemptStampDeferred = false
+	return s.phaseRefuseIncludeTableScopeDrift(ctx, applier, streamID)
+}
+
+// stampAfterOpen makes a deferred stamp no warm path made before its open.
+func (s *Streamer) stampAfterOpen(ctx context.Context, applier ir.ChangeApplier, streamID string) error {
+	if !s.attemptStampDeferred {
+		return nil
+	}
+	s.attemptStampDeferred = false
+	if err := s.stampAttemptStart(ctx, applier, streamID); err != nil {
+		return connectHint(err)
+	}
+	return nil
+}
+
+// resumeVerifies runs the source reader's position check without streaming
+// ([ir.ResumeVerifier]); a source without one, or a reader that cannot be
+// opened, counts as verified (the stamp then goes ahead as it always did).
+func (s *Streamer) resumeVerifies(ctx context.Context, persisted ir.Position) bool {
+	if s.Source == nil {
+		return true
+	}
+	reader, err := s.Source.OpenCDCReader(ctx, s.SourceDSN)
+	if err != nil {
+		return true
+	}
+	defer migcore.CloseIf(reader)
+	verifier, ok := reader.(ir.ResumeVerifier)
+	if !ok {
+		return true
+	}
+	return verifier.VerifyResumable(ctx, persisted) == nil
+}
+
 // stampAttemptStart stamps the stream running through the attempt's own
 // applier, at the start of every attempt (see the file comment), and folds
 // the stamp into the Run's ownership. It may add the column to an older

@@ -66,6 +66,30 @@ func (r *vstreamCDCReader) VerifyLineage(ctx context.Context, from ir.Position) 
 	return nil //nolint:nilerr // every non-foreign outcome is deliberately nil; see the doc comment
 }
 
+// VerifyResumable implements [ir.ResumeVerifier] for the binlog reader:
+// the full position check StreamChanges runs, every outcome reported.
+func (r *CDCReader) VerifyResumable(ctx context.Context, from ir.Position) error {
+	decoded, ok, err := decodeBinlogPos(from)
+	if err != nil || !ok {
+		return err
+	}
+	return r.verifyPositionResumable(ctx, decoded)
+}
+
+// VerifyResumable implements [ir.ResumeVerifier] for the VStream reader.
+func (r *vstreamCDCReader) VerifyResumable(ctx context.Context, from ir.Position) error {
+	decoded, err := r.resolveStartPosition(from)
+	if err != nil || len(decoded) == 0 {
+		return err
+	}
+	return r.verifyVStreamPositionReachable(ctx, decoded)
+}
+
+var (
+	_ ir.ResumeVerifier = (*CDCReader)(nil)
+	_ ir.ResumeVerifier = (*vstreamCDCReader)(nil)
+)
+
 // Both reader types [Engine.OpenCDCReader] can return answer the reactive
 // path's lineage question. The pins fail the BUILD if either method is
 // dropped; TestEveryCDCReaderAnswersTheLineageQuestion fails the build if

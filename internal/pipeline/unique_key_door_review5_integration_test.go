@@ -121,15 +121,20 @@ func TestStreamer_UniqueKeyDoor_Review5AddTableAcceptedKey(t *testing.T) {
 	actx, acancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer acancel()
 	// The shape under test is a table added while the stream runs. --no-drain
-	// on a binlog source refuses now (NO-DRAIN-BINLOG-SOURCE), so the state is
-	// reached the one way any stream still can: a drained add the operator
-	// ran without stopping the stream, which add-table does not detect
-	// (DRAINED-ADD-TABLE-RUNNING-STREAM-UNCHECKED in docs/dev/audit-backlog.md).
-	// --no-drain is withdrawn on Postgres too (Bug 332), so there is no live
-	// add left to twin this with; when that door closes, this state is only
-	// reachable from a pre-v0.163.10 binary's record.
+	// on a binlog source refuses now (NO-DRAIN-BINLOG-SOURCE), and the drained
+	// add now refuses a stream that has not recorded its stop
+	// (DRAINED-ADD-TABLE-STREAM-NOT-STOPPED), so a current binary cannot reach
+	// this state. It is still reachable through what the check cannot see —
+	// an idle stream run by an older binary after this release recorded its
+	// stop (the CHANGELOG's Compatibility section) — and mixedVersionTarget
+	// emulates exactly that for the add: the record reads stopped, and the
+	// stream's position does not move. (This rig's source and target share a
+	// server, so the running stream reads the add's own target writes as
+	// filtered events and advances its position, which a separate-server
+	// target would not; freezing the position the add reads is what keeps
+	// the emulation to the mixed-version case.)
 	if err := (&AddTable{
-		Source: mysqlEng, Target: mysqlEng, SourceDSN: srcDSN, TargetDSN: tgtDSN,
+		Source: mysqlEng, Target: mixedVersionTarget(t, mysqlEng), SourceDSN: srcDSN, TargetDSN: tgtDSN,
 		StreamID: streamID, TableName: "kd", AcceptTargetOnlyUniqueKeys: accept,
 	}).Run(actx); err != nil {
 		t.Fatalf("add-table with the key accepted: %v", err)

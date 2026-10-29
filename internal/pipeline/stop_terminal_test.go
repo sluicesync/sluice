@@ -84,6 +84,36 @@ func TestStopObservedRunIsTerminal_RetryLoop(t *testing.T) {
 	})
 }
 
+// TestApplyWithReshardFollowMarksAStopObservedRun pins the wrap where it is
+// applied in production (applyWithReshardFollow), not a test helper's own
+// stopTerminal call: with a stop observed, both the settle exit and the
+// reshard-reopen exit return an error carrying ErrStopRequestedRun beside
+// its own identity; with no stop, neither is marked.
+func TestApplyWithReshardFollowMarksAStopObservedRun(t *testing.T) {
+	invalid := fmt.Errorf("vstream: %w", ir.ErrPositionInvalid)
+	ctx := context.Background()
+	for _, observed := range []bool{true, false} {
+		var stop stopSignal
+		stop.observed.Store(observed)
+		settled := (&Streamer{ApplyBatchSize: 1, sourceErrFn: func() error { return invalid }}).
+			applyWithReshardFollow(ctx, ctx, &reshardRecordingApplier{}, "sid", chanOf(), &liveAddedFilter{}, &stop)
+		reopenErr := errors.New("vtgate: journal unreadable")
+		reopened := newReshardStreamer(&fakeReshardReader{err: reopenErr}).
+			applyWithReshardFollow(ctx, ctx, &reshardRecordingApplier{}, "sid", chanOf(), &liveAddedFilter{}, &stop)
+		for name, c := range map[string]struct {
+			err  error
+			keep error
+		}{"settle exit": {settled, ir.ErrPositionInvalid}, "reshard-reopen exit": {reopened, reopenErr}} {
+			if !errors.Is(c.err, c.keep) {
+				t.Errorf("observed=%v, %s: %v lost %v", observed, name, c.err, c.keep)
+			}
+			if errors.Is(c.err, ErrStopRequestedRun) != observed {
+				t.Errorf("observed=%v, %s: marked stop-requested = %v", observed, name, errors.Is(c.err, ErrStopRequestedRun))
+			}
+		}
+	}
+}
+
 // TestStopObservedRunIsTerminal_Supervisor is the fleet half: a leg that
 // fails with a non-retriable error after its stop was observed — one not on
 // the supervisor's refusals-a-restart-repeats list — used to be restarted on
