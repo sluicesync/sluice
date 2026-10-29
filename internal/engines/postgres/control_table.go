@@ -693,10 +693,12 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 // advances its position is running, and the stamp riding the position write
 // is what keeps a drained add-table from passing while the stream applies.
 // It overwrites a stopped marker, as the run's first stamp does. The value
-// is GREATEST(now, previous + 1), so every writer of the column is strictly
-// monotonic and never rewrites the value it replaces: a start's
-// compare-and-set restore ([appliershared.RestoreStreamStopped]) can then
-// never mistake a position write for its own stamp, whatever the clocks do.
+// is GREATEST(now, previous + 1), so every RUNNING writer of the column
+// (position writes and the owned stamp) is strictly monotonic and never
+// rewrites the value it replaces: a start's compare-and-set restore
+// ([appliershared.RestoreStreamStopped]) can then never mistake a position
+// write for its own stamp, whatever the clocks do. The stop record and the
+// restore write 0, and a stamp after a 0 writes the raw clock.
 // False only when the control table has no such column (a role that could
 // not add it).
 func buildWritePositionSQL(schema, streamID, token, slotName, publicationName, rowFilterHash, sourceFingerprint, targetSchema string, rowsApplied int64, stampAlive bool) (stmt string, args []any) {

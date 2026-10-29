@@ -536,6 +536,16 @@ func (s *Supervisor) superviseOne(ctx context.Context, sy SupervisedSync) {
 			s.setState(sy.ID, SyncFailed, err)
 			return
 		}
+		// Any other failure of a leg whose `sync stop` was observed is not
+		// restarted either: the restart would clear the stop request and
+		// stream on (ErrStopRequestedRun). The leg ends failed with its own
+		// error and exit status.
+		if errors.Is(err, ErrStopRequestedRun) {
+			slog.ErrorContext(ctx, "supervisor: sync failed after its stop was requested; not restarting",
+				slog.String("stream_id", sy.ID), slog.String("err", err.Error()))
+			s.setState(sy.ID, SyncFailed, err)
+			return
+		}
 
 		// An UNFORWARDED-SCHEMA-CHANGE refusal (GC-2) is not restarted. It is
 		// recorded on the target and replayed at every start, so a restart

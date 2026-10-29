@@ -1137,9 +1137,12 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, controlKeyspace, streamID,
 // [appliershared.StreamLivenessColumn]) to the same upsert, overwriting a
 // stopped marker: a stream that advances its position is running, so a
 // drained add-table cannot pass while it applies. The value is GREATEST(now,
-// previous + 1), so every writer of the column is strictly monotonic and a
-// start's compare-and-set restore cannot mistake a position write for its
-// own stamp, whatever the clocks do. updated_at keeps its position-write
+// previous + 1), so every RUNNING writer of the column (position writes and the
+// owned stamp) is strictly monotonic, and a start's compare-and-set restore
+// cannot mistake a position write for its own stamp, whatever the clocks do.
+// The stop record and the restore write 0, and a stamp after a 0 writes the
+// raw clock; neither breaks that, because the restore only ever matches the
+// exact value its own stamp wrote. updated_at keeps its position-write
 // semantics (its ON UPDATE fires for this statement as it always has). False
 // (byte-identical to the historical statement) only when the control table
 // has no such column.

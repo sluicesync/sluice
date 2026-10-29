@@ -2893,20 +2893,25 @@ var (
 )
 
 // stopWaitTimeoutError is `sync stop --wait`'s timeout. It cannot claim the
-// drain is still going: the control row reads the same (stop request set, a
-// running stamp on stream_alive_ms) for three different states, and the
+// drain is still going: a stop request still set fits four states, and the
 // commonest at the default --timeout (5m, against the streamer's 30s drain
-// watchdog) is a stream that is no longer draining at all — its drain was
-// hard-cancelled and it exited 4 with STOP-DRAIN-HARD-CANCELLED, or no
-// process was running it to begin with. So the message names all three and
-// the remedy the first two share.
+// watchdog) is a stream that is no longer draining at all. Its drain was
+// hard-cancelled and it exited 4 with STOP-DRAIN-HARD-CANCELLED (no stop
+// recorded); or it stopped on another error after the stop was requested (it
+// exited with that error's own status, and its stop IS recorded, because a
+// run that streamed records it on its way out); or no process was running it;
+// or its apply is still wedged. The message names all four, and what to do
+// in each.
 func stopWaitTimeoutError(streamID string, timeout time.Duration) error {
 	return fmt.Errorf("stream %q did not complete drain within %s, and its stop request is still set. "+
-		"Either the stream's drain timed out and it exited without draining (its log ends with %s and the process exited %d), "+
-		"or no process was running the stream, or its apply is still wedged. sluice cannot tell these apart from the control row. "+
-		"In the first two cases the stop is not recorded and `sluice schema add-table` refuses against the stream: start it once "+
-		"with the same --stream-id (it resumes from its last committed position and clears the stop request), then stop it "+
-		"again with `sluice sync stop --wait`. If the process is still running, find what is blocking its apply on the target",
+		"sluice cannot tell from the control row which of these happened: "+
+		"(1) its drain timed out and it exited without draining (its log ends with %s and the process exited %d); its stop is not recorded; "+
+		"(2) it stopped on another error after the stop was requested (the process exited with that error's own status, and its log names the error); its stop is recorded, but the request stays set until the next start; "+
+		"(3) no process was running the stream; its stop is not recorded; "+
+		"(4) its apply is still wedged: find what is blocking it on the target. "+
+		"In cases 1 and 3 `sluice schema add-table` refuses against the stream until you start it once with the same --stream-id "+
+		"(it resumes from its last committed position and clears the stop request) and stop it again with `sluice sync stop --wait`; "+
+		"in case 2, fix the error, then do the same",
 		streamID, timeout, pipeline.StopDrainHardCancelledMarker, sluicecode.ExitStopNotDrained)
 }
 
