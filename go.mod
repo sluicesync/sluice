@@ -45,7 +45,7 @@ require (
 	gocloud.dev v0.46.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sync v0.25.0
-	golang.org/x/text v0.43.0
+	golang.org/x/text v0.44.0
 	google.golang.org/api v0.309.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
